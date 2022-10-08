@@ -173,7 +173,7 @@ class JsonPropertyMerger:
                 tagsDict["EXIF:ExifIFD:OffsetTimeOriginal"] = takenDateTimeZoneStr
                 tagsDict["EXIF:ExifIFD:OffsetTimeDigitized"] = takenDateTimeZoneStr
 
-            tagsDict, imageMetaData = this.__HandleParamThatAlreadyExist(tagsDict, descriptionTagUpdateMode, "EXIF:UserComment", description, imageMetaData, imageFile, appendable=False)
+            tagsDict, imageMetaData = this.__HandleParamThatAlreadyExist(tagsDict, descriptionTagUpdateMode, "EXIF:UserComment", description, imageMetaData, imageFile, appendable=True)
             if (tagsDict is None):
                 # The image file does not exist, so no use trying to update it.
                 return None
