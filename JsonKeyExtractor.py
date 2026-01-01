@@ -26,7 +26,40 @@ def getNestedKeys(data, max_depth=2, current_depth=0):
     else:
         return type(data).__name__
 
-def processJsonFiles(directory_path, output_file='output_keys.json'):
+def mergeStructures(struct1, struct2):
+    """
+    Merge two structure dictionaries, combining all keys from both.
+    """
+    if not isinstance(struct1, dict) or not isinstance(struct2, dict):
+        # If either is not a dict, prefer dict over other types, otherwise return struct2
+        if isinstance(struct1, dict):
+            return struct1
+        elif isinstance(struct2, dict):
+            return struct2
+        else:
+            return struct2
+    
+    result = struct1.copy()
+    
+    for key, value in struct2.items():
+        if key in result:
+            # If both have the key, merge their values recursively
+            if isinstance(result[key], dict) and isinstance(value, dict):
+                result[key] = mergeStructures(result[key], value)
+            elif isinstance(result[key], list) and isinstance(value, list):
+                # For lists, merge the structure of their first elements
+                if result[key] and value:
+                    result[key] = [mergeStructures(result[key][0], value[0])]
+                elif value:
+                    result[key] = value
+            # Otherwise, keep existing value (could also choose to keep the new one)
+        else:
+            # Key only exists in struct2, add it
+            result[key] = value
+    
+    return result
+
+def processJsonFiles(directory_path, output_file='extracted_keys.json'):
     """
     Process all JSON files in directory and subdirectories.
     Extract first and second level keys and save to a new JSON file.
@@ -39,6 +72,7 @@ def processJsonFiles(directory_path, output_file='output_keys.json'):
     
     # Dictionary to store all unique key structures found
     all_structures = {}
+    combined_structure = {}
     files_processed = 0
     files_with_errors = []
     
@@ -63,6 +97,9 @@ def processJsonFiles(directory_path, output_file='output_keys.json'):
                 relative_path = json_file.relative_to(directory)
                 all_structures[str(relative_path)] = structure
                 
+                # Merge into combined structure
+                combined_structure = mergeStructures(combined_structure, structure)
+                
                 files_processed += 1
                 
         except json.JSONDecodeError as e:
@@ -70,10 +107,16 @@ def processJsonFiles(directory_path, output_file='output_keys.json'):
         except Exception as e:
             files_with_errors.append((str(json_file), f"Error: {e}"))
     
+    # Create final output with both individual and combined structures
+    output_data = {
+        "combined_structure": combined_structure,
+        "individual_files": all_structures
+    }
+    
     # Save the results
     output_path = Path(output_file)
     with open(output_path, 'w', encoding='utf-8') as f:
-        json.dump(all_structures, f, indent=2, ensure_ascii=False)
+        json.dump(output_data, f, indent=2, ensure_ascii=False)
     
     # Print summary
     print(f"\nProcessing complete!")
@@ -86,6 +129,9 @@ def processJsonFiles(directory_path, output_file='output_keys.json'):
             print(f"  - {file_path}: {error}")
     
     print(f"\nOutput saved to: {output_path.absolute()}")
+    print(f"\nThe output contains:")
+    print(f"  - 'combined_structure': Merged structure from all files")
+    print(f"  - 'individual_files': Structure for each file")
 
 if __name__ == "__main__":
     # Specify the directory to scan
