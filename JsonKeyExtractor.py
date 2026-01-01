@@ -114,15 +114,20 @@ def processJsonFiles(directoryPath, outputFile='extracted_keys.json'):
     typeConflicts = []
     filesProcessed = 0
     filesWithErrors = []
+    mkvFiles = []
     
     # Find all JSON files recursively
     jsonFiles = list(directory.rglob('*.json'))
+    
+    # Find all MKV files recursively
+    mkvFiles = list(directory.rglob('*.mkv'))
     
     if not jsonFiles:
         print(f"No JSON files found in '{directoryPath}'")
         return
     
     print(f"Found {len(jsonFiles)} JSON file(s) to process...")
+    print(f"Found {len(mkvFiles)} MKV file(s) in the directory tree")
     
     for jsonFile in jsonFiles:
         try:
@@ -149,7 +154,8 @@ def processJsonFiles(directoryPath, outputFile='extracted_keys.json'):
     # Create final output with both individual and combined structures
     outputData = {
         "combined_structure": combinedStructure,
-        "individual_files": allStructures
+        "individual_files": allStructures,
+        "mkv_files": [str(mkv.relative_to(directory)) for mkv in mkvFiles]
     }
     
     # Add type conflicts if any were found
@@ -181,10 +187,17 @@ def processJsonFiles(directoryPath, outputFile='extracted_keys.json'):
             print(f"    Found type: {conflict['found_type']}")
             print()
     
+    if mkvFiles:
+        print(f"\nMKV files found: {len(mkvFiles)}")
+        print("\nMKV files:")
+        for mkvFile in mkvFiles:
+            print(f"  - {mkvFile.relative_to(directory)}")
+    
     print(f"\nOutput saved to: {outputPath.absolute()}")
     print(f"\nThe output contains:")
     print(f"  - 'combined_structure': Merged structure from all files")
     print(f"  - 'individual_files': Structure for each file")
+    print(f"  - 'mkv_files': List of all MKV files found")
     if typeConflicts:
         print(f"  - 'type_conflicts': List of type mismatches found")
 
