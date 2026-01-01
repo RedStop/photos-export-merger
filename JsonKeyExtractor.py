@@ -115,6 +115,7 @@ def processJsonFiles(directoryPath, outputFile='extracted_keys.json'):
     filesProcessed = 0
     filesWithErrors = []
     mkvFiles = []
+    missingFiles = []
     
     # Find all JSON files recursively
     jsonFiles = list(directory.rglob('*.json'))
@@ -141,6 +142,18 @@ def processJsonFiles(directoryPath, outputFile='extracted_keys.json'):
                 relativePath = jsonFile.relative_to(directory)
                 allStructures[str(relativePath)] = structure
                 
+                # Check if the actual file exists (based on the JSON filename)
+                # The JSON file is named like "DSCN0403.jpg.json", so we remove ".json" to get the actual filename
+                actualFileName = jsonFile.stem  # This removes the .json extension
+                actualFilePath = jsonFile.parent / actualFileName
+                
+                if not actualFilePath.exists():
+                    missingFiles.append({
+                        "json_file": str(relativePath),
+                        "expected_file": actualFileName,
+                        "expected_path": str(actualFilePath.relative_to(directory))
+                    })
+                
                 # Merge into combined structure
                 combinedStructure = mergeStructures(combinedStructure, structure, "", str(relativePath), typeConflicts)
                 
@@ -161,6 +174,10 @@ def processJsonFiles(directoryPath, outputFile='extracted_keys.json'):
     # Add type conflicts if any were found
     if typeConflicts:
         outputData["type_conflicts"] = typeConflicts
+    
+    # Add missing files if any were found
+    if missingFiles:
+        outputData["missing_files"] = missingFiles
     
     # Save the results
     outputPath = Path(outputFile)
@@ -187,6 +204,15 @@ def processJsonFiles(directoryPath, outputFile='extracted_keys.json'):
             print(f"    Found type: {conflict['found_type']}")
             print()
     
+    if missingFiles:
+        print(f"\nMissing files: {len(missingFiles)}")
+        print("\nFiles described by JSON but not found on disk:")
+        for missing in missingFiles:
+            print(f"  - JSON file: {missing['json_file']}")
+            print(f"    Expected file: {missing['expected_file']}")
+            print(f"    Expected at: {missing['expected_path']}")
+            print()
+    
     if mkvFiles:
         print(f"\nMKV files found: {len(mkvFiles)}")
         print("\nMKV files:")
@@ -200,6 +226,8 @@ def processJsonFiles(directoryPath, outputFile='extracted_keys.json'):
     print(f"  - 'mkv_files': List of all MKV files found")
     if typeConflicts:
         print(f"  - 'type_conflicts': List of type mismatches found")
+    if missingFiles:
+        print(f"  - 'missing_files': List of files described by JSON but not found on disk")
 
 if __name__ == "__main__":
     # Specify the directory to scan
