@@ -258,3 +258,8 @@ if __name__ == "__main__":
     outputFilename = "extracted_keys.json"
     
     processJsonFiles(directoryToScan, outputFilename)
+
+    # TODO:
+    # Detect photo's that does not have a .json file.
+    # Find the missing .json files.
+    # Ensure each .json file points to a unique photo
