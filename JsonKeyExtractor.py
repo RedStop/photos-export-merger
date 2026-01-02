@@ -122,14 +122,17 @@ def processJsonFiles(directoryPath, outputFile='extracted_keys.json'):
     # Track all file types
     fileTypeTracking = defaultdict(list)
     
-    # OPTIMIZATION: Scan all files once and cache the results
+    # OPTIMIZATION: Scan all files once and organize by directory
     print("Scanning directory tree...")
     allFiles = [f for f in directory.rglob('*') if f.is_file()]
-    allFilesSet = set(allFiles)  # Use set for O(1) lookups
     
-    # Categorize files by extension
+    # Group files by their parent directory (as filenames only)
+    filesByDirectory = defaultdict(set)
     for file in allFiles:
-        ext = file.suffix.lower()  # Get extension in lowercase
+        filesByDirectory[file.parent].add(file.name)
+        
+        # Track file types
+        ext = file.suffix.lower()
         if not ext:
             ext = 'no_extension'
         else:
@@ -138,64 +141,74 @@ def processJsonFiles(directoryPath, outputFile='extracted_keys.json'):
         relativePath = str(file.relative_to(directory))
         fileTypeTracking[ext].append(relativePath)
     
-    # Find all JSON files for processing
-    jsonFiles = [f for f in allFiles if f.suffix.lower() == '.json']
+    # Group JSON files by directory
+    jsonFilesByDirectory = defaultdict(list)
+    for file in allFiles:
+        if file.suffix.lower() == '.json':
+            jsonFilesByDirectory[file.parent].append(file)
     
-    if not jsonFiles:
+    totalJsonFiles = sum(len(files) for files in jsonFilesByDirectory.values())
+    
+    if totalJsonFiles == 0:
         print(f"No JSON files found in '{directoryPath}'")
         return
     
-    print(f"Found {len(jsonFiles)} JSON file(s) to process...")
+    print(f"Found {totalJsonFiles} JSON file(s) to process in {len(jsonFilesByDirectory)} directories...")
     print(f"Found {len(allFiles)} total file(s) in the directory tree")
     
-    for jsonFile in jsonFiles:
-        try:
-            data = None
-            # OPTIMIZATION: Load JSON data once
-            with open(jsonFile, 'r', encoding='utf-8') as f:
-                data = json.load(f)
+    # OPTIMIZATION: Process JSON files directory by directory
+    for dir_path, jsonFiles in jsonFilesByDirectory.items():
+        # Get all filenames in this directory (filter once per directory)
+        dir_filenames = filesByDirectory[dir_path]
+        
+        for jsonFile in jsonFiles:
+            try:
+                data = None
+                # OPTIMIZATION: Load JSON data once
+                with open(jsonFile, 'r', encoding='utf-8') as f:
+                    data = json.load(f)
 
-            if data is not None:
-                # Store with relative path as key
-                relativePath = jsonFile.relative_to(directory)
-                
-                # OPTIMIZATION: Pass pre-loaded data and file list to avoid re-reading
-                matchingFilename, newTitle = JsonFileFinder(
-                    str(jsonFile),
-                    json_data=data,
-                    all_files=allFilesSet
-                )
+                if data is not None:
+                    # Store with relative path as key
+                    relativePath = jsonFile.relative_to(directory)
+                    
+                    # OPTIMIZATION: Pass pre-loaded data and filtered filenames for this directory
+                    matchingFilename, newTitle = JsonFileFinder(
+                        str(jsonFile),
+                        json_data=data,
+                        dir_files=dir_filenames
+                    )
 
-                if newTitle is None:
-                    raise Exception(f"Title for {relativePath} is not available.")
-                
-                if matchingFilename is None:
-                    missingFiles.append({
-                        "json_file": str(relativePath)
-                    })
-                
-                # Get the key structure (first and second level)
-                structure = getNestedKeys(data, maxDepth=2)
-                # Merge into combined structure
-                combinedStructure = mergeStructures(combinedStructure, structure, "", str(relativePath), typeConflicts)
-                # Add the linked file to the structure
-                structure["MatchingFile"] = matchingFilename
-                allStructures[str(relativePath)] = structure
-                
-                # Track titles by folder to detect duplicates within the same folder
-                folderPath = str(jsonFile.parent.relative_to(directory))
-                if folderPath not in titlesByFolder:
-                    titlesByFolder[folderPath] = {}
-                if newTitle not in titlesByFolder[folderPath]:
-                    titlesByFolder[folderPath][newTitle] = []
-                titlesByFolder[folderPath][newTitle].append(str(relativePath))
+                    if newTitle is None:
+                        raise Exception(f"Title for {relativePath} is not available.")
+                    
+                    if matchingFilename is None:
+                        missingFiles.append({
+                            "json_file": str(relativePath)
+                        })
+                    
+                    # Get the key structure (first and second level)
+                    structure = getNestedKeys(data, maxDepth=2)
+                    # Merge into combined structure
+                    combinedStructure = mergeStructures(combinedStructure, structure, "", str(relativePath), typeConflicts)
+                    # Add the linked file to the structure
+                    structure["MatchingFile"] = matchingFilename
+                    allStructures[str(relativePath)] = structure
+                    
+                    # Track titles by folder to detect duplicates within the same folder
+                    folderPath = str(jsonFile.parent.relative_to(directory))
+                    if folderPath not in titlesByFolder:
+                        titlesByFolder[folderPath] = {}
+                    if newTitle not in titlesByFolder[folderPath]:
+                        titlesByFolder[folderPath][newTitle] = []
+                    titlesByFolder[folderPath][newTitle].append(str(relativePath))
 
-                filesProcessed += 1
-                
-        except json.JSONDecodeError as e:
-            filesWithErrors.append((str(jsonFile), f"JSON decode error: {e}"))
-        except Exception as e:
-            filesWithErrors.append((str(jsonFile), f"Error: {e}"))
+                    filesProcessed += 1
+                    
+            except json.JSONDecodeError as e:
+                filesWithErrors.append((str(jsonFile), f"JSON decode error: {e}"))
+            except Exception as e:
+                filesWithErrors.append((str(jsonFile), f"Error: {e}"))
 
     # Find duplicate titles within each folder
     for folderPath, titles in titlesByFolder.items():
