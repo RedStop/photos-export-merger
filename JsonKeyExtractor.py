@@ -2,6 +2,7 @@ import json
 import sys
 from pathlib import Path
 from collections import defaultdict
+from JsonFileIdentifier import JsonFileFinder
 
 def getNestedKeys(data, maxDepth=2, currentDepth=0):
     """
@@ -147,44 +148,39 @@ def processJsonFiles(directoryPath, outputFile='extracted_keys.json'):
     
     for jsonFile in jsonFiles:
         try:
+            data = None
             with open(jsonFile, 'r', encoding='utf-8') as f:
                 data = json.load(f)
+
+            if data is not None:
+                # Store with relative path as key
+                relativePath = jsonFile.relative_to(directory)
+                matchingFilename, newTitle = JsonFileFinder(jsonFile)
+
+                if newTitle is None:
+                    raise Exception(f"Title for {relativePath} is not available.")
+                
+                if matchingFilename is None:
+                    missingFiles.append({
+                        "json_file": str(relativePath)
+                    })
                 
                 # Get the key structure (first and second level)
                 structure = getNestedKeys(data, maxDepth=2)
-                
-                # Store with relative path as key
-                relativePath = jsonFile.relative_to(directory)
-                allStructures[str(relativePath)] = structure
-                
-                # Check if the actual file exists (based on the JSON filename)
-                # The JSON file is named like "DSCN0403.jpg.json", so we remove ".json" to get the actual filename
-                actualFileName = jsonFile.stem  # This removes the .json extension
-                actualFilePath = jsonFile.parent / actualFileName
-                
-                if not actualFilePath.exists():
-                    missingFiles.append({
-                        "json_file": str(relativePath),
-                        "expected_file": actualFileName,
-                        "expected_path": str(actualFilePath.relative_to(directory))
-                    })
-                
-                # Track titles by folder to detect duplicates within the same folder
-                if "title" in data and isinstance(data["title"], str):
-                    title = data["title"]
-                    folderPath = str(jsonFile.parent.relative_to(directory))
-                    
-                    if folderPath not in titlesByFolder:
-                        titlesByFolder[folderPath] = {}
-                    
-                    if title not in titlesByFolder[folderPath]:
-                        titlesByFolder[folderPath][title] = []
-                    
-                    titlesByFolder[folderPath][title].append(str(relativePath))
-                
                 # Merge into combined structure
                 combinedStructure = mergeStructures(combinedStructure, structure, "", str(relativePath), typeConflicts)
+                # Add the linked file to the structure
+                structure["MatchingFile"] = matchingFilename
+                allStructures[str(relativePath)] = structure
                 
+                # Track titles by folder to detect duplicates within the same folder
+                folderPath = str(jsonFile.parent.relative_to(directory))
+                if folderPath not in titlesByFolder:
+                    titlesByFolder[folderPath] = {}
+                if newTitle not in titlesByFolder[folderPath]:
+                    titlesByFolder[folderPath][newTitle] = []
+                titlesByFolder[folderPath][newTitle].append(str(relativePath))
+
                 filesProcessed += 1
                 
         except json.JSONDecodeError as e:
