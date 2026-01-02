@@ -116,6 +116,8 @@ def processJsonFiles(directoryPath, outputFile='extracted_keys.json'):
     filesWithErrors = []
     mkvFiles = []
     missingFiles = []
+    titlesByFolder = {}  # Dictionary to track titles by folder
+    duplicateTitles = []  # List of duplicate titles within same folder
     
     # Find all JSON files recursively
     jsonFiles = list(directory.rglob('*.json'))
@@ -154,6 +156,19 @@ def processJsonFiles(directoryPath, outputFile='extracted_keys.json'):
                         "expected_path": str(actualFilePath.relative_to(directory))
                     })
                 
+                # Track titles by folder to detect duplicates within the same folder
+                if "title" in data and isinstance(data["title"], str):
+                    title = data["title"]
+                    folderPath = str(jsonFile.parent.relative_to(directory))
+                    
+                    if folderPath not in titlesByFolder:
+                        titlesByFolder[folderPath] = {}
+                    
+                    if title not in titlesByFolder[folderPath]:
+                        titlesByFolder[folderPath][title] = []
+                    
+                    titlesByFolder[folderPath][title].append(str(relativePath))
+                
                 # Merge into combined structure
                 combinedStructure = mergeStructures(combinedStructure, structure, "", str(relativePath), typeConflicts)
                 
@@ -163,13 +178,27 @@ def processJsonFiles(directoryPath, outputFile='extracted_keys.json'):
             filesWithErrors.append((str(jsonFile), f"JSON decode error: {e}"))
         except Exception as e:
             filesWithErrors.append((str(jsonFile), f"Error: {e}"))
-    
+
+    # Find duplicate titles within each folder
+    for folderPath, titles in titlesByFolder.items():
+        for title, jsonFilesList in titles.items():
+            if len(jsonFilesList) > 1:
+                duplicateTitles.append({
+                    "folder": folderPath,
+                    "title": title,
+                    "json_files": jsonFilesList
+                })
+
     # Create final output with both individual and combined structures
     outputData = {
         "combined_structure": combinedStructure,
         "individual_files": allStructures,
         "mkv_files": [str(mkv.relative_to(directory)) for mkv in mkvFiles]
     }
+    
+    # Add duplicate titles if any were found
+    if duplicateTitles:
+        outputData["duplicate_titles"] = duplicateTitles
     
     # Add type conflicts if any were found
     if typeConflicts:
@@ -213,6 +242,19 @@ def processJsonFiles(directoryPath, outputFile='extracted_keys.json'):
             print(f"    Expected at: {missing['expected_path']}")
             print()
     
+    if duplicateTitles:
+        totalDuplicates = sum(len(dup['json_files']) for dup in duplicateTitles)
+        print(f"\nDuplicate titles found: {len(duplicateTitles)} title(s) with duplicates in the same folder")
+        print(f"Total JSON files with duplicate titles: {totalDuplicates}")
+        print("\nDuplicate titles within same folder:")
+        for duplicate in duplicateTitles:
+            print(f"  Folder: {duplicate['folder']}")
+            print(f"  Title: {duplicate['title']}")
+            print(f"  JSON files ({len(duplicate['json_files'])}):")
+            for jsonFile in duplicate['json_files']:
+                print(f"    - {jsonFile}")
+            print()
+    
     if mkvFiles:
         print(f"\nMKV files found: {len(mkvFiles)}")
         print("\nMKV files:")
@@ -224,6 +266,8 @@ def processJsonFiles(directoryPath, outputFile='extracted_keys.json'):
     print(f"  - 'combined_structure': Merged structure from all files")
     print(f"  - 'individual_files': Structure for each file")
     print(f"  - 'mkv_files': List of all MKV files found")
+    if duplicateTitles:
+        print(f"  - 'duplicate_titles': JSON files with duplicate title fields in same folder")
     if typeConflicts:
         print(f"  - 'type_conflicts': List of type mismatches found")
     if missingFiles:
