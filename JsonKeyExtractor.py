@@ -98,10 +98,10 @@ def mergeStructures(struct1, struct2, currentPath="", currentFile="", typeConfli
     
     return result
 
-def processJsonFiles(directoryPath, outputFile='extracted_keys.json'):
+def processJsonFiles(directoryPath, outputDir='output'):
     """
     Process all JSON files in directory and subdirectories.
-    Extract first and second level keys and save to a new JSON file.
+    Extract first and second level keys and save to multiple JSON files.
     """
     directory = Path(directoryPath)
     
@@ -279,37 +279,41 @@ def processJsonFiles(directoryPath, outputFile='extracted_keys.json'):
         if ext.lower() not in countOnlyExtensions:
             fileTypeSummary["detailed_listings"][ext] = sorted(files)
     
-    # Create final output with both individual and combined structures
-    outputData = {
+    # Create output directory
+    outputPath = Path(outputDir)
+    outputPath.mkdir(exist_ok=True)
+    
+    # Create individual JSON files for each top-level key
+    outputFiles = {
         "combined_structure": combinedStructure,
         "individual_files": allStructures,
         "file_types": fileTypeSummary
     }
     
-    # Add type conflicts if any were found
+    # Add optional sections if they have data
     if typeConflicts:
-        outputData["type_conflicts"] = typeConflicts
+        outputFiles["type_conflicts"] = typeConflicts
     
-    # Add duplicate titles if any were found
     if duplicateTitles:
-        outputData["duplicate_titles"] = duplicateTitles
+        outputFiles["duplicate_titles"] = duplicateTitles
     
-    # Add duplicate matching filenames if any were found
     if duplicateMatchingFilenames:
-        outputData["duplicate_matching_filenames"] = duplicateMatchingFilenames
+        outputFiles["duplicate_matching_filenames"] = duplicateMatchingFilenames
 
-    # Add missing files if any were found
     if missingFiles:
-        outputData["missing_files"] = missingFiles
+        outputFiles["missing_files"] = missingFiles
     
-    # Add unreferenced files if any were found
     if unreferencedFilesByFolder:
-        outputData["unreferenced_files"] = unreferencedFilesByFolder
+        outputFiles["unreferenced_files"] = unreferencedFilesByFolder
     
-    # Save the results
-    outputPath = Path(outputFile)
-    with open(outputPath, 'w', encoding='utf-8') as f:
-        json.dump(outputData, f, indent=2, ensure_ascii=False)
+    # Save each top-level key to its own file
+    savedFiles = []
+    for key, data in outputFiles.items():
+        filename = f"{key}.json"
+        filepath = outputPath / filename
+        with open(filepath, 'w', encoding='utf-8') as f:
+            json.dump(data, f, indent=2, ensure_ascii=False)
+        savedFiles.append(filename)
     
     # Print summary
     print(f"\nProcessing complete!")
@@ -346,23 +350,10 @@ def processJsonFiles(directoryPath, outputFile='extracted_keys.json'):
         totalUnreferenced = sum(len(files) for files in unreferencedFilesByFolder.values())
         print(f"Unreferenced files: {totalUnreferenced} file(s) in {len(unreferencedFilesByFolder)} folder(s)")
     
-    print(f"\nOutput saved to: {outputPath.absolute()}")
-    print(f"The output contains:")
-    print(f"  - 'combined_structure': Merged structure from all files")
-    print(f"  - 'individual_files': Matching_filename, title and structure for each file")
-    print(f"  - 'file_types': Summary and detailed listings of all file types")
-    print(f"    - 'summary': Count of each file type")
-    print(f"    - 'detailed_listings': Individual files (except json, jpg, jpeg, mp4)")
-    if typeConflicts:
-        print(f"  - 'type_conflicts': List of type mismatches found")
-    if duplicateTitles:
-        print(f"  - 'duplicate_titles': JSON files with duplicate title fields in same folder")
-    if duplicateMatchingFilenames:
-        print(f"  - 'duplicate_matching_filenames': JSON files pointing to same file in same folder")
-    if missingFiles:
-        print(f"  - 'missing_files': List of files described by JSON but not found on disk")
-    if unreferencedFilesByFolder:
-        print(f"  - 'unreferenced_files': Non-JSON files without a corresponding JSON file")
+    print(f"\nOutput saved to directory: {outputPath.absolute()}")
+    print(f"Generated files:")
+    for filename in savedFiles:
+        print(f"  - {filename}")
 
 if __name__ == "__main__":
     # Specify the directory to scan
@@ -370,10 +361,12 @@ if __name__ == "__main__":
     if len(sys.argv) > 1:
         directoryToScan = sys.argv[1]
     
-    # Optional: specify custom output file name
-    outputFilename = "extracted_keys.json"
+    # Optional: specify custom output directory name
+    outputDirName = "output"
+    if len(sys.argv) > 2:
+        outputDirName = sys.argv[2]
     
-    processJsonFiles(directoryToScan, outputFilename)
+    processJsonFiles(directoryToScan, outputDirName)
 
     # TODO:
     # Find the missing .json files.
