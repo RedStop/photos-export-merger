@@ -118,6 +118,8 @@ def processJsonFiles(directoryPath, outputFile='extracted_keys.json'):
     missingFiles = []
     titlesByFolder = {}  # Dictionary to track titles by folder
     duplicateTitles = []  # List of duplicate titles within same folder
+    matchingFilenamesByFolder = {}  # Dictionary to track matching filenames by folder
+    duplicateMatchingFilenames = []  # List of duplicate matching filenames within same folder
     
     # Track all file types
     fileTypeTracking = defaultdict(list)
@@ -186,16 +188,20 @@ def processJsonFiles(directoryPath, outputFile='extracted_keys.json'):
                     
                     if matchingFilename is None:
                         missingFiles.append({
-                            "json_file": str(relativePath)
+                            "json_file": str(relativePath),
+                            "title": newTitle
                         })
                     
                     # Get the key structure (first and second level)
                     structure = getNestedKeys(data, maxDepth=2)
                     # Merge into combined structure
                     combinedStructure = mergeStructures(combinedStructure, structure, "", str(relativePath), typeConflicts)
-                    # Add the linked file to the structure
-                    structure["MatchingFile"] = matchingFilename
-                    allStructures[str(relativePath)] = structure
+                    # Add the linked file to the structure with metadata
+                    allStructures[str(relativePath)] = {
+                        "matching_filename": matchingFilename,
+                        "title": newTitle,
+                        "structure": structure
+                    }
                     
                     # Track titles by folder to detect duplicates within the same folder
                     folderPath = str(jsonFile.parent.relative_to(directory))
@@ -204,6 +210,14 @@ def processJsonFiles(directoryPath, outputFile='extracted_keys.json'):
                     if newTitle not in titlesByFolder[folderPath]:
                         titlesByFolder[folderPath][newTitle] = []
                     titlesByFolder[folderPath][newTitle].append(str(relativePath))
+                    
+                    # Track matching filenames by folder to detect duplicates within the same folder
+                    if matchingFilename is not None:
+                        if folderPath not in matchingFilenamesByFolder:
+                            matchingFilenamesByFolder[folderPath] = {}
+                        if matchingFilename not in matchingFilenamesByFolder[folderPath]:
+                            matchingFilenamesByFolder[folderPath][matchingFilename] = []
+                        matchingFilenamesByFolder[folderPath][matchingFilename].append(str(relativePath))
 
                     filesProcessed += 1
                     
@@ -219,6 +233,16 @@ def processJsonFiles(directoryPath, outputFile='extracted_keys.json'):
                 duplicateTitles.append({
                     "folder": folderPath,
                     "title": title,
+                    "json_files": jsonFilesList
+                })
+    
+    # Find duplicate matching filenames within each folder
+    for folderPath, filenames in matchingFilenamesByFolder.items():
+        for filename, jsonFilesList in filenames.items():
+            if len(jsonFilesList) > 1:
+                duplicateMatchingFilenames.append({
+                    "folder": folderPath,
+                    "matching_filename": filename,
                     "json_files": jsonFilesList
                 })
 
@@ -252,6 +276,10 @@ def processJsonFiles(directoryPath, outputFile='extracted_keys.json'):
     # Add duplicate titles if any were found
     if duplicateTitles:
         outputData["duplicate_titles"] = duplicateTitles
+    
+    # Add duplicate matching filenames if any were found
+    if duplicateMatchingFilenames:
+        outputData["duplicate_matching_filenames"] = duplicateMatchingFilenames
 
     # Add missing files if any were found
     if missingFiles:
@@ -284,13 +312,18 @@ def processJsonFiles(directoryPath, outputFile='extracted_keys.json'):
         print(f"Duplicate titles found: {len(duplicateTitles)} title(s) with duplicates in the same folder")
         print(f" - Total JSON files with duplicate titles: {totalDuplicates}")
     
+    if duplicateMatchingFilenames:
+        totalDuplicates = sum(len(dup['json_files']) for dup in duplicateMatchingFilenames)
+        print(f"Duplicate matching filenames found: {len(duplicateMatchingFilenames)} filename(s) with duplicates in the same folder")
+        print(f" - Total JSON files with duplicate matching filenames: {totalDuplicates}")
+    
     if missingFiles:
         print(f"Missing files: {len(missingFiles)}")
     
     print(f"\nOutput saved to: {outputPath.absolute()}")
     print(f"The output contains:")
     print(f"  - 'combined_structure': Merged structure from all files")
-    print(f"  - 'individual_files': Structure for each file")
+    print(f"  - 'individual_files': Matching_filename, title and structure for each file")
     print(f"  - 'file_types': Summary and detailed listings of all file types")
     print(f"    - 'summary': Count of each file type")
     print(f"    - 'detailed_listings': Individual files (except json, jpg, jpeg, mp4)")
@@ -298,6 +331,8 @@ def processJsonFiles(directoryPath, outputFile='extracted_keys.json'):
         print(f"  - 'type_conflicts': List of type mismatches found")
     if duplicateTitles:
         print(f"  - 'duplicate_titles': JSON files with duplicate title fields in same folder")
+    if duplicateMatchingFilenames:
+        print(f"  - 'duplicate_matching_filenames': JSON files pointing to same file in same folder")
     if missingFiles:
         print(f"  - 'missing_files': List of files described by JSON but not found on disk")
 
