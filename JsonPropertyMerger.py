@@ -3,8 +3,7 @@
 # Title: JsonPropertyMerger
 
 from datetime import datetime, timezone
-from pathlib import Path
-from typing import Tuple, Union, Optional, List
+from typing import Tuple, Union, Optional, List, Dict, Any
 import enum
 import exiftool
 import json
@@ -88,7 +87,7 @@ class JsonPropertyMerger:
         return newTagsDict, imageMetaData
 
     def ExtracJsonData(this, jsonFile=""):
-        data = None
+        data:Optional[Dict[str, Any]] = None
         jsonFile = str(jsonFile)
         try:
             with open(jsonFile, mode="r") as file:
@@ -118,31 +117,25 @@ class JsonPropertyMerger:
 
     '''
     Update the the image refrenced in the Google Photo's json file with the parameters in the file.
-    @param jsonFile (str): path to the jsonFile that should be parsed and used to updated the image's metadata with.
+    @param jsonFile (str|Dict[str, Any]): path to the jsonFile that should be parsed and used to updated the image's metadata with, or the already parsed json data in a Dict[str, Any] format
     @param imageFile (str): Optional path to the image who's metadata should be updated. If not provided, the title
     field in the json file will be used, and the image must be in the same directory as the json file.
     @param descriptionTagUpdateMode (TagUpdateMode): Optionally overwrite the default (that can be set when creating
     this class) description tag update mode that is used.
     '''
-    def UpdateImageMetaDataWithJson(this, jsonFile: str, imagefile: Optional[str] = None, descriptionTagUpdateMode: Optional[TagUpdateMode] = None):
+    def UpdateImageMetaDataWithJson(this, jsonFile: Union[str,Dict[str, Any]], imageFile: str, descriptionTagUpdateMode: Optional[TagUpdateMode] = None):
         if (descriptionTagUpdateMode is None):
             descriptionTagUpdateMode = this.descriptionTagUpdateMode
 
-        googleMetadata = this.ExtracJsonData(jsonFile)
+        if isinstance(jsonFile, str): 
+            googleMetadata = this.ExtracJsonData(jsonFile)
+        else:
+            googleMetadata = jsonFile
         if (googleMetadata is None):
             return None
 
-        if (imagefile is None):
-            # Get the file name from the googleMetaData
-            imagefile = googleMetadata.get("title")
-            if (imagefile is None):
-                this.logger.error("Title did not obtain the image name for the jsonFile: %s", str(jsonFile))
-                return None
-            # Add the prefix if there is one, since it is assumed that the json and image files are in the same directory.
-            imageFile = str(Path(jsonFile).with_name(imagefile))
-            if (this.logger.isEnabledFor(logging.DEBUG)):
-                this.logger.debug("Image file location: %s", imageFile)
-
+        # File must be renamed to this name
+        newTitle = googleMetadata.get("title")
         description = googleMetadata.get("description")
         photoTakenTime = googleMetadata.get("photoTakenTime")
         if (description is not None and len(description) > 0):

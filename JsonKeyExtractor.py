@@ -2,6 +2,7 @@ from JsonFileIdentifier import JsonFileFinder
 from collections import defaultdict
 from pathlib import Path
 from sortedcontainers import SortedSet
+from typing import Dict, Optional, Any
 import json
 import sys
 
@@ -172,7 +173,7 @@ def processJsonFiles(directoryPath, outputDir='output'):
         
         for jsonFile in jsonFiles:
             try:
-                data = None
+                data:Optional[Dict[str, Any]] = None
                 # Load JSON data once
                 with open(jsonFile, 'r', encoding='utf-8') as f:
                     data = json.load(f)
