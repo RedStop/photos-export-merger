@@ -126,11 +126,9 @@ def processJsonFiles(directoryPath, outputFile='extracted_keys.json'):
     print("Scanning directory tree...")
     allFiles = [f for f in directory.rglob('*') if f.is_file()]
     
-    # Group files by their parent directory (as filenames only)
-    filesByDirectory = defaultdict(set)
+    # Group files by their parent directory, excluding JSON files
+    nonJsonFilesByDirectory = defaultdict(set)
     for file in allFiles:
-        filesByDirectory[file.parent].add(file.name)
-        
         # Track file types
         ext = file.suffix.lower()
         if not ext:
@@ -140,6 +138,10 @@ def processJsonFiles(directoryPath, outputFile='extracted_keys.json'):
         
         relativePath = str(file.relative_to(directory))
         fileTypeTracking[ext].append(relativePath)
+        
+        # Add to directory set only if not a JSON file
+        if ext != 'json':
+            nonJsonFilesByDirectory[file.parent].add(file.name)
     
     # Group JSON files by directory
     jsonFilesByDirectory = defaultdict(list)
@@ -158,13 +160,13 @@ def processJsonFiles(directoryPath, outputFile='extracted_keys.json'):
     
     # OPTIMIZATION: Process JSON files directory by directory
     for dir_path, jsonFiles in jsonFilesByDirectory.items():
-        # Get all filenames in this directory (filter once per directory)
-        dir_filenames = filesByDirectory[dir_path]
+        # Get all non-JSON filenames in this directory (already filtered)
+        dir_non_json_filenames = nonJsonFilesByDirectory[dir_path]
         
         for jsonFile in jsonFiles:
             try:
                 data = None
-                # OPTIMIZATION: Load JSON data once
+                # Load JSON data once
                 with open(jsonFile, 'r', encoding='utf-8') as f:
                     data = json.load(f)
 
@@ -172,11 +174,11 @@ def processJsonFiles(directoryPath, outputFile='extracted_keys.json'):
                     # Store with relative path as key
                     relativePath = jsonFile.relative_to(directory)
                     
-                    # OPTIMIZATION: Pass pre-loaded data and filtered filenames for this directory
+                    # Pass pre-loaded data and pre-filtered non-JSON filenames
                     matchingFilename, newTitle = JsonFileFinder(
                         str(jsonFile),
                         json_data=data,
-                        dir_files=dir_filenames
+                        dir_files=dir_non_json_filenames
                     )
 
                     if newTitle is None:

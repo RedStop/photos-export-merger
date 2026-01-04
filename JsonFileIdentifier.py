@@ -18,7 +18,7 @@ def JsonFileFinder(
     Args:
         json_path: Path to the .json file
         json_data: Optional pre-loaded JSON data (to avoid re-parsing)
-        dir_files: Optional set of filenames (not full paths) in the same directory as the json_path's file
+        dir_files: Optional set of non-JSON filenames (not full paths) in the same directory
         
     Returns:
         Tuple of (matching_filename, new_title):
@@ -72,13 +72,14 @@ def JsonFileFinder(
             # Remove (N).json to get base
             base_without_bracket = json_filename[:bracket_match.start()]
             
-            # Get list of filenames to check
+            # Get filenames to check
             if dir_files is not None:
-                filenames_to_check = [f for f in dir_files if f != json_filename]
+                # dir_files already excludes JSON files, use directly as set
+                filenames_to_check = dir_files
             else:
                 try:
                     files_in_dir = list(directory.iterdir())
-                    filenames_to_check = [f.name for f in files_in_dir if f.is_file() and f.name != json_filename]
+                    filenames_to_check = {f.name for f in files_in_dir if f.is_file() and not f.name.endswith('.json')}
                 except OSError:
                     return (None, new_title)
             
@@ -98,13 +99,14 @@ def JsonFileFinder(
         if json_filename.endswith('.json'):
             base_without_json = json_filename[:-5]
             
-            # Get list of filenames to check
+            # Get filenames to check
             if dir_files is not None:
-                filenames_to_check = [f for f in dir_files if f != json_filename]
+                # dir_files already excludes JSON files, use directly as set
+                filenames_to_check = dir_files
             else:
                 try:
                     files_in_dir = list(directory.iterdir())
-                    filenames_to_check = [f.name for f in files_in_dir if f.is_file() and f.name != json_filename]
+                    filenames_to_check = {f.name for f in files_in_dir if f.is_file() and not f.name.endswith('.json')}
                 except OSError:
                     return (None, new_title)
             
