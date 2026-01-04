@@ -12,3 +12,4 @@ No gurantees are made, so ensure you have a backup of your photos somewhere else
 ## Python packages
 
 - PyExifTool 0.5.4 (use `pip install PyExifTool`)
+- sortedcontainers 2.4.0 (use `pip install sortedcontainers`)
