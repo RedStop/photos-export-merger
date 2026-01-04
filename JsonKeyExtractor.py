@@ -120,6 +120,7 @@ def processJsonFiles(directoryPath, outputFile='extracted_keys.json'):
     duplicateTitles = []  # List of duplicate titles within same folder
     matchingFilenamesByFolder = {}  # Dictionary to track matching filenames by folder
     duplicateMatchingFilenames = []  # List of duplicate matching filenames within same folder
+    unreferencedFilesByFolder = {}  # Dictionary to track unreferenced non-JSON files by folder
     
     # Track all file types
     fileTypeTracking = defaultdict(list)
@@ -150,6 +151,9 @@ def processJsonFiles(directoryPath, outputFile='extracted_keys.json'):
     for file in allFiles:
         if file.suffix.lower() == '.json':
             jsonFilesByDirectory[file.parent].append(file)
+    
+    # Track referenced files by directory
+    referencedFilesByDirectory = defaultdict(set)
     
     totalJsonFiles = sum(len(files) for files in jsonFilesByDirectory.values())
     
@@ -191,6 +195,9 @@ def processJsonFiles(directoryPath, outputFile='extracted_keys.json'):
                             "json_file": str(relativePath),
                             "title": newTitle
                         })
+                    else:
+                        # Track this referenced file
+                        referencedFilesByDirectory[dir_path].add(matchingFilename)
                     
                     # Get the key structure (first and second level)
                     structure = getNestedKeys(data, maxDepth=2)
@@ -225,6 +232,16 @@ def processJsonFiles(directoryPath, outputFile='extracted_keys.json'):
                 filesWithErrors.append((str(jsonFile), f"JSON decode error: {e}"))
             except Exception as e:
                 filesWithErrors.append((str(jsonFile), f"Error: {e}"))
+
+    # Find unreferenced files in each directory
+    for dir_path in nonJsonFilesByDirectory.keys():
+        allNonJsonFiles = nonJsonFilesByDirectory[dir_path]
+        referencedFiles = referencedFilesByDirectory.get(dir_path, set())
+        unreferencedFiles = allNonJsonFiles - referencedFiles
+        
+        if unreferencedFiles:
+            folderPath = str(dir_path.relative_to(directory))
+            unreferencedFilesByFolder[folderPath] = sorted(list(unreferencedFiles))
 
     # Find duplicate titles within each folder
     for folderPath, titles in titlesByFolder.items():
@@ -285,6 +302,10 @@ def processJsonFiles(directoryPath, outputFile='extracted_keys.json'):
     if missingFiles:
         outputData["missing_files"] = missingFiles
     
+    # Add unreferenced files if any were found
+    if unreferencedFilesByFolder:
+        outputData["unreferenced_files"] = unreferencedFilesByFolder
+    
     # Save the results
     outputPath = Path(outputFile)
     with open(outputPath, 'w', encoding='utf-8') as f:
@@ -320,6 +341,11 @@ def processJsonFiles(directoryPath, outputFile='extracted_keys.json'):
     if missingFiles:
         print(f"Missing files: {len(missingFiles)}")
     
+    # Print unreferenced files summary
+    if unreferencedFilesByFolder:
+        totalUnreferenced = sum(len(files) for files in unreferencedFilesByFolder.values())
+        print(f"Unreferenced files: {totalUnreferenced} file(s) in {len(unreferencedFilesByFolder)} folder(s)")
+    
     print(f"\nOutput saved to: {outputPath.absolute()}")
     print(f"The output contains:")
     print(f"  - 'combined_structure': Merged structure from all files")
@@ -335,6 +361,8 @@ def processJsonFiles(directoryPath, outputFile='extracted_keys.json'):
         print(f"  - 'duplicate_matching_filenames': JSON files pointing to same file in same folder")
     if missingFiles:
         print(f"  - 'missing_files': List of files described by JSON but not found on disk")
+    if unreferencedFilesByFolder:
+        print(f"  - 'unreferenced_files': Non-JSON files without a corresponding JSON file")
 
 if __name__ == "__main__":
     # Specify the directory to scan
@@ -348,6 +376,4 @@ if __name__ == "__main__":
     processJsonFiles(directoryToScan, outputFilename)
 
     # TODO:
-    # Detect photo's that does not have a .json file.
     # Find the missing .json files.
-    # Ensure each .json file points to a unique photo
