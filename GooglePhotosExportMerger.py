@@ -143,7 +143,7 @@ def _build_gps_params(gps: Dict[str, float]) -> List[str]:
 
 def _build_sidecar_params(info: MediaFileInfo, gps: Optional[Dict[str, float]]) -> List[str]:
     """Build ExifTool params for creating an XMP sidecar."""
-    params = ['-charset', 'filename=utf8', '-overwrite_original']
+    params = ['-charset', 'filename=utf8']
 
     if info.resolved_datetime:
         tz_str = _format_tz_offset(info.resolved_datetime.tzinfo)
@@ -502,7 +502,16 @@ class GooglePhotosExportMerger:
         # Ensure output directory exists
         info.output_path.parent.mkdir(parents=True, exist_ok=True)
 
-        # Build ExifTool params
+        # Copy source to output first (never pass source path to ExifTool,
+        # as ExifTool with -o and -overwrite_original can delete the source)
+        try:
+            shutil.copy2(str(info.source_path), str(info.output_path))
+        except Exception as e:
+            self.logger.error("Failed to copy %s: %s", self._rel(info.source_path), e)
+            stats.errors += 1
+            return
+
+        # Build ExifTool params for in-place write on the output copy
         params = ['-charset', 'filename=utf8', '-overwrite_original']
 
         # Date tags
@@ -529,44 +538,16 @@ class GooglePhotosExportMerger:
                 params.extend(_build_gps_params(gps))
                 stats.gps_written += 1
 
-        # Output path (copy + write in one operation)
-        params.append('-o')
+        # Write metadata to the output copy in-place
         params.append(str(info.output_path))
-        params.append(str(info.source_path))
 
         try:
             et.execute(*[p.encode('utf-8') if isinstance(p, str) else p for p in params])
-            stats.written += 1
         except Exception as e:
-            self.logger.warning("ExifTool write failed for %s, falling back to copy: %s", self._rel(info.source_path), e)
-            try:
-                shutil.copy2(str(info.source_path), str(info.output_path))
-                # Try in-place write
-                in_place_params = ['-charset', 'filename=utf8', '-overwrite_original']
-                if info.resolved_datetime:
-                    dt_str = info.resolved_datetime.strftime('%Y:%m:%d %H:%M:%S')
-                    tz_str = _format_tz_offset(info.resolved_datetime.tzinfo)
-                    in_place_params.append(f'-alldates={dt_str}')
-                    in_place_params.append(f'-EXIF:ExifIFD:OffsetTime={tz_str}')
-                    in_place_params.append(f'-EXIF:ExifIFD:OffsetTimeOriginal={tz_str}')
-                    in_place_params.append(f'-EXIF:ExifIFD:OffsetTimeDigitized={tz_str}')
-                if info.json_data:
-                    desc = info.json_data.get('description', '')
-                    if desc:
-                        in_place_params.append(f'-XMP-dc:Description={desc}')
-                        in_place_params.append(f'-EXIF:ImageDescription={desc}')
-                if gps:
-                    in_place_params.extend(_build_gps_params(gps))
-                in_place_params.append(str(info.output_path))
-                try:
-                    et.execute(*[p.encode('utf-8') if isinstance(p, str) else p for p in in_place_params])
-                except Exception as e2:
-                    self.logger.warning("In-place write also failed for %s: %s (file copied without metadata)", self._rel(info.source_path), e2)
-                stats.written += 1
-            except Exception as e3:
-                self.logger.error("Copy also failed for %s: %s", self._rel(info.source_path), e3)
-                stats.errors += 1
-                return
+            self.logger.warning("ExifTool metadata write failed for %s: %s (file copied without metadata)",
+                                self._rel(info.source_path), e)
+
+        stats.written += 1
 
         # Create XMP sidecar if needed
         if info.sidecar_path:
