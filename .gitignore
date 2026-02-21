@@ -10,6 +10,7 @@
 *.mov
 *.mp4
 *.png
+*.xmp
 *.zip
 
 __pycache__

@@ -502,17 +502,8 @@ class GooglePhotosExportMerger:
         # Ensure output directory exists
         info.output_path.parent.mkdir(parents=True, exist_ok=True)
 
-        # Copy source to output first (never pass source path to ExifTool,
-        # as ExifTool with -o and -overwrite_original can delete the source)
-        try:
-            shutil.copy2(str(info.source_path), str(info.output_path))
-        except Exception as e:
-            self.logger.error("Failed to copy %s: %s", self._rel(info.source_path), e)
-            stats.errors += 1
-            return
-
-        # Build ExifTool params for in-place write on the output copy
-        params = ['-charset', 'filename=utf8', '-overwrite_original']
+        # Build ExifTool params (NO -overwrite_original: -o copies to output without deleting source)
+        params = ['-charset', 'filename=utf8']
 
         # Date tags
         if info.resolved_datetime:
@@ -538,14 +529,34 @@ class GooglePhotosExportMerger:
                 params.extend(_build_gps_params(gps))
                 stats.gps_written += 1
 
-        # Write metadata to the output copy in-place
+        # Use -o to copy source to output with metadata in one step
+        params.append('-o')
         params.append(str(info.output_path))
+        params.append(str(info.source_path))
 
         try:
             et.execute(*[p.encode('utf-8') if isinstance(p, str) else p for p in params])
         except Exception as e:
-            self.logger.warning("ExifTool metadata write failed for %s: %s (file copied without metadata)",
-                                self._rel(info.source_path), e)
+            if info.output_path.exists():
+                # ExifTool status 1 = warnings (e.g. unsupported tags for this format).
+                # The -o copy still succeeded, so treat as success with warnings.
+                self.logger.debug("ExifTool warnings for %s: %s (output created successfully)",
+                                  self._rel(info.source_path), e)
+            else:
+                # Genuine failure: output not created. Fallback to copy + in-place write.
+                self.logger.warning("ExifTool -o failed for %s: %s, falling back to copy+write",
+                                    self._rel(info.source_path), e)
+                try:
+                    shutil.copy2(str(info.source_path), str(info.output_path))
+                    fallback_params = ['-charset', 'filename=utf8', '-overwrite_original']
+                    fallback_params.extend(params[2:-3])  # tag params only (skip charset/filename, -o/output/source)
+                    fallback_params.append(str(info.output_path))
+                    et.execute(*[p.encode('utf-8') if isinstance(p, str) else p for p in fallback_params])
+                except Exception as e2:
+                    if not info.output_path.exists():
+                        self.logger.error("Failed to process %s: %s", self._rel(info.source_path), e2)
+                        stats.errors += 1
+                        return
 
         stats.written += 1
 
