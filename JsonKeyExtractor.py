@@ -123,6 +123,7 @@ def processJsonFiles(directoryPath, outputDir='output'):
     matchingFilenamesByFolder = {}  # Dictionary to track matching filenames by folder
     duplicateMatchingFilenames = []  # List of duplicate matching filenames within same folder
     unreferencedFilesByFolder = {}  # Dictionary to track unreferenced non-JSON files by folder
+    descriptions = {}  # Dictionary to track non-empty descriptions by JSON file
     
     # Track all file types
     fileTypeTracking = defaultdict(list)
@@ -201,6 +202,11 @@ def processJsonFiles(directoryPath, outputDir='output'):
                         # Track this referenced file
                         referencedFilesByDirectory[dir_path].add(matchingFilename)
                     
+                    # Track non-empty descriptions
+                    fileDescription = data.get("description")
+                    if fileDescription is not None and len(fileDescription) > 0:
+                        descriptions[str(relativePath)] = fileDescription
+
                     # Get the key structure (first and second level)
                     structure = getNestedKeys(data, maxDepth=2)
                     # Merge into combined structure
@@ -307,6 +313,9 @@ def processJsonFiles(directoryPath, outputDir='output'):
     
     if unreferencedFilesByFolder:
         outputFiles["unreferenced_files"] = unreferencedFilesByFolder
+
+    if descriptions:
+        outputFiles["descriptions"] = descriptions
     
     # Save each top-level key to its own file
     savedFiles = []
@@ -347,6 +356,9 @@ def processJsonFiles(directoryPath, outputDir='output'):
     if missingFiles:
         print(f"Missing files: {len(missingFiles)}")
     
+    if descriptions:
+        print(f"Descriptions found: {len(descriptions)}")
+
     # Print unreferenced files summary
     if unreferencedFilesByFolder:
         totalUnreferenced = sum(len(files) for files in unreferencedFilesByFolder.values())
