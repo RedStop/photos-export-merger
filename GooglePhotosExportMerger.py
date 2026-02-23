@@ -33,6 +33,8 @@ DATE_TAGS_PRIORITY = [
     'EXIF:ModifyDate',
 ]
 
+DESC_READ_TAGS = ['EXIF:UserComment', 'EXIF:ImageDescription', 'XMP:Description']
+
 GMT_PLUS_2 = timezone(timedelta(hours=2))
 
 
@@ -48,6 +50,7 @@ class MediaFileInfo:
     year: Optional[str] = None
     month: Optional[str] = None
     is_orphan: bool = False
+    clear_descriptions: bool = False
     date_source: Optional[str] = None
     resolved_datetime: Optional[datetime] = None
     error: Optional[str] = None
@@ -66,6 +69,7 @@ class MergeStats:
     date_from_exif: int = 0
     date_from_filesystem: int = 0
     gps_written: int = 0
+    descriptions_cleared: int = 0
 
 
 def _get_write_strategy(ext: str) -> Optional[WriteStrategy]:
@@ -152,7 +156,7 @@ def _build_sidecar_params(info: MediaFileInfo, gps: Optional[Dict[str, float]]) 
         params.append(f'-XMP:CreateDate={dt_str}')
         params.append(f'-XMP:ModifyDate={dt_str}')
 
-    if info.json_data:
+    if not info.clear_descriptions and info.json_data:
         desc = info.json_data.get('description', '')
         if desc:
             params.append(f'-XMP-dc:Description={desc}')
@@ -166,10 +170,12 @@ def _build_sidecar_params(info: MediaFileInfo, gps: Optional[Dict[str, float]]) 
 
 
 class GooglePhotosExportMerger:
-    def __init__(self, input_dir: str, output_dir: str, dry_run: bool = False):
+    def __init__(self, input_dir: str, output_dir: str, dry_run: bool = False,
+                 blocked_descriptions: Optional[List[str]] = None):
         self.input_path = Path(input_dir).resolve()
         self.output_path = Path(output_dir).resolve()
         self.dry_run = dry_run
+        self.blocked_descriptions: set = set(blocked_descriptions) if blocked_descriptions else set()
         self.logger = logging.getLogger('GooglePhotosExportMerger')
         self.logger.setLevel(logging.DEBUG)
         if not self.logger.handlers:
@@ -350,14 +356,27 @@ class GooglePhotosExportMerger:
         for dir_path, infos in matched_by_dir.items():
             file_paths = [str(info.source_path) for info in infos]
             tz_tags = ['EXIF:OffsetTimeOriginal', 'EXIF:OffsetTime']
+            read_tags = tz_tags + (DESC_READ_TAGS if self.blocked_descriptions else [])
 
             try:
-                tag_results = et.get_tags(file_paths, tz_tags)
+                tag_results = et.get_tags(file_paths, read_tags)
             except Exception as e:
                 self.logger.warning("Failed to batch-read timezone from %s: %s", self._rel(dir_path), e)
                 tag_results = [{} for _ in infos]
 
             for info, tags in zip(infos, tag_results):
+                # Check blocked descriptions
+                if self.blocked_descriptions and info.json_data:
+                    json_desc = info.json_data.get('description', '')
+                    if json_desc and json_desc in self.blocked_descriptions:
+                        info.clear_descriptions = True
+                    elif not json_desc:
+                        for desc_tag in DESC_READ_TAGS:
+                            exif_desc = tags.get(desc_tag, '')
+                            if exif_desc and str(exif_desc) in self.blocked_descriptions:
+                                info.clear_descriptions = True
+                                break
+
                 epoch_str = None
                 if info.json_data:
                     pt = info.json_data.get('photoTakenTime')
@@ -394,14 +413,23 @@ class GooglePhotosExportMerger:
         # Resolve dates for orphan files (batch read per directory)
         for dir_path, infos in orphans_by_dir.items():
             file_paths = [str(info.source_path) for info in infos]
+            read_tags = DATE_TAGS_PRIORITY + (DESC_READ_TAGS if self.blocked_descriptions else [])
 
             try:
-                tag_results = et.get_tags(file_paths, DATE_TAGS_PRIORITY)
+                tag_results = et.get_tags(file_paths, read_tags)
             except Exception as e:
                 self.logger.warning("Failed to batch-read dates from %s: %s", self._rel(dir_path), e)
                 tag_results = [{} for _ in infos]
 
             for info, tags in zip(infos, tag_results):
+                # Check blocked descriptions on existing EXIF tags
+                if self.blocked_descriptions:
+                    for desc_tag in DESC_READ_TAGS:
+                        exif_desc = tags.get(desc_tag, '')
+                        if exif_desc and str(exif_desc) in self.blocked_descriptions:
+                            info.clear_descriptions = True
+                            break
+
                 resolved_dt = None
                 date_source = None
 
@@ -515,7 +543,12 @@ class GooglePhotosExportMerger:
             params.append(f'-EXIF:ExifIFD:OffsetTimeDigitized={tz_str}')
 
         # Description
-        if info.json_data:
+        if info.clear_descriptions:
+            params.append('-EXIF:UserComment=')
+            params.append('-EXIF:ImageDescription=')
+            params.append('-XMP-dc:Description=')
+            stats.descriptions_cleared += 1
+        elif info.json_data:
             desc = info.json_data.get('description', '')
             if desc:
                 params.append(f'-XMP-dc:Description={desc}')
@@ -582,6 +615,21 @@ class GooglePhotosExportMerger:
             stats.errors += 1
             return
 
+        # Clear blocked descriptions from output file
+        if info.clear_descriptions:
+            try:
+                clear_params = [
+                    '-overwrite_original',
+                    '-EXIF:UserComment=',
+                    '-EXIF:ImageDescription=',
+                    '-XMP-dc:Description=',
+                    str(info.output_path),
+                ]
+                et.execute(*[p.encode('utf-8') if isinstance(p, str) else p for p in clear_params])
+                stats.descriptions_cleared += 1
+            except Exception as e:
+                self.logger.warning("Failed to clear descriptions for orphan %s: %s", self._rel(info.source_path), e)
+
         # Set filesystem timestamps if date was resolved
         self._set_filesystem_timestamps(et, info)
 
@@ -640,6 +688,9 @@ class GooglePhotosExportMerger:
         if info.resolved_datetime:
             self.logger.info("  Date: %s (source: %s)", info.resolved_datetime.isoformat(), info.date_source)
 
+        if info.clear_descriptions:
+            self.logger.info("  Blocked description detected — will clear UserComment, ImageDescription, XMP:Description")
+
         if not info.is_orphan and info.json_data:
             tags = []
             pt = info.json_data.get('photoTakenTime')
@@ -664,6 +715,7 @@ class GooglePhotosExportMerger:
         self.logger.info("Files written:         %d", stats.written)
         self.logger.info("XMP sidecars created:  %d", stats.sidecars_created)
         self.logger.info("GPS tags written:      %d", stats.gps_written)
+        self.logger.info("Descriptions cleared:  %d", stats.descriptions_cleared)
         self.logger.info("Duplicates renamed:    %d", stats.duplicates_renamed)
         self.logger.info("Skipped JSON files:    %d", stats.skipped_json)
         self.logger.info("Errors:                %d", stats.errors)
@@ -683,5 +735,11 @@ if __name__ == '__main__':
     output_dir = sys.argv[2]
     dry_run = '--dry-run' in sys.argv
 
-    merger = GooglePhotosExportMerger(input_dir, output_dir, dry_run=dry_run)
+    blocked_descriptions = [
+        # Add unwanted description strings here, e.g.:
+        # "Photo uploaded by Google Photos",
+    ]
+
+    merger = GooglePhotosExportMerger(input_dir, output_dir, dry_run=dry_run,
+                                     blocked_descriptions=blocked_descriptions)
     result = merger.run()
