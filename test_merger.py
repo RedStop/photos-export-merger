@@ -2,16 +2,23 @@
 test_merger.py — Comprehensive unit tests for GooglePhotosExportMerger.
 
 This file is built in stages:
-  Part 1  (current): File factories — minimal valid binary files + JSON files.
-  Part 2  (future):  Test infrastructure — setUpClass, tearDownClass, summary runner.
+  Part 1  (done):    File factories — minimal valid binary files + JSON files.
+  Part 2  (current): Test infrastructure — setUpClass, tearDownClass, summary runner.
   Part 3  (future):  All test_* methods.
 """
 
 import json
+import logging
+import shutil
 import struct
+import tempfile
+import unittest
 import zlib
 from pathlib import Path
 from typing import Any, Dict
+
+import exiftool
+from GooglePhotosExportMerger import GooglePhotosExportMerger, MergeStats
 
 
 # ---------------------------------------------------------------------------
@@ -102,7 +109,7 @@ def _make_avi() -> bytes:
 def _make_ebml(doc_type: bytes) -> bytes:
     """Minimal EBML header for Matroska/WebM containers."""
     def _vint(value: int) -> bytes:
-        """1-byte VINT — sufficient for values 0–126."""
+        """1-byte VINT — sufficient for values 0-126."""
         return bytes([0x80 | value])
 
     def _elem(elem_id: bytes, data: bytes) -> bytes:
@@ -151,7 +158,7 @@ def _make_dng() -> bytes:
 
 
 def _make_cr2() -> bytes:
-    """Minimal CR2: TIFF header with CR2 signature at bytes 8–11, IFD0 at offset 16."""
+    """Minimal CR2: TIFF header with CR2 signature at bytes 8-11, IFD0 at offset 16."""
     # Bytes 0–3:  'II' + magic 42
     # Bytes 4–7:  IFD0 offset → 16
     # Bytes 8–9:  'CR' (Canon CR2 identifier)
@@ -170,6 +177,35 @@ def _make_cr2() -> bytes:
     ifd += struct.pack('<I', 0)
 
     return header + cr2_sig + raw_ifd_offset + ifd
+
+
+def _make_jpeg_with_exif_tz(offset: str) -> bytes:
+    """JPEG with a minimal EXIF APP1 segment containing *only* OffsetTimeOriginal.
+
+    This lets the merger read the timezone directly from the source file without
+    needing a separate ExifTool pre-write step (which fails on minimal JPEGs).
+
+    TIFF layout inside the APP1 payload (little-endian):
+      0-7   : TIFF header  (IFD0 at offset 8)
+      8-25  : IFD0         (1 entry: ExifIFD pointer at offset 26)
+      26-43 : ExifIFD      (1 entry: OffsetTimeOriginal ASCII, 7 bytes at offset 44)
+      44-50 : ASCII string "+HH:MM\\0"
+    """
+    value = (offset + '\x00').encode('ascii')   # e.g. b'+00:00\x00' (7 bytes)
+    count = len(value)
+
+    tiff  = b'II' + struct.pack('<H', 42) + struct.pack('<I', 8)   # TIFF header
+    tiff += struct.pack('<H', 1)
+    tiff += struct.pack('<HHII', 0x8769, 4, 1, 26)                 # ExifIFD ptr
+    tiff += struct.pack('<I', 0)                                   # IFD0 next = 0
+    tiff += struct.pack('<H', 1)
+    tiff += struct.pack('<HHII', 0x9011, 2, count, 44)             # OffsetTimeOriginal
+    tiff += struct.pack('<I', 0)                                   # ExifIFD next = 0
+    tiff += value
+
+    app1_body = b'Exif\x00\x00' + tiff
+    app1 = b'\xFF\xE1' + struct.pack('>H', 2 + len(app1_body)) + app1_body
+    return b'\xFF\xD8' + app1 + b'\xFF\xD9'
 
 
 # ---------------------------------------------------------------------------
@@ -263,3 +299,250 @@ def make_json_file(path: Path, **fields: Any) -> Path:
     path.parent.mkdir(parents=True, exist_ok=True)
     path.write_text(json.dumps(defaults, ensure_ascii=False, indent=2), encoding='utf-8')
     return path
+
+
+# ---------------------------------------------------------------------------
+# Test constants
+# ---------------------------------------------------------------------------
+
+# Blocked descriptions list passed to the merger — mirrors a typical production run.
+_BLOCKED_DESCRIPTIONS = ['SONY DSC']
+
+# Epoch shared across most test JSON files: 2024-08-08 09:04:06 UTC.
+# In GMT+02:00 (the merger's fallback TZ) this is 2024-08-08 11:04:06,
+# so output files land in output/2024/08/.
+_EPOCH_DEFAULT = '1723113846'
+
+
+# ---------------------------------------------------------------------------
+# Test class
+# ---------------------------------------------------------------------------
+
+class TestGooglePhotosExportMerger(unittest.TestCase):
+    """
+    Single-pass integration test for GooglePhotosExportMerger.
+
+    setUpClass builds the full input tree, runs the merger once, and stores
+    the resulting MergeStats and a pre-run input-directory snapshot.
+    Individual test_* methods (Part 3) assert specific output properties
+    against that single run.
+    """
+
+    # Class-level state populated by setUpClass
+    tmp_dir:        Path
+    input_dir:      Path
+    output_dir:     Path
+    stats:          MergeStats
+    input_snapshot: dict   # {rel_path_str: (size, mtime, ctime)}
+
+    # ------------------------------------------------------------------
+    # setUpClass
+    # ------------------------------------------------------------------
+
+    @classmethod
+    def setUpClass(cls) -> None:
+        logging.basicConfig(
+            format='%(levelname)s %(name)s: %(message)s',
+            level=logging.WARNING,
+        )
+
+        # Isolated temp tree
+        cls.tmp_dir    = Path(tempfile.mkdtemp(prefix='gpem_test_'))
+        cls.input_dir  = cls.tmp_dir / 'input'
+        cls.output_dir = cls.tmp_dir / 'output'
+        cls.input_dir.mkdir()
+
+        # Build the full input tree (timezone EXIF is pre-embedded in the JPEG bytes)
+        cls._create_input_tree()
+
+        # Snapshot input BEFORE the merger touches anything
+        cls.input_snapshot = cls._snapshot(cls.input_dir)
+
+        # Single merge run shared by all test_* methods
+        merger = GooglePhotosExportMerger(
+            str(cls.input_dir),
+            str(cls.output_dir),
+            blocked_descriptions=_BLOCKED_DESCRIPTIONS,
+        )
+        cls.stats = merger.run()
+
+    # ------------------------------------------------------------------
+    # Input-tree builder
+    # ------------------------------------------------------------------
+
+    @classmethod
+    def _create_input_tree(cls) -> None:
+        """Populate cls.input_dir with all test media + JSON files."""
+        inp = cls.input_dir
+
+        # ── RootLevel ──────────────────────────────────────────────────────
+        # photo_basic.jpg : matched file with no EXIF timezone → GMT+02:00 fallback
+        # orphan_no_json.jpg : no matching JSON → processed as orphan
+        d = inp / 'RootLevel'
+        make_media_file(d / 'photo_basic.jpg')
+        make_json_file(d / 'photo_basic.jpg.json')
+        make_media_file(d / 'orphan_no_json.jpg')
+
+        # ── GPS Tests ──────────────────────────────────────────────────────
+        # Each file covers one GPS scenario (quadrant, altitude sign).
+        # Both geoData and geoDataExif carry the same coordinates so the
+        # merger always picks up GPS regardless of which key it checks first.
+        d = inp / 'GPS Tests'
+        _gps_cases = [
+            # (stem,                    lat,    lon,      alt)
+            ('gps_ne',                 38.91,  121.60,    0.0),   # N+E quadrant
+            ('gps_nw',                 48.85,   -2.35,    0.0),   # N+W quadrant
+            ('gps_se',                -25.82,   28.20,    0.0),   # S+E quadrant
+            ('gps_sw',                -33.86,  -70.67,    0.0),   # S+W quadrant (Santiago)
+            ('gps_altitude_negative', -25.82,   28.20,  -50.0),   # below sea level
+            ('gps_high_altitude',     -25.82,   28.20, 1623.44),  # high altitude
+        ]
+        for stem, lat, lon, alt in _gps_cases:
+            make_media_file(d / f'{stem}.jpg')
+            geo = {'latitude': lat, 'longitude': lon, 'altitude': alt,
+                   'latitudeSpan': 0.0, 'longitudeSpan': 0.0}
+            make_json_file(d / f'{stem}.jpg.json', geoData=geo, geoDataExif=geo)
+
+        # ── Timezones ──────────────────────────────────────────────────────
+        # Each JPEG has OffsetTimeOriginal pre-embedded so the merger reads it
+        # from the source file without any ExifTool pre-write step.
+        # The no-timezone fallback scenario is covered by photo_basic.jpg above.
+        d = inp / 'Timezones'
+        _tz_cases = [
+            ('tz_utc',    '+00:00'),
+            ('tz_gmt2',   '+02:00'),
+            ('tz_minus5', '-05:00'),
+            ('tz_plus8',  '+08:00'),
+            ('tz_plus530', '+05:30'),
+        ]
+        for stem, offset in _tz_cases:
+            p = d / f'{stem}.jpg'
+            p.parent.mkdir(parents=True, exist_ok=True)
+            p.write_bytes(_make_jpeg_with_exif_tz(offset))
+            make_json_file(d / f'{stem}.jpg.json')
+
+        # ── Descriptions ───────────────────────────────────────────────────
+        d = inp / 'Descriptions'
+        _desc_cases = [
+            ('desc_utf8',    '郭恒 and Timoné visited'),
+            ('desc_escaped', 'He said "hello" and `goodbye`'),
+            ('desc_newline', 'Line one\nLine two'),
+            ('desc_crlf',    'Line one\r\nLine two'),
+            ('desc_empty',   ''),
+            ('desc_blocked', 'SONY DSC'),           # in _BLOCKED_DESCRIPTIONS → cleared
+            ('desc_long',    'A' * 500),
+        ]
+        for stem, desc in _desc_cases:
+            make_media_file(d / f'{stem}.jpg')
+            make_json_file(d / f'{stem}.jpg.json', description=desc)
+
+        # ── FileTypes / Matched ────────────────────────────────────────────
+        # One file per supported extension, each paired with a JSON.
+        d = inp / 'FileTypes' / 'Matched'
+        for ext in ('.jpg', '.jpeg', '.png', '.gif', '.tiff',
+                    '.mp4', '.mov', '.avi', '.mkv', '.webm', '.heic', '.dng'):
+            make_media_file(d / f'test{ext}')
+            make_json_file(d / f'test{ext}.json')
+
+        # ── FileTypes / Orphans ────────────────────────────────────────────
+        # No JSON counterparts → all become orphans.
+        d = inp / 'FileTypes' / 'Orphans'
+        for ext in ('.jpg', '.png', '.gif', '.mp4', '.mov', '.avi'):
+            make_media_file(d / f'orphan{ext}')
+
+        # ── Duplicates ─────────────────────────────────────────────────────
+        # Two source files both carry title='same_name.jpg' and the same epoch
+        # → both resolve to output/2024/08/same_name.jpg
+        # → the merger renames the second to same_name_2.jpg.
+        d = inp / 'Duplicates'
+        for stem in ('same_name_a', 'same_name_b'):
+            make_media_file(d / f'{stem}.jpg')
+            make_json_file(
+                d / f'{stem}.jpg.json',
+                title='same_name.jpg',
+                photoTakenTime={'timestamp': _EPOCH_DEFAULT, 'formatted': ''},
+            )
+
+        # ── BracketNotation ────────────────────────────────────────────────
+        # Google Photos names duplicated exports as  photo.jpg(1).json  (bracket
+        # before the .json suffix, not inside the extension).
+        # JsonFileFinder strips the bracket and matches the correct media file.
+        d = inp / 'BracketNotation'
+        for n in (1, 2):
+            make_media_file(d / f'photo({n}).jpg')
+            make_json_file(
+                d / f'photo.jpg({n}).json',
+                title='photo.jpg',
+                photoTakenTime={'timestamp': _EPOCH_DEFAULT, 'formatted': ''},
+            )
+
+        # ── SpecialChars ───────────────────────────────────────────────────
+        d = inp / 'SpecialChars'
+        make_media_file(d / 'Kosi Bay - 2014 - 179.jpg')
+        make_json_file(d / 'Kosi Bay - 2014 - 179.jpg.json',
+                       title='Kosi Bay - 2014 - 179.jpg')
+
+        make_media_file(d / '_DSC5757-Enhanced-NR - Kruger.jpg')
+        make_json_file(d / '_DSC5757-Enhanced-NR - Kruger.jpg.json',
+                       title='_DSC5757-Enhanced-NR - Kruger.jpg')
+
+    # ------------------------------------------------------------------
+    # Helpers
+    # ------------------------------------------------------------------
+
+    @classmethod
+    def _snapshot(cls, directory: Path) -> dict:
+        """Return {relative_path_str: (size, mtime, ctime)} for every file under *directory*."""
+        snap = {}
+        for f in sorted(directory.rglob('*')):
+            if f.is_file():
+                st = f.stat()
+                snap[str(f.relative_to(directory))] = (st.st_size, st.st_mtime, st.st_ctime)
+        return snap
+
+    # ------------------------------------------------------------------
+    # Placeholder — ensures setUpClass/tearDownClass are invoked.
+    # Replace with real assertions in Part 3.
+    # ------------------------------------------------------------------
+
+    def test_merger_ran_without_errors(self) -> None:
+        """Smoke test: merger completed with zero errors."""
+        self.assertEqual(self.stats.errors, 0,
+                         f"Merger reported {self.stats.errors} error(s)")
+
+    # ------------------------------------------------------------------
+    # tearDownClass
+    # ------------------------------------------------------------------
+
+    @classmethod
+    def tearDownClass(cls) -> None:
+        s = cls.stats
+        print('\n' + '=' * 60)
+        print('                   TEST SUMMARY')
+        print('=' * 60)
+        print(f'  Total media files : {s.total_media_files}')
+        print(f'  Matched           : {s.matched}')
+        print(f'  Orphans           : {s.orphans}')
+        print(f'  Written           : {s.written}')
+        print(f'  Sidecars created  : {s.sidecars_created}')
+        print(f'  GPS written       : {s.gps_written}')
+        print(f'  Descriptions clrd : {s.descriptions_cleared}')
+        print(f'  Duplicates renamed: {s.duplicates_renamed}')
+        print(f'  Errors            : {s.errors}')
+        print('=' * 60)
+        print(f'\n  Input  : {cls.input_dir}')
+        print(f'  Output : {cls.output_dir}')
+
+        try:
+            input('\nPress Enter to delete test files, or Ctrl+C to keep them ... ')
+        except KeyboardInterrupt:
+            print(f'\nTest files kept at: {cls.tmp_dir}')
+            return
+
+        shutil.rmtree(str(cls.tmp_dir), ignore_errors=True)
+        print(f'Deleted: {cls.tmp_dir}')
+
+
+# ---------------------------------------------------------------------------
+if __name__ == '__main__':
+    unittest.main(verbosity=2)
