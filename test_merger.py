@@ -278,13 +278,41 @@ def _make_ebml(doc_type: bytes) -> bytes:
 
 
 def _make_heic() -> bytes:
-    """Minimal HEIC file (ftyp with 'heic' brand + empty meta box)."""
+    """HEIC with a primary hvc1 item backed by a 1-byte mdat (mdat-first layout).
+
+    ExifTool requires:
+    - A non-empty iinf box (otherwise it deletes it and can't add EXIF/XMP).
+    - The mdat to come BEFORE meta so that mdat offset fixups work correctly when
+      ExifTool grows the metadata section and shifts offsets.
+    Layout: ftyp(24) + mdat(9) → mdat data at offset 32, meta follows at offset 33.
+    """
     def _box(box_type: bytes, data: bytes = b'') -> bytes:
         return struct.pack('>I', 8 + len(data)) + box_type + data
 
     ftyp = _box(b'ftyp', b'heic' + struct.pack('>I', 0) + b'heic' + b'mif1')
-    meta = _box(b'meta', struct.pack('>I', 0))   # version=0, flags=0
-    return ftyp + meta
+    mdat = _box(b'mdat', b'\x00')   # 1-byte dummy image data; data at offset 32
+
+    hdlr = _box(b'hdlr',
+        struct.pack('>I', 0) + struct.pack('>I', 0) + b'pict' + b'\x00' * 12 + b'\x00')
+    pitm = _box(b'pitm', struct.pack('>I', 0) + struct.pack('>H', 1))
+    infe = _box(b'infe',
+        struct.pack('>B', 2) + b'\x00\x00\x00' +   # version=2, flags=0
+        struct.pack('>H', 1) +                       # item_id=1
+        struct.pack('>H', 0) +                       # protection_index=0
+        b'hvc1' +                                    # item_type (HEVC still image)
+        b'\x00')                                     # item_name=''
+    iinf = _box(b'iinf', struct.pack('>I', 0) + struct.pack('>H', 1) + infe)
+    # iloc v0: item 1 at absolute offset 32 (ftyp=24 + mdat_header=8), length 1
+    iloc_entry = (struct.pack('>H', 1) + struct.pack('>H', 0) +   # item_id, dref_idx
+                  struct.pack('>H', 1) +                           # extent_count
+                  struct.pack('>I', 32) + struct.pack('>I', 1))    # offset, length
+    iloc = _box(b'iloc',
+        struct.pack('>I', 0) + b'\x44\x00' + struct.pack('>H', 1) + iloc_entry)
+    url  = _box(b'url ', struct.pack('>I', 1))   # self-contained
+    dref = _box(b'dref', struct.pack('>I', 0) + struct.pack('>I', 1) + url)
+    dinf = _box(b'dinf', dref)
+    meta = _box(b'meta', struct.pack('>I', 0) + hdlr + pitm + iinf + iloc + dinf)
+    return ftyp + mdat + meta
 
 
 def _make_dng() -> bytes:
@@ -305,25 +333,35 @@ def _make_dng() -> bytes:
 
 
 def _make_cr2() -> bytes:
-    """Minimal CR2: TIFF header with CR2 signature at bytes 8-11, IFD0 at offset 16."""
-    # Bytes 0–3:  'II' + magic 42
-    # Bytes 4–7:  IFD0 offset → 16
-    # Bytes 8–9:  'CR' (Canon CR2 identifier)
-    # Bytes 10:   CR2 major version (2)
-    # Bytes 11:   CR2 minor version (0)
-    # Bytes 12–15: Offset to RAW IFD (0 for stub)
+    """Minimal CR2: TIFF header with CR2 signature and a two-IFD chain.
+
+    ExifTool's WriteCR2 requires bytes 12-15 (raw_ifd_offset) to point to the LAST
+    IFD in the linked chain.  A single IFD0 with next=0 leaves LastIFD unset → error
+    "CR2 image IFD may not be deleted".  Adding IFD1 as the chain tail fixes this.
+
+    Layout:
+      0-7  : TIFF header (II + 0x2A + IFD0_offset=16)
+      8-11 : CR2 signature CR\\x02\\x00
+      12-15: raw_ifd_offset → 70 (IFD1, the last IFD)
+      16-69: IFD0 (4 entries, next→70)
+      70-87: IFD1 (1 entry, next=0)
+    """
     header = b'II' + struct.pack('<H', 42) + struct.pack('<I', 16)
     cr2_sig = b'CR\x02\x00'
-    raw_ifd_offset = struct.pack('<I', 0)
+    raw_ifd_offset = struct.pack('<I', 70)   # bytes 12-15: last IFD = IFD1 at offset 70
 
-    ifd = struct.pack('<H', 4)
-    ifd += struct.pack('<HHII', 256, 3, 1, 1)   # ImageWidth
-    ifd += struct.pack('<HHII', 257, 3, 1, 1)   # ImageLength
-    ifd += struct.pack('<HHII', 258, 3, 1, 8)   # BitsPerSample
-    ifd += struct.pack('<HHII', 277, 3, 1, 1)   # SamplesPerPixel
-    ifd += struct.pack('<I', 0)
+    ifd0 = struct.pack('<H', 4)
+    ifd0 += struct.pack('<HHII', 256, 3, 1, 1)   # ImageWidth
+    ifd0 += struct.pack('<HHII', 257, 3, 1, 1)   # ImageLength
+    ifd0 += struct.pack('<HHII', 258, 3, 1, 8)   # BitsPerSample
+    ifd0 += struct.pack('<HHII', 277, 3, 1, 1)   # SamplesPerPixel
+    ifd0 += struct.pack('<I', 70)                 # next IFD → IFD1 at offset 70
 
-    return header + cr2_sig + raw_ifd_offset + ifd
+    ifd1 = struct.pack('<H', 1)
+    ifd1 += struct.pack('<HHII', 256, 3, 1, 1)   # ImageWidth (raw strip stub)
+    ifd1 += struct.pack('<I', 0)                  # next IFD = 0 (last in chain)
+
+    return header + cr2_sig + raw_ifd_offset + ifd0 + ifd1
 
 
 def _make_jpeg_with_exif_tz(offset: str) -> bytes:
@@ -1486,7 +1524,7 @@ class TestGooglePhotosExportMerger(unittest.TestCase):
         mode = getattr(cls, '_cleanup_mode', 'prompt')
         if mode == 'auto_delete':
             shutil.rmtree(str(cls.tmp_dir), ignore_errors=True)
-            print(f'Deleted: {cls.tmp_dir}')
+            print(f'  Deleted: {cls.tmp_dir}')
         elif mode == 'auto_keep':
             print(f'\nTest files kept at: {cls.tmp_dir}')
         else:  # 'prompt'
