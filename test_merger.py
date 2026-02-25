@@ -633,6 +633,26 @@ class TestGooglePhotosExportMerger(unittest.TestCase):
         make_json_file(d / '_DSC5757-Enhanced-NR - Kruger.jpg.json',
                        title='_DSC5757-Enhanced-NR - Kruger.jpg')
 
+        # ── Sidecars ───────────────────────────────────────────────────────
+        # Dedicated files with unique stems to avoid the stem collision that
+        # affects FileTypes/Matched/test.* (all target test.xmp, so only the
+        # first sidecar-capable format succeeds).
+        d = inp / 'Sidecars'
+        _geo_sidecar = {
+            'latitude': 48.85, 'longitude': 2.35, 'altitude': 100.0,
+            'latitudeSpan': 0.0, 'longitudeSpan': 0.0,
+        }
+        make_media_file(d / 'sc_png.png')
+        make_json_file(d / 'sc_png.png.json',
+                       description='PNG sidecar test',
+                       geoData=_geo_sidecar, geoDataExif=_geo_sidecar)
+        make_media_file(d / 'sc_gif.gif')
+        make_json_file(d / 'sc_gif.gif.json')
+        make_media_file(d / 'sc_avi.avi')
+        make_json_file(d / 'sc_avi.avi.json',
+                       description='AVI sidecar test',
+                       geoData=_geo_sidecar, geoDataExif=_geo_sidecar)
+
     # ------------------------------------------------------------------
     # Helpers
     # ------------------------------------------------------------------
@@ -747,6 +767,8 @@ class TestGooglePhotosExportMerger(unittest.TestCase):
             # SpecialChars
             'Kosi Bay - 2014 - 179.jpg',
             '_DSC5757-Enhanced-NR - Kruger.jpg',
+            # Sidecars
+            'sc_png.png', 'sc_gif.gif', 'sc_avi.avi',
         ]
 
         missing = [name for name in expected if name not in output_names]
@@ -1087,6 +1109,95 @@ class TestGooglePhotosExportMerger(unittest.TestCase):
                          f"Orphan in wrong year: got {parts[0]!r}, expected {expected_year!r}")
         self.assertEqual(parts[1], expected_month,
                          f"Orphan in wrong month: got {parts[1]!r}, expected {expected_month!r}")
+
+    # ------------------------------------------------------------------
+    # Category 8 — XMP Sidecars
+    # ------------------------------------------------------------------
+    # Uses dedicated files in Sidecars/ (sc_png.png, sc_gif.gif, sc_avi.avi)
+    # to avoid the stem collision where all FileTypes/Matched/test.* files
+    # would target the same test.xmp sidecar path.
+
+    def test_xmp_sidecar_for_png(self) -> None:
+        """PNG uses PARTIAL_WITH_SIDECAR strategy → sc_png.xmp must exist in output."""
+        xmp = self._find_output_file('sc_png.xmp')
+        self.assertIsNotNone(xmp, "sc_png.xmp not found in output")
+
+    def test_xmp_sidecar_for_gif(self) -> None:
+        """GIF uses PARTIAL_WITH_SIDECAR strategy → sc_gif.xmp must exist in output."""
+        xmp = self._find_output_file('sc_gif.xmp')
+        self.assertIsNotNone(xmp, "sc_gif.xmp not found in output")
+
+    def test_xmp_sidecar_for_video(self) -> None:
+        """AVI uses VIDEO_WITH_SIDECAR strategy → sc_avi.xmp must exist in output."""
+        xmp = self._find_output_file('sc_avi.xmp')
+        self.assertIsNotNone(xmp, "sc_avi.xmp not found in output")
+
+    def test_xmp_sidecar_contains_dates(self) -> None:
+        """XMP sidecar contains XMP:DateTimeOriginal (or XMP:CreateDate) from JSON timestamp."""
+        tags = self._read_tags('sc_avi.xmp', ['XMP:DateTimeOriginal', 'XMP:CreateDate'])
+        dt = tags.get('XMP:DateTimeOriginal') or tags.get('XMP:CreateDate')
+        self.assertIsNotNone(dt, "sc_avi.xmp missing XMP:DateTimeOriginal / XMP:CreateDate")
+
+    def test_xmp_sidecar_contains_gps(self) -> None:
+        """XMP sidecar contains GPS coordinates written from JSON geoData."""
+        tags = self._read_tags('sc_avi.xmp', ['XMP:GPSLatitude', 'XMP:GPSLongitude'])
+        self.assertIsNotNone(tags.get('XMP:GPSLatitude'),
+                             "sc_avi.xmp missing XMP:GPSLatitude")
+        self.assertIsNotNone(tags.get('XMP:GPSLongitude'),
+                             "sc_avi.xmp missing XMP:GPSLongitude")
+
+    def test_xmp_sidecar_contains_description(self) -> None:
+        """XMP sidecar contains XMP:Description written from JSON description field."""
+        tags = self._read_tags('sc_avi.xmp', ['XMP:Description'])
+        desc = tags.get('XMP:Description', '')
+        self.assertIn('AVI sidecar test', desc,
+                      f"sc_avi.xmp XMP:Description mismatch: {desc!r}")
+
+    # ------------------------------------------------------------------
+    # Category 9 — Duplicate Resolution
+    # ------------------------------------------------------------------
+    # same_name_a.jpg and same_name_b.jpg both carry title='same_name.jpg'
+    # and the same epoch.  The merger writes the first as same_name.jpg and
+    # renames the second to same_name_2.jpg.
+
+    def test_duplicate_both_exist(self) -> None:
+        """Both duplicate source files produce output: same_name.jpg and same_name_2.jpg."""
+        self.assertIsNotNone(self._find_output_file('same_name.jpg'),
+                             "same_name.jpg not found in output")
+        self.assertIsNotNone(self._find_output_file('same_name_2.jpg'),
+                             "same_name_2.jpg (renamed duplicate) not found in output")
+
+    def test_duplicate_different_content(self) -> None:
+        """Both duplicate outputs have EXIF:DateTimeOriginal set from their JSON."""
+        for name in ('same_name.jpg', 'same_name_2.jpg'):
+            with self.subTest(file=name):
+                tags = self._read_tags(name, ['EXIF:DateTimeOriginal'])
+                self.assertEqual(
+                    tags.get('EXIF:DateTimeOriginal'), '2024:08:08 12:44:06',
+                    f"{name}: EXIF:DateTimeOriginal not set correctly",
+                )
+
+    # ------------------------------------------------------------------
+    # Category 10 — Bracket Notation
+    # ------------------------------------------------------------------
+    # photo.jpg(1).json and photo.jpg(2).json must each match their
+    # corresponding photo(1).jpg / photo(2).jpg.  Both carry title='photo.jpg'
+    # so the second output is renamed photo_2.jpg (same deduplication logic).
+
+    def test_bracket_notation_match(self) -> None:
+        """photo.jpg(1).json matched to photo(1).jpg → EXIF:DateTimeOriginal set."""
+        tags = self._read_tags('photo.jpg', ['EXIF:DateTimeOriginal'])
+        self.assertEqual(
+            tags.get('EXIF:DateTimeOriginal'), '2024:08:08 12:44:06',
+            "photo.jpg: DateTimeOriginal not set (bracket notation matching failed)",
+        )
+
+    def test_bracket_notation_multiple(self) -> None:
+        """Both photo(1).jpg and photo(2).jpg are processed; second renamed to photo_2.jpg."""
+        self.assertIsNotNone(self._find_output_file('photo.jpg'),
+                             "photo.jpg not found in output")
+        self.assertIsNotNone(self._find_output_file('photo_2.jpg'),
+                             "photo_2.jpg not found in output")
 
     # ------------------------------------------------------------------
     # tearDownClass
