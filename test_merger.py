@@ -3,10 +3,11 @@ test_merger.py — Comprehensive unit tests for GooglePhotosExportMerger.
 
 This file is built in stages:
   Part 1  (done):    File factories — minimal valid binary files + JSON files.
-  Part 2  (done): Test infrastructure — setUpClass, tearDownClass, summary runner.
+  Part 2  (done):    Test infrastructure — setUpClass, tearDownClass, summary runner.
   Part 3  (future):  All test_* methods.
 """
 
+import argparse
 import json
 import logging
 import shutil
@@ -1482,14 +1483,20 @@ class TestGooglePhotosExportMerger(unittest.TestCase):
         print(f'\n  Input  : {cls.input_dir}')
         print(f'  Output : {cls.output_dir}')
 
-        try:
-            input('\nPress Enter to delete test files, or Ctrl+C to keep them ... ')
-        except (KeyboardInterrupt, EOFError):
+        mode = getattr(cls, '_cleanup_mode', 'prompt')
+        if mode == 'auto_delete':
+            shutil.rmtree(str(cls.tmp_dir), ignore_errors=True)
+            print(f'Deleted: {cls.tmp_dir}')
+        elif mode == 'auto_keep':
             print(f'\nTest files kept at: {cls.tmp_dir}')
-            return
-
-        shutil.rmtree(str(cls.tmp_dir), ignore_errors=True)
-        print(f'Deleted: {cls.tmp_dir}')
+        else:  # 'prompt'
+            try:
+                input('\nPress Enter to delete test files, or Ctrl+C to keep them ... ')
+            except (KeyboardInterrupt, EOFError):
+                print(f'\nTest files kept at: {cls.tmp_dir}')
+                return
+            shutil.rmtree(str(cls.tmp_dir), ignore_errors=True)
+            print(f'Deleted: {cls.tmp_dir}')
 
 
 # ---------------------------------------------------------------------------
@@ -1527,6 +1534,79 @@ if __name__ == '__main__':
                 return label
         return "Other"
 
+    # ── Supported file types ─────────────────────────────────────────────────
+    _SUPPORTED_TYPES = sorted(ext.lstrip('.') for ext in _MEDIA_BYTES)
+
+    # ── Argument parser ──────────────────────────────────────────────────────
+    parser = argparse.ArgumentParser(
+        prog='test_merger.py',
+        description='Run GooglePhotosExportMerger tests with optional filtering.',
+    )
+    parser.add_argument(
+        '-c', '--category', dest='categories', action='append', metavar='NAME',
+        help='Run only categories whose label contains NAME (case-insensitive; repeatable)',
+    )
+    parser.add_argument(
+        '-t', '--file-type', dest='file_types', action='append', metavar='EXT',
+        help='Run only tests whose method name contains EXT (case-insensitive; repeatable)',
+    )
+    parser.add_argument(
+        '--cleanup', action='store_true',
+        help='Delete temp files after run without prompting',
+    )
+    parser.add_argument(
+        '--keep', action='store_true',
+        help='Keep temp files after run without prompting',
+    )
+    parser.add_argument(
+        '--list-categories', action='store_true',
+        help='Print available categories and exit',
+    )
+    parser.add_argument(
+        '--list-types', action='store_true',
+        help='Print available file types and exit',
+    )
+    args = parser.parse_args()
+
+    # ── Early exit for --list-* ──────────────────────────────────────────────
+    if args.list_categories:
+        print('Available test categories:')
+        for i, (label, _) in enumerate(_CATEGORIES, 1):
+            print(f'  {i:>2}. {label}')
+        sys.exit(0)
+
+    if args.list_types:
+        print('Supported file types:')
+        for i, ext in enumerate(_SUPPORTED_TYPES, 1):
+            print(f'  {i:>2}. {ext}')
+        sys.exit(0)
+
+    # ── Set cleanup mode ─────────────────────────────────────────────────────
+    if args.cleanup:
+        TestGooglePhotosExportMerger._cleanup_mode = 'auto_delete'
+    elif args.keep:
+        TestGooglePhotosExportMerger._cleanup_mode = 'auto_keep'
+    # else leave default 'prompt'
+
+    # ── Suite filter helper ──────────────────────────────────────────────────
+    def _filter_suite(suite, categories, file_types):
+        filtered = unittest.TestSuite()
+        for item in suite:
+            if isinstance(item, unittest.TestSuite):
+                filtered.addTests(_filter_suite(item, categories, file_types))
+            elif hasattr(item, '_testMethodName'):
+                name = item._testMethodName
+                if categories:
+                    cat = _cat(name)
+                    if not any(c.lower() in cat.lower() for c in categories):
+                        continue
+                if file_types:
+                    nl = name.lower()
+                    if not any(ft.lower() in nl for ft in file_types):
+                        continue
+                filtered.addTest(item)
+        return filtered
+
     # ── Custom result collector ──────────────────────────────────────────────
     class _SummaryResult(unittest.TextTestResult):
         """TextTestResult that additionally records per-test pass/fail status."""
@@ -1561,7 +1641,14 @@ if __name__ == '__main__':
         format='%(levelname)s %(name)s: %(message)s',
         level=logging.WARNING,
     )
-    suite  = unittest.TestLoader().loadTestsFromTestCase(TestGooglePhotosExportMerger)
+    suite = unittest.TestLoader().loadTestsFromTestCase(TestGooglePhotosExportMerger)
+    if args.categories or args.file_types:
+        print('Running with filters:')
+        if args.categories:
+            print(f'  Categories : {", ".join(args.categories)}')
+        if args.file_types:
+            print(f'  File types : {", ".join(args.file_types)}')
+        suite = _filter_suite(suite, args.categories or [], args.file_types or [])
     runner = unittest.TextTestRunner(verbosity=2, resultclass=_SummaryResult)
     result = runner.run(suite)
 
