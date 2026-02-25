@@ -25,18 +25,96 @@ from GooglePhotosExportMerger import GooglePhotosExportMerger, MergeStats
 # Internal binary builders (called once at import time)
 # ---------------------------------------------------------------------------
 
+def _jpeg_body() -> bytes:
+    """Shared JPEG image body: DQT + SOF0 + DHT_DC + DHT_AC + SOS + scan data.
+
+    Encodes a 1×1 white grayscale pixel using baseline DCT with standard
+    ITU-T T.81 Annex K Huffman tables.  Prepend SOI + one APP segment and
+    append EOI to form a complete, ExifTool-accepted JPEG file.
+
+    Scan data derivation (Y=255 → level-shifted to 127):
+      DC coefficient = 8×127 = 1016; all AC = 0 (flat block).
+      DIFF=1016, category 10 → Huffman 11111110 + VLI 1111111000.
+      AC EOB (0x00) → Huffman 1010.
+      Bit stream (22 bits, padded to 3 bytes with 1s): 0xFE 0xFE 0x2B.
+    """
+    # DQT — unity quantization table (all 1s → maximum quality, table 0)
+    dqt = bytes([0xFF, 0xDB, 0x00, 0x43, 0x00]) + bytes([0x01] * 64)
+
+    # SOF0 — baseline DCT, 1×1 pixel, 8-bit precision, 1 grayscale component
+    sof0 = bytes([
+        0xFF, 0xC0, 0x00, 0x0B,              # marker, length=11
+        0x08,                                # precision = 8 bits
+        0x00, 0x01, 0x00, 0x01,              # height=1, width=1
+        0x01,                                # Nf = 1 component
+        0x01, 0x11, 0x00,                    # comp id=1, H=1 V=1, Tq=0
+    ])
+
+    # DHT — standard luminance DC table (ITU-T T.81 Table K.3, Tc=0 Th=0)
+    dc_bits     = bytes([0x00, 0x01, 0x05, 0x01, 0x01, 0x01, 0x01, 0x01,
+                         0x01, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00])
+    dc_huffval  = bytes(range(12))           # 0x00 … 0x0B
+    dht_dc = (bytes([0xFF, 0xC4])
+              + struct.pack('>H', 2 + 1 + len(dc_bits) + len(dc_huffval))
+              + bytes([0x00])                # Tc=0 (DC), Th=0
+              + dc_bits + dc_huffval)
+
+    # DHT — standard luminance AC table (ITU-T T.81 Table K.5, Tc=1 Th=0)
+    ac_bits = bytes([0x00, 0x02, 0x01, 0x03, 0x03, 0x02, 0x04, 0x03,
+                     0x05, 0x05, 0x04, 0x04, 0x00, 0x00, 0x01, 0x7D])
+    ac_huffval = bytes([
+        0x01, 0x02, 0x03, 0x00, 0x04, 0x11, 0x05, 0x12,
+        0x21, 0x31, 0x41, 0x06, 0x13, 0x51, 0x61, 0x07,
+        0x22, 0x71, 0x14, 0x32, 0x81, 0x91, 0xA1, 0x08,
+        0x23, 0x42, 0xB1, 0xC1, 0x15, 0x52, 0xD1, 0xF0,
+        0x24, 0x33, 0x62, 0x72, 0x82, 0x09, 0x0A, 0x16,
+        0x17, 0x18, 0x19, 0x1A, 0x25, 0x26, 0x27, 0x28,
+        0x29, 0x2A, 0x34, 0x35, 0x36, 0x37, 0x38, 0x39,
+        0x3A, 0x43, 0x44, 0x45, 0x46, 0x47, 0x48, 0x49,
+        0x4A, 0x53, 0x54, 0x55, 0x56, 0x57, 0x58, 0x59,
+        0x5A, 0x63, 0x64, 0x65, 0x66, 0x67, 0x68, 0x69,
+        0x6A, 0x73, 0x74, 0x75, 0x76, 0x77, 0x78, 0x79,
+        0x7A, 0x83, 0x84, 0x85, 0x86, 0x87, 0x88, 0x89,
+        0x8A, 0x92, 0x93, 0x94, 0x95, 0x96, 0x97, 0x98,
+        0x99, 0x9A, 0xA2, 0xA3, 0xA4, 0xA5, 0xA6, 0xA7,
+        0xA8, 0xA9, 0xAA, 0xB2, 0xB3, 0xB4, 0xB5, 0xB6,
+        0xB7, 0xB8, 0xB9, 0xBA, 0xC2, 0xC3, 0xC4, 0xC5,
+        0xC6, 0xC7, 0xC8, 0xC9, 0xCA, 0xD2, 0xD3, 0xD4,
+        0xD5, 0xD6, 0xD7, 0xD8, 0xD9, 0xDA, 0xE1, 0xE2,
+        0xE3, 0xE4, 0xE5, 0xE6, 0xE7, 0xE8, 0xE9, 0xEA,
+        0xF1, 0xF2, 0xF3, 0xF4, 0xF5, 0xF6, 0xF7, 0xF8,
+        0xF9, 0xFA,
+    ])
+    dht_ac = (bytes([0xFF, 0xC4])
+              + struct.pack('>H', 2 + 1 + len(ac_bits) + len(ac_huffval))
+              + bytes([0x10])                # Tc=1 (AC), Th=0
+              + ac_bits + ac_huffval)
+
+    # SOS — scan header for 1 grayscale component
+    sos = bytes([
+        0xFF, 0xDA, 0x00, 0x08,              # marker, length=8
+        0x01,                                # Ns = 1 component in scan
+        0x01, 0x00,                          # comp id=1, Td=0 (DC table 0), Ta=0 (AC table 0)
+        0x00, 0x3F, 0x00,                    # Ss=0, Se=63, Ah=0 Al=0
+    ])
+
+    # Scan data: white pixel (no 0xFF bytes → no byte-stuffing needed)
+    scan = bytes([0xFE, 0xFE, 0x2B])
+
+    return dqt + sof0 + dht_dc + dht_ac + sos + scan
+
+
 def _make_jpeg() -> bytes:
-    """Minimal valid JFIF JPEG (1×1 pixel, no actual image data needed by ExifTool)."""
-    return bytes([
-        0xFF, 0xD8,                          # SOI
+    """Full 1×1 white grayscale JFIF JPEG accepted by ExifTool without warnings."""
+    app0 = bytes([
         0xFF, 0xE0, 0x00, 0x10,              # APP0 marker, length=16
         0x4A, 0x46, 0x49, 0x46, 0x00,        # 'JFIF\0'
         0x01, 0x01,                          # version 1.1
-        0x00,                                # pixel aspect ratio: no units
+        0x00,                                # aspect ratio: no units
         0x00, 0x01, 0x00, 0x01,              # 1×1 density
         0x00, 0x00,                          # no embedded thumbnail
-        0xFF, 0xD9,                          # EOI
     ])
+    return b'\xFF\xD8' + app0 + _jpeg_body() + b'\xFF\xD9'
 
 
 def _make_png() -> bytes:
@@ -86,14 +164,42 @@ def _make_tiff() -> bytes:
 
 
 def _make_mp4(brand: bytes = b'isom') -> bytes:
-    """Minimal ISO Base Media file (MP4 or MOV depending on brand)."""
-    def _box(box_type: bytes, data: bytes = b'') -> bytes:
-        return struct.pack('>I', 8 + len(data)) + box_type + data
+    """Valid ISO Base Media file (MP4 or MOV) that ExifTool can read and write.
 
-    ftyp = _box(b'ftyp', brand + struct.pack('>I', 0) + b'isom' + b'iso2')
-    free = _box(b'free')
+    Structure: ftyp + moov (mvhd only — no trak) + mdat.
+    A zero-sample trak causes ExifTool to fail with "Can't locate data reference
+    to update offsets", so we omit it; mvhd alone satisfies ExifTool's parser.
+    """
+    def _box(fourcc: bytes, payload: bytes = b'') -> bytes:
+        return struct.pack('>I', 8 + len(payload)) + fourcc + payload
+
+    # ftyp — brand-specific compatible brands
+    if brand == b'qt  ':
+        ftyp = _box(b'ftyp', brand + struct.pack('>I', 0) + b'qt  ')
+    else:
+        ftyp = _box(b'ftyp', brand + struct.pack('>I', 0) + b'isom' + b'iso2')
+
+    # mvhd — Movie Header (version 0)
+    _matrix = struct.pack('>9I',
+        0x00010000, 0, 0,
+        0, 0x00010000, 0,
+        0, 0, 0x40000000)
+    mvhd_payload = (
+        struct.pack('>I',  0)           # version=0, flags=0
+        + struct.pack('>II', 0, 0)      # creation_time, modification_time
+        + struct.pack('>II', 1000, 0)   # timescale=1000, duration=0
+        + struct.pack('>I', 0x00010000) # rate=1.0 (16.16 fixed-point)
+        + struct.pack('>H', 0x0100)     # volume=1.0 (8.8 fixed-point)
+        + b'\x00' * 2                   # reserved
+        + b'\x00' * 8                   # reserved[2]
+        + _matrix                       # 36 bytes
+        + b'\x00' * 24                  # pre_defined[6]
+        + struct.pack('>I', 1)          # next_track_ID=1
+    )
+    moov = _box(b'moov', _box(b'mvhd', mvhd_payload))
     mdat = _box(b'mdat')
-    return ftyp + free + mdat
+
+    return ftyp + moov + mdat
 
 
 def _make_avi() -> bytes:
@@ -107,26 +213,65 @@ def _make_avi() -> bytes:
 
 
 def _make_ebml(doc_type: bytes) -> bytes:
-    """Minimal EBML header for Matroska/WebM containers."""
-    def _vint(value: int) -> bytes:
-        """1-byte VINT — sufficient for values 0-126."""
-        return bytes([0x80 | value])
+    """Valid Matroska/WebM container with EBML header, SegmentInfo, and video track.
+
+    The Segment has a known size (not the unknown-size 0xFF sentinel used
+    previously), which allows ExifTool to parse the container properly.
+    """
+    def _vint_n(value: int) -> bytes:
+        """Shortest valid VINT encoding for *value* (multi-byte aware)."""
+        if value <= 0x7E:
+            return bytes([0x80 | value])
+        elif value <= 0x3FFE:
+            return struct.pack('>H', 0x4000 | value)
+        elif value <= 0x1FFFFE:
+            n = 0x200000 | value
+            return bytes([(n >> 16) & 0xFF, (n >> 8) & 0xFF, n & 0xFF])
+        else:
+            return struct.pack('>I', 0x10000000 | value)
 
     def _elem(elem_id: bytes, data: bytes) -> bytes:
-        return elem_id + _vint(len(data)) + data
+        return elem_id + _vint_n(len(data)) + data
 
-    body = (
-        _elem(b'\x42\x86', b'\x01') +          # EBMLVersion = 1
-        _elem(b'\x42\xF7', b'\x01') +          # EBMLReadVersion = 1
-        _elem(b'\x42\xF2', b'\x04') +          # EBMLMaxIDLength = 4
-        _elem(b'\x42\xF3', b'\x08') +          # EBMLMaxSizeLength = 8
-        _elem(b'\x42\x82', doc_type) +         # DocType
-        _elem(b'\x42\x87', b'\x04') +          # DocTypeVersion = 4
-        _elem(b'\x42\x85', b'\x02')            # DocTypeReadVersion = 2
+    # EBML header (element ID: 0x1A45DFA3)
+    header_body = (
+        _elem(b'\x42\x86', b'\x01')       # EBMLVersion = 1
+        + _elem(b'\x42\xF7', b'\x01')     # EBMLReadVersion = 1
+        + _elem(b'\x42\xF2', b'\x04')     # EBMLMaxIDLength = 4
+        + _elem(b'\x42\xF3', b'\x08')     # EBMLMaxSizeLength = 8
+        + _elem(b'\x42\x82', doc_type)    # DocType
+        + _elem(b'\x42\x87', b'\x04')     # DocTypeVersion = 4
+        + _elem(b'\x42\x85', b'\x02')     # DocTypeReadVersion = 2
     )
-    ebml_header = b'\x1A\x45\xDF\xA3' + _vint(len(body)) + body
-    # Segment element with unknown-size marker (0xFF = 1-byte unknown VINT)
-    segment = b'\x18\x53\x80\x67\xFF'
+    ebml_header = b'\x1A\x45\xDF\xA3' + _vint_n(len(header_body)) + header_body
+
+    # SegmentInfo (element ID: 0x1549A966)
+    seg_info_body = (
+        _elem(b'\x2A\xD7\xB1', b'\x0F\x42\x40')      # TimecodeScale = 1 000 000 (1 ms)
+        + _elem(b'\x4D\x80', b'test')                  # MuxingApp
+        + _elem(b'\x57\x41', b'test')                  # WritingApp
+        + _elem(b'\x44\x89', struct.pack('>d', 0.0))   # Duration = 0.0 (float64)
+    )
+    seg_info = _elem(b'\x15\x49\xA9\x66', seg_info_body)
+
+    # Tracks (element ID: 0x1654AE6B)  —  one video track, no codec data needed
+    video_body = (
+        _elem(b'\xB0', b'\x20')   # PixelWidth  = 32
+        + _elem(b'\xBA', b'\x20') # PixelHeight = 32
+    )
+    track_entry_body = (
+        _elem(b'\xD7', b'\x01')                  # TrackNumber = 1
+        + _elem(b'\x73\xC5', b'\x01')            # TrackUID    = 1
+        + _elem(b'\x83', b'\x01')                # TrackType   = 1 (video)
+        + _elem(b'\x86', b'V_UNCOMPRESSED')      # CodecID
+        + _elem(b'\xE0', video_body)             # Video sub-element
+    )
+    tracks = _elem(b'\x16\x54\xAE\x6B', _elem(b'\xAE', track_entry_body))
+
+    # Segment (element ID: 0x18538067) — known size
+    segment_body = seg_info + tracks
+    segment = b'\x18\x53\x80\x67' + _vint_n(len(segment_body)) + segment_body
+
     return ebml_header + segment
 
 
@@ -182,8 +327,9 @@ def _make_cr2() -> bytes:
 def _make_jpeg_with_exif_tz(offset: str) -> bytes:
     """JPEG with a minimal EXIF APP1 segment containing *only* OffsetTimeOriginal.
 
-    This lets the merger read the timezone directly from the source file without
-    needing a separate ExifTool pre-write step (which fails on minimal JPEGs).
+    The APP1 is placed immediately after SOI (standard EXIF placement), followed
+    by a full valid baseline-DCT body so ExifTool accepts the file without the
+    "Corrupted JPEG" warning.
 
     TIFF layout inside the APP1 payload (little-endian):
       0-7   : TIFF header  (IFD0 at offset 8)
@@ -205,7 +351,7 @@ def _make_jpeg_with_exif_tz(offset: str) -> bytes:
 
     app1_body = b'Exif\x00\x00' + tiff
     app1 = b'\xFF\xE1' + struct.pack('>H', 2 + len(app1_body)) + app1_body
-    return b'\xFF\xD8' + app1 + b'\xFF\xD9'
+    return b'\xFF\xD8' + app1 + _jpeg_body() + b'\xFF\xD9'
 
 
 # ---------------------------------------------------------------------------
