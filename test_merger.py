@@ -658,6 +658,104 @@ class TestGooglePhotosExportMerger(unittest.TestCase):
                          f"Merger reported {self.stats.errors} error(s)")
 
     # ------------------------------------------------------------------
+    # Category 1 — Input Integrity
+    # ------------------------------------------------------------------
+
+    def test_input_files_unchanged(self) -> None:
+        """Merger must not modify any input file (paths, sizes, or mtimes)."""
+        snapshot_after = self._snapshot(self.input_dir)
+        self.assertEqual(
+            self.input_snapshot, snapshot_after,
+            "Input directory was modified by the merger run",
+        )
+
+    def test_input_file_count_unchanged(self) -> None:
+        """Exact same number of files in the input tree before and after the merger run."""
+        snapshot_after = self._snapshot(self.input_dir)
+        before = len(self.input_snapshot)
+        after  = len(snapshot_after)
+        self.assertEqual(
+            before, after,
+            f"Input file count changed: before={before}, after={after}",
+        )
+
+    # ------------------------------------------------------------------
+    # Category 2 — Output Structure
+    # ------------------------------------------------------------------
+
+    def test_no_json_in_output(self) -> None:
+        """Output directory must contain zero .json files."""
+        json_files = [str(f) for f in self.output_dir.rglob('*.json')]
+        self.assertFalse(
+            json_files,
+            f"Found .json files in output:\n  " + "\n  ".join(json_files),
+        )
+
+    def test_output_organized_by_year_month(self) -> None:
+        """Every output file must sit exactly two levels deep: output/YYYY/MM/filename."""
+        bad: list[str] = []
+        for f in self.output_dir.rglob('*'):
+            if not f.is_file():
+                continue
+            rel   = f.relative_to(self.output_dir)
+            parts = rel.parts          # expect exactly ('YYYY', 'MM', 'filename')
+            if len(parts) != 3:
+                bad.append(f"{rel!s}  [depth={len(parts)-1}, expected 2]")
+                continue
+            year, month, _ = parts
+            if not (year.isdigit() and len(year) == 4):
+                bad.append(f"{rel!s}  [bad year: {year!r}]")
+            elif not (month.isdigit() and len(month) == 2 and 1 <= int(month) <= 12):
+                bad.append(f"{rel!s}  [bad month: {month!r}]")
+        self.assertFalse(
+            bad,
+            "Files not in valid YYYY/MM/ structure:\n  " + "\n  ".join(bad),
+        )
+
+    def test_all_media_files_in_output(self) -> None:
+        """Every expected output filename must exist somewhere in the output tree."""
+        output_names = {f.name for f in self.output_dir.rglob('*') if f.is_file()}
+
+        # Non-duplicate matched files — output name equals the JSON title, which
+        # defaults to the media filename (path.stem of the .json file).
+        expected = [
+            # RootLevel
+            'photo_basic.jpg',
+            'orphan_no_json.jpg',
+            # GPS Tests
+            'gps_ne.jpg', 'gps_nw.jpg', 'gps_se.jpg', 'gps_sw.jpg',
+            'gps_altitude_negative.jpg', 'gps_high_altitude.jpg',
+            # Timezones
+            'tz_utc.jpg', 'tz_gmt2.jpg', 'tz_minus5.jpg',
+            'tz_plus8.jpg', 'tz_plus530.jpg',
+            # Descriptions
+            'desc_utf8.jpg', 'desc_escaped.jpg', 'desc_newline.jpg',
+            'desc_crlf.jpg', 'desc_empty.jpg', 'desc_blocked.jpg', 'desc_long.jpg',
+            # FileTypes / Matched (title = "test.<ext>")
+            'test.jpg', 'test.jpeg', 'test.png', 'test.gif', 'test.tiff',
+            'test.mp4', 'test.mov', 'test.avi', 'test.mkv', 'test.webm',
+            'test.heic', 'test.dng',
+            # FileTypes / Orphans (no JSON → copied with original name)
+            'orphan.jpg', 'orphan.png', 'orphan.gif',
+            'orphan.mp4', 'orphan.mov', 'orphan.avi',
+            # Duplicates — both same_name_a/.._b carry title='same_name.jpg';
+            # first copy keeps same_name.jpg, second is renamed same_name_2.jpg.
+            'same_name.jpg', 'same_name_2.jpg',
+            # BracketNotation — photo(1) and photo(2) both have title='photo.jpg';
+            # first keeps photo.jpg, second is renamed photo_2.jpg.
+            'photo.jpg', 'photo_2.jpg',
+            # SpecialChars
+            'Kosi Bay - 2014 - 179.jpg',
+            '_DSC5757-Enhanced-NR - Kruger.jpg',
+        ]
+
+        missing = [name for name in expected if name not in output_names]
+        self.assertFalse(
+            missing,
+            "Expected output files not found:\n  " + "\n  ".join(missing),
+        )
+
+    # ------------------------------------------------------------------
     # tearDownClass
     # ------------------------------------------------------------------
 
@@ -682,7 +780,7 @@ class TestGooglePhotosExportMerger(unittest.TestCase):
 
         try:
             input('\nPress Enter to delete test files, or Ctrl+C to keep them ... ')
-        except KeyboardInterrupt:
+        except (KeyboardInterrupt, EOFError):
             print(f'\nTest files kept at: {cls.tmp_dir}')
             return
 
@@ -734,7 +832,9 @@ if __name__ == '__main__':
             self._outcomes: list[tuple[str, str]] = []  # (method_name, status)
 
         def _record(self, test: unittest.TestCase, status: str) -> None:
-            self._outcomes.append((test._testMethodName, status))
+            name = getattr(test, '_testMethodName', None)
+            if name:
+                self._outcomes.append((name, status))
 
         def addSuccess(self, test):
             super().addSuccess(test)
