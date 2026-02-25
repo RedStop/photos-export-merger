@@ -196,6 +196,7 @@ class GooglePhotosExportMerger:
             handler = logging.StreamHandler()
             handler.setFormatter(logging.Formatter('%(asctime)s [%(levelname)s] %(message)s', datefmt='%H:%M:%S'))
             self.logger.addHandler(handler)
+        self.logger.propagate = False
 
     def _rel(self, path: Path) -> str:
         """Return path relative to input directory for log readability."""
