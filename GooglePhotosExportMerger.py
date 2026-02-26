@@ -497,7 +497,7 @@ class GooglePhotosExportMerger:
             info.output_path = self.output_path / info.year / info.month / title
 
             if info.write_strategy in (WriteStrategy.PARTIAL_WITH_SIDECAR, WriteStrategy.VIDEO_WITH_SIDECAR):
-                info.sidecar_path = info.output_path.parent / (Path(title).stem + '.xmp')
+                info.sidecar_path = info.output_path.parent / (title + '.xmp')
 
     def _resolve_duplicates(self, media_files: List[MediaFileInfo], stats: MergeStats):
         seen: Dict[Path, int] = {}
@@ -515,7 +515,7 @@ class GooglePhotosExportMerger:
                 info.output_path = path.parent / new_name
                 info.new_title = new_name
                 if info.sidecar_path:
-                    info.sidecar_path = path.parent / f"{stem}_{counter}.xmp"
+                    info.sidecar_path = path.parent / f"{stem}_{counter}{ext}.xmp"
                 stats.duplicates_renamed += 1
                 self.logger.warning("Duplicate filename resolved: %s -> %s (source: %s)", original_path.name, new_name, self._rel(info.source_path))
             else:

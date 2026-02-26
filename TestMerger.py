@@ -724,9 +724,8 @@ class TestGooglePhotosExportMerger(unittest.TestCase):
         make_media_file(deep_dir / 'deep.jpg')
 
         # ── Sidecars ───────────────────────────────────────────────────────
-        # Dedicated files with unique stems to avoid the stem collision that
-        # affects FileTypes/Matched/test.* (all target test.xmp, so only the
-        # first sidecar-capable format succeeds).
+        # Dedicated files with unique stems used for sidecar content tests
+        # (GPS, description, timestamps).
         d = inp / 'Sidecars'
         _geo_sidecar = {
             'latitude': 48.85, 'longitude': 2.35, 'altitude': 100.0,
@@ -1239,52 +1238,51 @@ class TestGooglePhotosExportMerger(unittest.TestCase):
     # Category 8 — XMP Sidecars
     # ------------------------------------------------------------------
     # Uses dedicated files in Sidecars/ (sc_png.png, sc_gif.gif, sc_avi.avi)
-    # to avoid the stem collision where all FileTypes/Matched/test.* files
-    # would target the same test.xmp sidecar path.
+    # for sidecar content verification (GPS, description, timestamps).
 
     def test_xmp_sidecar_for_png(self) -> None:
-        """PNG uses PARTIAL_WITH_SIDECAR strategy → sc_png.xmp must exist in output."""
-        xmp = self._find_output_file('sc_png.xmp')
-        self.assertIsNotNone(xmp, "sc_png.xmp not found in output")
+        """PNG uses PARTIAL_WITH_SIDECAR strategy → sc_png.png.xmp must exist in output."""
+        xmp = self._find_output_file('sc_png.png.xmp')
+        self.assertIsNotNone(xmp, "sc_png.png.xmp not found in output")
 
     def test_xmp_sidecar_for_gif(self) -> None:
-        """GIF uses PARTIAL_WITH_SIDECAR strategy → sc_gif.xmp must exist in output."""
-        xmp = self._find_output_file('sc_gif.xmp')
-        self.assertIsNotNone(xmp, "sc_gif.xmp not found in output")
+        """GIF uses PARTIAL_WITH_SIDECAR strategy → sc_gif.gif.xmp must exist in output."""
+        xmp = self._find_output_file('sc_gif.gif.xmp')
+        self.assertIsNotNone(xmp, "sc_gif.gif.xmp not found in output")
 
     def test_xmp_sidecar_for_video(self) -> None:
-        """AVI uses VIDEO_WITH_SIDECAR strategy → sc_avi.xmp must exist in output."""
-        xmp = self._find_output_file('sc_avi.xmp')
-        self.assertIsNotNone(xmp, "sc_avi.xmp not found in output")
+        """AVI uses VIDEO_WITH_SIDECAR strategy → sc_avi.avi.xmp must exist in output."""
+        xmp = self._find_output_file('sc_avi.avi.xmp')
+        self.assertIsNotNone(xmp, "sc_avi.avi.xmp not found in output")
 
     def test_xmp_sidecar_png_contains_gps(self) -> None:
-        """sc_png.xmp contains GPS coordinates written from sc_png.png JSON geoData."""
-        tags = self._read_tags('sc_png.xmp', ['XMP:GPSLatitude', 'XMP:GPSLongitude'])
+        """sc_png.png.xmp contains GPS coordinates written from sc_png.png JSON geoData."""
+        tags = self._read_tags('sc_png.png.xmp', ['XMP:GPSLatitude', 'XMP:GPSLongitude'])
         self.assertIsNotNone(tags.get('XMP:GPSLatitude'),
-                             "sc_png.xmp missing XMP:GPSLatitude")
+                             "sc_png.png.xmp missing XMP:GPSLatitude")
         self.assertIsNotNone(tags.get('XMP:GPSLongitude'),
-                             "sc_png.xmp missing XMP:GPSLongitude")
+                             "sc_png.png.xmp missing XMP:GPSLongitude")
 
     def test_xmp_sidecar_contains_dates(self) -> None:
         """XMP sidecar contains XMP:DateTimeOriginal (or XMP:CreateDate) from JSON timestamp."""
-        tags = self._read_tags('sc_avi.xmp', ['XMP:DateTimeOriginal', 'XMP:CreateDate'])
+        tags = self._read_tags('sc_avi.avi.xmp', ['XMP:DateTimeOriginal', 'XMP:CreateDate'])
         dt = tags.get('XMP:DateTimeOriginal') or tags.get('XMP:CreateDate')
-        self.assertIsNotNone(dt, "sc_avi.xmp missing XMP:DateTimeOriginal / XMP:CreateDate")
+        self.assertIsNotNone(dt, "sc_avi.avi.xmp missing XMP:DateTimeOriginal / XMP:CreateDate")
 
     def test_xmp_sidecar_contains_gps(self) -> None:
         """XMP sidecar contains GPS coordinates written from JSON geoData."""
-        tags = self._read_tags('sc_avi.xmp', ['XMP:GPSLatitude', 'XMP:GPSLongitude'])
+        tags = self._read_tags('sc_avi.avi.xmp', ['XMP:GPSLatitude', 'XMP:GPSLongitude'])
         self.assertIsNotNone(tags.get('XMP:GPSLatitude'),
-                             "sc_avi.xmp missing XMP:GPSLatitude")
+                             "sc_avi.avi.xmp missing XMP:GPSLatitude")
         self.assertIsNotNone(tags.get('XMP:GPSLongitude'),
-                             "sc_avi.xmp missing XMP:GPSLongitude")
+                             "sc_avi.avi.xmp missing XMP:GPSLongitude")
 
     def test_xmp_sidecar_contains_description(self) -> None:
         """XMP sidecar contains XMP:Description written from JSON description field."""
-        tags = self._read_tags('sc_avi.xmp', ['XMP:Description'])
+        tags = self._read_tags('sc_avi.avi.xmp', ['XMP:Description'])
         desc = tags.get('XMP:Description', '')
         self.assertIn('AVI sidecar test', desc,
-                      f"sc_avi.xmp XMP:Description mismatch: {desc!r}")
+                      f"sc_avi.avi.xmp XMP:Description mismatch: {desc!r}")
 
     # ------------------------------------------------------------------
     # Category 9 — Duplicate Resolution
@@ -1363,15 +1361,15 @@ class TestGooglePhotosExportMerger(unittest.TestCase):
         )
 
     def test_sidecar_timestamps_match(self) -> None:
-        """sc_avi.avi and sc_avi.xmp have matching mtimes (both set by _set_filesystem_timestamps)."""
+        """sc_avi.avi and sc_avi.avi.xmp have matching mtimes (both set by _set_filesystem_timestamps)."""
         avi = self._find_output_file('sc_avi.avi')
-        xmp = self._find_output_file('sc_avi.xmp')
+        xmp = self._find_output_file('sc_avi.avi.xmp')
         self.assertIsNotNone(avi, "sc_avi.avi not found in output")
-        self.assertIsNotNone(xmp, "sc_avi.xmp not found in output")
+        self.assertIsNotNone(xmp, "sc_avi.avi.xmp not found in output")
         self.assertAlmostEqual(
             avi.stat().st_mtime, xmp.stat().st_mtime, delta=2,
             msg=(f"sc_avi.avi mtime ({avi.stat().st_mtime:.3f}) and "
-                 f"sc_avi.xmp mtime ({xmp.stat().st_mtime:.3f}) differ by more than 2 s"),
+                 f"sc_avi.avi.xmp mtime ({xmp.stat().st_mtime:.3f}) differ by more than 2 s"),
         )
 
     # ------------------------------------------------------------------
@@ -1383,7 +1381,9 @@ class TestGooglePhotosExportMerger(unittest.TestCase):
     #               includes test.cr2, test.tif, tz_offset_time.jpg, UPPERCASE.JPG)
     #   orphans=7  (orphan_no_json + 6 × FileTypes/Orphans)
     #   gps=8      (6 GPS Tests + sc_png + sc_avi)
-    #   sidecars=4 (sc_png.xmp + sc_gif.xmp + sc_avi.xmp + test.xmp via AVI)
+    #   sidecars=10 (test.png.xmp + test.gif.xmp + test.mp4.xmp + test.mov.xmp +
+    #               test.avi.xmp + test.mkv.xmp + test.webm.xmp from FileTypes/Matched,
+    #               + sc_png.png.xmp + sc_gif.gif.xmp + sc_avi.avi.xmp)
     #   descriptions_cleared=1  (desc_blocked.jpg)
     #   duplicates_renamed=2    (same_name_b → same_name_2, photo(2) → photo_2)
     #   written=52
@@ -1410,9 +1410,9 @@ class TestGooglePhotosExportMerger(unittest.TestCase):
                          f"Expected 8 GPS writes, got {self.stats.gps_written}")
 
     def test_stats_sidecars_created(self) -> None:
-        """XMP sidecars created = 4 (sc_png, sc_gif, sc_avi, test.xmp from FileTypes/AVI)."""
-        self.assertEqual(self.stats.sidecars_created, 4,
-                         f"Expected 4 sidecars, got {self.stats.sidecars_created}")
+        """XMP sidecars created = 10 (7 from FileTypes/Matched + sc_png.png, sc_gif.gif, sc_avi.avi)."""
+        self.assertEqual(self.stats.sidecars_created, 10,
+                         f"Expected 10 sidecars, got {self.stats.sidecars_created}")
 
     def test_stats_zero_errors(self) -> None:
         """Merger reports zero errors for well-formed test data."""
