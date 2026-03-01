@@ -2202,33 +2202,83 @@ if __name__ == '__main__':
                 filtered.addTest(item)
         return filtered
 
+    # ── Known extensions for media-type labelling ────────────────────────────
+    _KNOWN_EXTS: frozenset[str] = frozenset(ext.lstrip('.') for ext in _MEDIA_BYTES)
+
+    def _media_tag(test_name: str) -> str:
+        """Return '[.ext] ' if a known extension is embedded in the test name, else ''."""
+        for part in reversed(test_name.split('_')):
+            if part in _KNOWN_EXTS:
+                return f'[.{part}] '
+        return ''
+
     # ── Custom result collector ──────────────────────────────────────────────
     class _SummaryResult(unittest.TextTestResult):
-        """TextTestResult that additionally records per-test pass/fail status."""
+        """TextTestResult that records per-test pass/fail and prints emoji progress."""
 
         def __init__(self, *args, **kwargs):
             super().__init__(*args, **kwargs)
             self._outcomes: list[tuple[str, str]] = []  # (method_name, status)
+            self._current_cat: str = ''
+            self._pending_desc: str = ''
 
         def _record(self, test: unittest.TestCase, status: str) -> None:
             name = getattr(test, '_testMethodName', None)
             if name:
                 self._outcomes.append((name, status))
 
+        def getDescription(self, test: unittest.TestCase) -> str:
+            tag = _media_tag(getattr(test, '_testMethodName', ''))
+            name = getattr(test, '_testMethodName', str(test))
+            doc = test.shortDescription() if self.descriptions else None
+            base = f'{name}\n{doc}' if doc else name
+            return f'{tag}{base}' if tag else base
+
+        def startTest(self, test: unittest.TestCase) -> None:
+            # Increment counter only — description is deferred until result is known.
+            unittest.TestResult.startTest(self, test)
+            name = getattr(test, '_testMethodName', '')
+            cat = _cat(name)
+            if cat != self._current_cat:
+                self._current_cat = cat
+                banner = f' CATEGORY: {cat} '
+                width = 62
+                dashes = max(0, width - len(banner))
+                left  = dashes // 2
+                right = dashes - left
+                self.stream.writeln()
+                self.stream.writeln('─' * left + banner + '─' * right)
+            self._pending_desc = self.getDescription(test)
+
+        def _emit(self, emoji: str) -> None:
+            if self.showAll:
+                name_line, _, doc_line = self._pending_desc.partition('\n')
+                if doc_line:
+                    self.stream.writeln(f'{name_line}\n{emoji} {doc_line}')
+                else:
+                    self.stream.writeln(f'{emoji} {name_line}')
+            elif self.dots:
+                self.stream.write(emoji[0])
+                self.stream.flush()
+
         def addSuccess(self, test):
-            super().addSuccess(test)
+            unittest.TestResult.addSuccess(self, test)
+            self._emit('✅')
             self._record(test, 'PASS')
 
         def addFailure(self, test, err):
-            super().addFailure(test, err)
+            unittest.TestResult.addFailure(self, test, err)
+            self._emit('❌')
             self._record(test, 'FAIL')
 
         def addError(self, test, err):
-            super().addError(test, err)
+            unittest.TestResult.addError(self, test, err)
+            self._emit('❌')
             self._record(test, 'ERROR')
 
         def addSkip(self, test, reason):
-            super().addSkip(test, reason)
+            unittest.TestResult.addSkip(self, test, reason)
+            self._emit('⏭')
             self._record(test, 'SKIP')
 
     # ── Run suite ────────────────────────────────────────────────────────────
@@ -2244,6 +2294,10 @@ if __name__ == '__main__':
         if args.file_types:
             print(f'  File types : {", ".join(args.file_types)}')
         suite = _filter_suite(suite, args.categories or [], args.file_types or [])
+    # Sort tests by category then method name so the category banner fires once per group.
+    suite = unittest.TestSuite(
+        sorted(suite, key=lambda t: (_cat(t._testMethodName), t._testMethodName))
+    )
     runner = unittest.TextTestRunner(verbosity=2, resultclass=_SummaryResult)
     result = runner.run(suite)
 
