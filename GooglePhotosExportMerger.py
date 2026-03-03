@@ -571,7 +571,6 @@ if __name__ == '__main__':
     blocked_descriptions = [
         # Add unwanted description strings here, e.g.:
         # "Photo uploaded by Google Photos",
-        "          ",
         "SONY DSC",
         "OLYMPUS DIGITAL CAMERA",
         "DCIM\\100MEDIA\\DJI_0009.JPG",
