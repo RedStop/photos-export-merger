@@ -148,7 +148,7 @@ python GooglePhotosExportMerger.py <input_dir> <output_dir> [--dry-run] [--worke
 4. Copies the updated media file into the output directory, organized into `YYYY/MM/filename` subdirectories based on the photo/video date.
 5. **Orphan files** (media with no matching JSON) are still copied to the output — they just won't have updated metadata. Their dates are resolved from existing EXIF tags or the filesystem creation date.
 
-Steps 1–3 (scanning, matching, date resolution) run serially. Step 4 (file processing) runs in parallel across multiple worker processes when `--workers` is greater than 1, with each worker managing its own ExifTool instance.
+Steps 1–3 (scanning, matching, date resolution) run serially. Step 4 (file processing) runs in parallel across multiple worker processes when `--workers` is greater than 1, with each worker managing its own ExifTool instance. Both serial and parallel paths share the same core processing logic — the class methods delegate to shared module-level functions that are also used by the parallel workers.
 
 ### Blocking unwanted descriptions
 

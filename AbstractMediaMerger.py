@@ -29,6 +29,9 @@ class MediaFileInfo:
     date_source: Optional[str] = None
     resolved_datetime: Optional[datetime] = None
     error: Optional[str] = None
+    # Pre-extracted fields for processing (avoids shipping full json_data to workers)
+    description: Optional[str] = None
+    gps: Optional[Dict[str, float]] = None
 
 
 @dataclass
@@ -124,16 +127,9 @@ class AbstractMediaMerger(ABC):
             self._close_writer()
 
         # Step 7 & 8: Process files
-        # Note: when running in parallel, each worker opens its own writer.
-        # When running serially, we re-open the writer for processing.
-        if self.num_workers > 1 and not self.dry_run and len(media_files) > 1:
-            self._process_files(media_files, stats)
-        else:
-            self._open_writer()
-            try:
-                self._process_files(media_files, stats)
-            finally:
-                self._close_writer()
+        # Writer lifecycle is managed by _process_files: serial mode opens/closes
+        # the writer; parallel mode lets each worker open its own.
+        self._process_files(media_files, stats)
 
         # Step 9: Log summary
         self._log_summary(stats)
@@ -238,9 +234,15 @@ class AbstractMediaMerger(ABC):
             return
 
         if self.num_workers > 1 and not self.dry_run and len(valid_files) > 1:
+            # Parallel mode: each worker opens its own writer
             self._process_files_parallel(valid_files, stats)
         else:
-            self._process_files_serial(valid_files, stats)
+            # Serial mode: open a single writer for all files
+            self._open_writer()
+            try:
+                self._process_files_serial(valid_files, stats)
+            finally:
+                self._close_writer()
 
     def _process_files_serial(self, media_files: List[MediaFileInfo], stats: MergeStats) -> None:
         """Process files one at a time using the current ExifTool instance."""
@@ -277,17 +279,14 @@ class AbstractMediaMerger(ABC):
         if info.clear_descriptions:
             self.logger.info("  Blocked description detected — will clear UserComment, ImageDescription, XMP:Description")
 
-        if not info.is_orphan and info.json_data:
+        if not info.is_orphan:
             tags = []
-            pt = info.json_data.get('photoTakenTime')
-            if pt and pt.get('timestamp'):
+            if info.resolved_datetime:
                 tags.append('dates')
-            desc = info.json_data.get('description', '')
-            if desc:
-                tags.append(f'description="{desc}"')
-            gps = _resolve_gps(info.json_data)
-            if gps:
-                tags.append(f'GPS({gps["latitude"]:.4f}, {gps["longitude"]:.4f})')
+            if info.description:
+                tags.append(f'description="{info.description}"')
+            if info.gps:
+                tags.append(f'GPS({info.gps["latitude"]:.4f}, {info.gps["longitude"]:.4f})')
             if tags:
                 self.logger.info("  Tags to write: %s", ', '.join(tags))
 

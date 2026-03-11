@@ -104,9 +104,9 @@ def _build_sidecar_params(info: MediaFileInfo, gps: Optional[Dict[str, float]]) 
         params.append(f'-XMP:CreateDate={dt_str}')
         params.append(f'-XMP:ModifyDate={dt_str}')
 
-    if not info.clear_descriptions and info.json_data:
-        desc = info.json_data.get('description', '')
-        if desc and desc.strip():
+    if not info.clear_descriptions and info.description:
+        desc = info.description
+        if desc.strip():
             escaped, needs_E = _escape_description(desc)
             if needs_E:
                 params.append('-E')
@@ -133,37 +133,18 @@ def _escape_description(desc: str) -> tuple:
 
 
 # ---------------------------------------------------------------------------
-# Parallel worker — top-level function for ProcessPoolExecutor pickling
+# Core processing functions — used by both serial and parallel paths.
+# Top-level (not methods) for ProcessPoolExecutor pickle compatibility.
 # ---------------------------------------------------------------------------
 
-def _process_chunk(chunk: List[MediaFileInfo], input_path: Path) -> MergeStats:
-    """Process a list of MediaFileInfo items in a worker process.
-
-    Each worker opens its own ExifTool instance.  Returns a partial
-    MergeStats with only the processing counters populated.
-    """
-    logger = logging.getLogger(f'Worker-{os.getpid()}')
-    stats = MergeStats()
-    et_helper = exiftool.ExifToolHelper()
-    et = et_helper.__enter__()
-    try:
-        for info in chunk:
-            try:
-                if info.is_orphan:
-                    _worker_process_orphan(et, info, stats, input_path, logger)
-                else:
-                    _worker_process_matched(et, info, stats, input_path, logger)
-            except Exception as e:
-                logger.error("Failed to process %s: %s", info.source_path, e)
-                stats.errors += 1
-    finally:
-        et_helper.__exit__(None, None, None)
-    return stats
+def _execute_et(et, params: List[str]):
+    """Execute ExifTool with UTF-8 encoded params."""
+    et.execute(*[p.encode('utf-8') if isinstance(p, str) else p for p in params])
 
 
-def _worker_process_matched(et, info: MediaFileInfo, stats: MergeStats,
-                            input_path: Path, logger: logging.Logger):
-    """Process a matched media file inside a worker process."""
+def _do_process_matched(et, info: MediaFileInfo, stats: MergeStats,
+                        logger: logging.Logger):
+    """Core logic for processing a matched media file."""
     info.output_path.parent.mkdir(parents=True, exist_ok=True)
 
     params = ['-charset', 'filename=utf8']
@@ -181,41 +162,40 @@ def _worker_process_matched(et, info: MediaFileInfo, stats: MergeStats,
         params.append('-EXIF:ImageDescription=')
         params.append('-XMP-dc:Description=')
         stats.descriptions_cleared += 1
-    elif info.json_data:
-        desc = info.json_data.get('description', '')
-        if desc and desc.strip():
-            escaped, needs_E = _escape_description(desc)
-            if needs_E:
-                params.append('-E')
-            params.append(f'-XMP-dc:Description={escaped}')
-            params.append(f'-EXIF:ImageDescription={escaped}')
+    elif info.description and info.description.strip():
+        escaped, needs_E = _escape_description(info.description)
+        if needs_E:
+            params.append('-E')
+        params.append(f'-XMP-dc:Description={escaped}')
+        params.append(f'-EXIF:ImageDescription={escaped}')
 
-    gps = None
-    if info.json_data:
-        gps = _resolve_gps(info.json_data)
-        if gps:
-            params.extend(_build_gps_params(gps))
-            stats.gps_written += 1
+    if info.gps:
+        params.extend(_build_gps_params(info.gps))
+        stats.gps_written += 1
 
+    # Use -o to copy source to output with metadata in one step
     params.append('-o')
     params.append(str(info.output_path))
     params.append(str(info.source_path))
 
     try:
-        et.execute(*[p.encode('utf-8') if isinstance(p, str) else p for p in params])
+        _execute_et(et, params)
     except Exception as e:
         if info.output_path.exists():
+            # ExifTool status 1 = warnings (e.g. unsupported tags for this format).
+            # The -o copy still succeeded, so treat as success with warnings.
             logger.debug("ExifTool warnings for %s: %s (output created successfully)",
                          info.source_path, e)
         else:
+            # Genuine failure: output not created. Fallback to copy + in-place write.
             logger.warning("ExifTool -o failed for %s: %s, falling back to copy+write",
                            info.source_path, e)
             try:
                 shutil.copy2(str(info.source_path), str(info.output_path))
                 fallback_params = ['-charset', 'filename=utf8', '-overwrite_original']
-                fallback_params.extend(params[2:-3])
+                fallback_params.extend(params[2:-3])  # tag params only (skip charset/filename, -o/output/source)
                 fallback_params.append(str(info.output_path))
-                et.execute(*[p.encode('utf-8') if isinstance(p, str) else p for p in fallback_params])
+                _execute_et(et, fallback_params)
             except Exception as e2:
                 if not info.output_path.exists():
                     logger.error("Failed to process %s: %s", info.source_path, e2)
@@ -225,14 +205,14 @@ def _worker_process_matched(et, info: MediaFileInfo, stats: MergeStats,
     stats.written += 1
 
     if info.sidecar_path:
-        _worker_create_sidecar(et, info, gps, stats, logger)
+        _do_create_sidecar(et, info, stats, logger)
 
-    _worker_set_filesystem_timestamps(et, info, logger)
+    _do_set_filesystem_timestamps(et, info, logger)
 
 
-def _worker_process_orphan(et, info: MediaFileInfo, stats: MergeStats,
-                           input_path: Path, logger: logging.Logger):
-    """Process an orphan media file inside a worker process."""
+def _do_process_orphan(et, info: MediaFileInfo, stats: MergeStats,
+                       logger: logging.Logger):
+    """Core logic for processing an orphan media file."""
     info.output_path.parent.mkdir(parents=True, exist_ok=True)
 
     try:
@@ -252,35 +232,35 @@ def _worker_process_orphan(et, info: MediaFileInfo, stats: MergeStats,
                 '-XMP-dc:Description=',
                 str(info.output_path),
             ]
-            et.execute(*[p.encode('utf-8') if isinstance(p, str) else p for p in clear_params])
+            _execute_et(et, clear_params)
             stats.descriptions_cleared += 1
         except Exception as e:
             logger.warning("Failed to clear descriptions for orphan %s: %s", info.source_path, e)
 
-    _worker_set_filesystem_timestamps(et, info, logger)
+    _do_set_filesystem_timestamps(et, info, logger)
 
 
-def _worker_create_sidecar(et, info: MediaFileInfo, gps: Optional[Dict[str, float]],
-                           stats: MergeStats, logger: logging.Logger):
-    """Create an XMP sidecar file inside a worker process."""
+def _do_create_sidecar(et, info: MediaFileInfo,
+                       stats: MergeStats, logger: logging.Logger):
+    """Core logic for creating an XMP sidecar file."""
     if info.sidecar_path is None:
         return
 
-    sidecar_params = _build_sidecar_params(info, gps)
+    sidecar_params = _build_sidecar_params(info, info.gps)
     sidecar_params.append('-o')
     sidecar_params.append(str(info.sidecar_path))
     sidecar_params.append(str(info.output_path))
 
     try:
-        et.execute(*[p.encode('utf-8') if isinstance(p, str) else p for p in sidecar_params])
+        _execute_et(et, sidecar_params)
         stats.sidecars_created += 1
         logger.info("Created XMP sidecar for %s: %s", info.source_path, info.sidecar_path.name)
     except Exception as e:
         logger.warning("Failed to create XMP sidecar for %s: %s", info.source_path, e)
 
 
-def _worker_set_filesystem_timestamps(et, info: MediaFileInfo, logger: logging.Logger):
-    """Set filesystem timestamps inside a worker process."""
+def _do_set_filesystem_timestamps(et, info: MediaFileInfo, logger: logging.Logger):
+    """Core logic for setting filesystem timestamps."""
     if info.resolved_datetime is None:
         return
 
@@ -299,9 +279,50 @@ def _worker_set_filesystem_timestamps(et, info: MediaFileInfo, logger: logging.L
                 f'-FileModifyDate={dt_str}',
                 str(file_path),
             ]
-            et.execute(*[p.encode('utf-8') if isinstance(p, str) else p for p in ts_params])
+            _execute_et(et, ts_params)
         except Exception as e:
             logger.warning("Failed to set filesystem timestamps for %s: %s", info.source_path, e)
+
+
+# ---------------------------------------------------------------------------
+# Parallel worker — top-level function for ProcessPoolExecutor pickling
+# ---------------------------------------------------------------------------
+
+def _setup_worker_logging() -> logging.Logger:
+    """Configure and return a logger for the current worker process."""
+    logger = logging.getLogger(f'Worker-{os.getpid()}')
+    if not logger.handlers:
+        handler = logging.StreamHandler()
+        handler.setFormatter(logging.Formatter(
+            '%(asctime)s [%(levelname)s] %(message)s', datefmt='%H:%M:%S'))
+        logger.addHandler(handler)
+        logger.setLevel(logging.DEBUG)
+    return logger
+
+
+def _process_chunk(chunk: List[MediaFileInfo]) -> MergeStats:
+    """Process a list of MediaFileInfo items in a worker process.
+
+    Each worker opens its own ExifTool instance.  Returns a partial
+    MergeStats with only the processing counters populated.
+    """
+    logger = _setup_worker_logging()
+    stats = MergeStats()
+    et_helper = exiftool.ExifToolHelper()
+    et = et_helper.__enter__()
+    try:
+        for info in chunk:
+            try:
+                if info.is_orphan:
+                    _do_process_orphan(et, info, stats, logger)
+                else:
+                    _do_process_matched(et, info, stats, logger)
+            except Exception as e:
+                logger.error("Failed to process %s: %s", info.source_path, e)
+                stats.errors += 1
+    finally:
+        et_helper.__exit__(None, None, None)
+    return stats
 
 
 class GooglePhotosExportMerger(AbstractMediaMerger):
@@ -578,161 +599,25 @@ class GooglePhotosExportMerger(AbstractMediaMerger):
             if info.write_strategy in (WriteStrategy.PARTIAL_WITH_SIDECAR, WriteStrategy.VIDEO_WITH_SIDECAR):
                 info.sidecar_path = info.output_path.parent / (title + '.xmp')
 
+        # Extract fields needed for processing and clear json_data to reduce
+        # serialisation payload when dispatching to worker processes.
+        for info in media_files:
+            if info.json_data:
+                info.description = info.json_data.get('description', '')
+                info.gps = _resolve_gps(info.json_data)
+                info.json_data = None
+
     def _process_matched(self, info: MediaFileInfo, stats: MergeStats):
         if self.dry_run:
             self._log_dry_run(info)
             return
-
-        # Ensure output directory exists
-        info.output_path.parent.mkdir(parents=True, exist_ok=True)
-
-        # Build ExifTool params (NO -overwrite_original: -o copies to output without deleting source)
-        params = ['-charset', 'filename=utf8']
-
-        # Date tags
-        if info.resolved_datetime:
-            dt_str = info.resolved_datetime.strftime('%Y:%m:%d %H:%M:%S')
-            tz_str = _format_tz_offset(info.resolved_datetime.tzinfo)
-            params.append(f'-alldates={dt_str}')
-            params.append(f'-EXIF:ExifIFD:OffsetTime={tz_str}')
-            params.append(f'-EXIF:ExifIFD:OffsetTimeOriginal={tz_str}')
-            params.append(f'-EXIF:ExifIFD:OffsetTimeDigitized={tz_str}')
-
-        # Description
-        if info.clear_descriptions:
-            params.append('-EXIF:UserComment=')
-            params.append('-EXIF:ImageDescription=')
-            params.append('-XMP-dc:Description=')
-            stats.descriptions_cleared += 1
-        elif info.json_data:
-            desc = info.json_data.get('description', '')
-            if desc and desc.strip():
-                escaped, needs_E = _escape_description(desc)
-                if needs_E:
-                    params.append('-E')
-                params.append(f'-XMP-dc:Description={escaped}')
-                params.append(f'-EXIF:ImageDescription={escaped}')
-
-        # GPS
-        gps = None
-        if info.json_data:
-            gps = _resolve_gps(info.json_data)
-            if gps:
-                params.extend(_build_gps_params(gps))
-                stats.gps_written += 1
-
-        # Use -o to copy source to output with metadata in one step
-        params.append('-o')
-        params.append(str(info.output_path))
-        params.append(str(info.source_path))
-
-        try:
-            self._et.execute(*[p.encode('utf-8') if isinstance(p, str) else p for p in params])
-        except Exception as e:
-            if info.output_path.exists():
-                # ExifTool status 1 = warnings (e.g. unsupported tags for this format).
-                # The -o copy still succeeded, so treat as success with warnings.
-                self.logger.debug("ExifTool warnings for %s: %s (output created successfully)",
-                                  self._rel(info.source_path), e)
-            else:
-                # Genuine failure: output not created. Fallback to copy + in-place write.
-                self.logger.warning("ExifTool -o failed for %s: %s, falling back to copy+write",
-                                    self._rel(info.source_path), e)
-                try:
-                    shutil.copy2(str(info.source_path), str(info.output_path))
-                    fallback_params = ['-charset', 'filename=utf8', '-overwrite_original']
-                    fallback_params.extend(params[2:-3])  # tag params only (skip charset/filename, -o/output/source)
-                    fallback_params.append(str(info.output_path))
-                    self._et.execute(*[p.encode('utf-8') if isinstance(p, str) else p for p in fallback_params])
-                except Exception as e2:
-                    if not info.output_path.exists():
-                        self.logger.error("Failed to process %s: %s", self._rel(info.source_path), e2)
-                        stats.errors += 1
-                        return
-
-        stats.written += 1
-
-        # Create XMP sidecar if needed
-        if info.sidecar_path:
-            self._create_sidecar(info, gps, stats)
-
-        # Set filesystem timestamps
-        self._set_filesystem_timestamps(info)
+        _do_process_matched(self._et, info, stats, self.logger)
 
     def _process_orphan(self, info: MediaFileInfo, stats: MergeStats):
         if self.dry_run:
             self._log_dry_run(info)
             return
-
-        info.output_path.parent.mkdir(parents=True, exist_ok=True)
-
-        try:
-            shutil.copy2(str(info.source_path), str(info.output_path))
-            stats.written += 1
-        except Exception as e:
-            self.logger.error("Failed to copy orphan %s: %s", self._rel(info.source_path), e)
-            stats.errors += 1
-            return
-
-        # Clear blocked descriptions from output file
-        if info.clear_descriptions:
-            try:
-                clear_params = [
-                    '-overwrite_original',
-                    '-EXIF:UserComment=',
-                    '-EXIF:ImageDescription=',
-                    '-XMP-dc:Description=',
-                    str(info.output_path),
-                ]
-                self._et.execute(*[p.encode('utf-8') if isinstance(p, str) else p for p in clear_params])
-                stats.descriptions_cleared += 1
-            except Exception as e:
-                self.logger.warning("Failed to clear descriptions for orphan %s: %s", self._rel(info.source_path), e)
-
-        # Set filesystem timestamps if date was resolved
-        self._set_filesystem_timestamps(info)
-
-    def _create_sidecar(self, info: MediaFileInfo, gps: Optional[Dict[str, float]], stats: MergeStats):
-        if info.sidecar_path is None:
-            return
-
-        sidecar_params = _build_sidecar_params(info, gps)
-
-        # Create the XMP from scratch by writing tags to a new file
-        sidecar_params.append('-o')
-        sidecar_params.append(str(info.sidecar_path))
-        sidecar_params.append(str(info.output_path))
-
-        try:
-            self._et.execute(*[p.encode('utf-8') if isinstance(p, str) else p for p in sidecar_params])
-            stats.sidecars_created += 1
-            self.logger.info("Created XMP sidecar for %s: %s", self._rel(info.source_path), info.sidecar_path.name)
-        except Exception as e:
-            self.logger.warning("Failed to create XMP sidecar for %s: %s", self._rel(info.source_path), e)
-
-    def _set_filesystem_timestamps(self, info: MediaFileInfo):
-        if info.resolved_datetime is None:
-            return
-
-        # Always convert to GMT+02:00 for filesystem timestamps
-        gmt2_dt = info.resolved_datetime.astimezone(GMT_PLUS_2)
-        dt_str = gmt2_dt.strftime('%Y:%m:%d %H:%M:%S') + '+02:00'
-
-        files_to_update = [info.output_path]
-        if info.sidecar_path and info.sidecar_path.exists():
-            files_to_update.append(info.sidecar_path)
-
-        for file_path in files_to_update:
-            try:
-                ts_params = [
-                    '-overwrite_original',
-                    f'-FileCreateDate={dt_str}',
-                    f'-FileModifyDate={dt_str}',
-                    str(file_path),
-                ]
-                self._et.execute(*[p.encode('utf-8') if isinstance(p, str) else p for p in ts_params])
-            except Exception as e:
-                self.logger.warning("Failed to set filesystem timestamps for %s: %s", self._rel(info.source_path), e)
+        _do_process_orphan(self._et, info, stats, self.logger)
 
     def _process_files_parallel(self, media_files: List[MediaFileInfo], stats: MergeStats) -> None:
         """Split media_files across worker processes, each with its own ExifTool."""
@@ -746,7 +631,7 @@ class GooglePhotosExportMerger(AbstractMediaMerger):
 
         with ProcessPoolExecutor(max_workers=num_workers) as pool:
             futures = {
-                pool.submit(_process_chunk, chunk, self.input_path): i
+                pool.submit(_process_chunk, chunk): i
                 for i, chunk in enumerate(chunks)
             }
             for future in as_completed(futures):
@@ -755,7 +640,9 @@ class GooglePhotosExportMerger(AbstractMediaMerger):
                     partial_stats = future.result()
                     stats.merge(partial_stats)
                 except Exception as e:
-                    self.logger.error("Worker %d failed: %s", worker_idx, e)
+                    self.logger.error(
+                        "Worker %d failed: %s (counting all %d files in chunk as errors)",
+                        worker_idx, e, len(chunks[worker_idx]))
                     stats.errors += len(chunks[worker_idx])
 
 

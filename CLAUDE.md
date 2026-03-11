@@ -33,9 +33,9 @@ python -m pytest TestMerger.py
 
 Five modules with clear separation of concerns:
 
-1. **AbstractMediaMerger.py** — Abstract base class defining the merge pipeline. Defines `WriteStrategy` enum (DIRECT, PARTIAL_WITH_SIDECAR, VIDEO_WITH_SIDECAR), `MediaFileInfo` dataclass, and `MergeStats` dataclass (with a `merge()` method for aggregating partial stats from parallel workers). Implements the 9-step merge pipeline, GPS resolution, duplicate filename resolution, dry-run logging, and summary reporting. Accepts a `num_workers` parameter (default 1) and delegates to `_process_files_serial` or `_process_files_parallel` accordingly.
+1. **AbstractMediaMerger.py** — Abstract base class defining the merge pipeline. Defines `WriteStrategy` enum (DIRECT, PARTIAL_WITH_SIDECAR, VIDEO_WITH_SIDECAR), `MediaFileInfo` dataclass (includes pre-extracted `description` and `gps` fields to avoid shipping full `json_data` to workers), and `MergeStats` dataclass (with a `merge()` method for aggregating partial stats from parallel workers). Implements the 9-step merge pipeline, GPS resolution, duplicate filename resolution, dry-run logging, and summary reporting. Accepts a `num_workers` parameter (default 1); `_process_files` owns the serial-vs-parallel decision and writer lifecycle.
 
-2. **GooglePhotosExportMerger.py** — Concrete implementation of AbstractMediaMerger and the CLI entry point. Builds ExifTool parameters for dates, descriptions, GPS, and timezones. Has a `blocked_descriptions` list in `__main__` for filtering unwanted descriptions. Implements parallel file processing via `ProcessPoolExecutor`: files are round-robin distributed across N worker processes, each with its own ExifTool instance. The module-level worker functions (`_process_chunk`, `_worker_process_matched`, `_worker_process_orphan`, `_worker_create_sidecar`, `_worker_set_filesystem_timestamps`) are top-level for pickle compatibility.
+2. **GooglePhotosExportMerger.py** — Concrete implementation of AbstractMediaMerger and the CLI entry point. Builds ExifTool parameters for dates, descriptions, GPS, and timezones. Has a `blocked_descriptions` list in `__main__` for filtering unwanted descriptions. Implements parallel file processing via `ProcessPoolExecutor`: files are round-robin distributed across N worker processes, each with its own ExifTool instance. Core processing logic lives in shared module-level functions (`_do_process_matched`, `_do_process_orphan`, `_do_create_sidecar`, `_do_set_filesystem_timestamps`) that are used by both the serial class methods and the parallel worker. The parallel entry point `_process_chunk` configures worker logging and opens a per-worker ExifTool instance. To reduce IPC serialisation overhead, `description` and `gps` are pre-extracted onto `MediaFileInfo` and `json_data` is cleared before dispatch to workers.
 
 3. **JsonFileIdentifier.py** — Matches JSON metadata files to their corresponding media files. Uses `SortedSet` for O(log n + k) prefix-based lookups. Handles Google's bracket notation (e.g., `filename(2).jpg`) and case-insensitive extension matching.
 
@@ -57,10 +57,12 @@ Five modules with clear separation of concerns:
 ## Parallel Processing
 
 - Steps 1–6 of the pipeline (scan, match, resolve dates, resolve duplicates) run serially using a single ExifTool instance — these are fast and involve shared state
+- At the end of step 5, `description` and `gps` are pre-extracted from `json_data` onto `MediaFileInfo` fields, and `json_data` is set to `None` to reduce pickle/IPC overhead when dispatching to workers
 - Step 7 (file processing) runs in parallel via `concurrent.futures.ProcessPoolExecutor` when `num_workers > 1`
-- Each worker process opens its own `ExifToolHelper` instance to avoid IPC bottlenecks
+- Each worker process configures its own logging handler and opens its own `ExifToolHelper` instance to avoid IPC bottlenecks
+- Both serial and parallel paths share the same core processing functions (`_do_process_matched`, `_do_process_orphan`, `_do_create_sidecar`, `_do_set_filesystem_timestamps`) — the class methods are thin wrappers that delegate to these, and the parallel worker calls them directly
 - Files are distributed round-robin across workers for balanced load
 - Workers return partial `MergeStats` objects that are aggregated via `MergeStats.merge()` in the main process
-- The worker functions are module-level (not methods) because `ProcessPoolExecutor` requires picklable callables
+- The `_process_files` method in `AbstractMediaMerger` owns the serial-vs-parallel decision and manages the writer lifecycle (opening/closing ExifTool for serial mode)
 - `--workers 1` (or omitting `num_workers` from the constructor) preserves the original serial behaviour
 - Dry-run mode always runs serially regardless of `num_workers`
