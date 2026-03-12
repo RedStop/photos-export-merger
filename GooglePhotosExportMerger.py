@@ -30,15 +30,27 @@ DATE_TAGS_PRIORITY = [
 
 DESC_READ_TAGS = ['EXIF:UserComment', 'EXIF:ImageDescription', 'XMP:Description', 'IPTC:Caption-Abstract']
 
-# XMP date tags that should be updated to resolved_datetime (with timezone)
-# only when they already exist in the source file.  Applies to DIRECT and
+# Date tags that should be updated to resolved_datetime only when they
+# already exist in the source file.  Applies to DIRECT and
 # PARTIAL_WITH_SIDECAR strategies only (not video).
-XMP_DATE_TAGS_CONDITIONAL = [
-    'XMP-photoshop:DateCreated',
-    'XMP-xmp:CreateDate',
-    'XMP-xmp:MetadataDate',
-    'XMP-xmp:ModifyDate',
-]
+#
+# Keys   = tag names as returned by ExifTool get_tags() (used for reading).
+# Values = callable(dt_str, tz_str) → list of ExifTool write parameters.
+#
+# ExifTool returns XMP tags under the "XMP:" family-1 group regardless of
+# the specific XMP namespace, so reads use "XMP:…" while writes must use
+# the fully-qualified "XMP-photoshop:…" / "XMP-xmp:…" form.
+CONDITIONAL_DATE_TAGS: Dict[str, Any] = {
+    'XMP:DateCreated':  lambda dt, tz: [f'-XMP-photoshop:DateCreated={dt}{tz}'],
+    'XMP:CreateDate':   lambda dt, tz: [f'-XMP-xmp:CreateDate={dt}{tz}'],
+    'XMP:MetadataDate': lambda dt, tz: [f'-XMP-xmp:MetadataDate={dt}{tz}'],
+    'XMP:ModifyDate':   lambda dt, tz: [f'-XMP-xmp:ModifyDate={dt}{tz}'],
+    'IPTC:DateCreated': lambda dt, tz: [f'-IPTC:DateCreated={dt[:10]}'],
+    'IPTC:TimeCreated': lambda dt, tz: [f'-IPTC:TimeCreated={dt[11:]}{tz}'],
+}
+
+# Read-tag list for batch reads (keys of the mapping above).
+CONDITIONAL_DATE_READ_TAGS: List[str] = list(CONDITIONAL_DATE_TAGS.keys())
 
 GMT_PLUS_2 = timezone(timedelta(hours=2))
 
@@ -100,17 +112,23 @@ def _build_gps_params(gps: Dict[str, float]) -> List[str]:
     return params
 
 
-def _build_conditional_xmp_date_params(info: MediaFileInfo, dt_with_tz: str) -> List[str]:
-    """Build ExifTool params to update XMP date tags that already exist in the source.
+def _build_conditional_date_params(info: MediaFileInfo, dt_str: str, tz_str: str) -> List[str]:
+    """Build ExifTool params to update date tags that already exist in the source.
 
     Only applies to DIRECT and PARTIAL_WITH_SIDECAR strategies.
-    Each tag in existing_xmp_dates is set to *dt_with_tz* (local time with tz suffix).
+    Uses CONDITIONAL_DATE_TAGS mapping to translate read-tag names into the
+    correct write parameters.
     """
     if not info.existing_xmp_dates:
         return []
     if info.write_strategy == WriteStrategy.VIDEO_WITH_SIDECAR:
         return []
-    return [f'-{tag}={dt_with_tz}' for tag in info.existing_xmp_dates]
+    params: List[str] = []
+    for read_tag in info.existing_xmp_dates:
+        builder = CONDITIONAL_DATE_TAGS.get(read_tag)
+        if builder:
+            params.extend(builder(dt_str, tz_str))
+    return params
 
 
 def _build_sidecar_params(info: MediaFileInfo, gps: Optional[Dict[str, float]]) -> List[str]:
@@ -205,7 +223,7 @@ def _do_process_matched(et, info: MediaFileInfo, stats: MergeStats,
 
         # Update any pre-existing XMP date tags to the resolved datetime
         # (e.g. XMP-photoshop:DateCreated, XMP-xmp:MetadataDate).
-        params.extend(_build_conditional_xmp_date_params(info, f'{dt_str}{tz_str}'))
+        params.extend(_build_conditional_date_params(info, dt_str, tz_str))
 
     if info.clear_descriptions:
         params.append('-EXIF:UserComment=')
@@ -315,7 +333,7 @@ def _do_process_orphan(et, info: MediaFileInfo, stats: MergeStats,
             update_params.append(f'-EXIF:ExifIFD:OffsetTimeDigitized={tz_str}')
 
         # Update any pre-existing XMP date tags to the resolved datetime.
-        update_params.extend(_build_conditional_xmp_date_params(info, f'{dt_str}{tz_str}'))
+        update_params.extend(_build_conditional_date_params(info, dt_str, tz_str))
 
     # Only call ExifTool if there are tag params beyond the base three
     # (charset, filename, overwrite_original).
@@ -563,7 +581,7 @@ class GooglePhotosExportMerger(AbstractMediaMerger):
         for dir_path, infos in matched_by_dir.items():
             file_paths = [str(info.source_path) for info in infos]
             tz_tags = ['EXIF:OffsetTimeOriginal', 'EXIF:OffsetTime']
-            read_tags = tz_tags + XMP_DATE_TAGS_CONDITIONAL + (DESC_READ_TAGS if self.blocked_descriptions else ['IPTC:Caption-Abstract'])
+            read_tags = tz_tags + CONDITIONAL_DATE_READ_TAGS + (DESC_READ_TAGS if self.blocked_descriptions else ['IPTC:Caption-Abstract'])
 
             try:
                 tag_results = self._et.get_tags(file_paths, read_tags)
@@ -578,7 +596,7 @@ class GooglePhotosExportMerger(AbstractMediaMerger):
 
                 # Record which XMP date tags exist in the source file
                 # (used to conditionally update them during processing).
-                existing = {t for t in XMP_DATE_TAGS_CONDITIONAL if tags.get(t)}
+                existing = {t for t in CONDITIONAL_DATE_READ_TAGS if tags.get(t)}
                 if existing:
                     info.existing_xmp_dates = existing
 
@@ -630,7 +648,7 @@ class GooglePhotosExportMerger(AbstractMediaMerger):
         # Resolve dates for orphan files (batch read per directory)
         for dir_path, infos in orphans_by_dir.items():
             file_paths = [str(info.source_path) for info in infos]
-            read_tags = DATE_TAGS_PRIORITY + XMP_DATE_TAGS_CONDITIONAL + (DESC_READ_TAGS if self.blocked_descriptions else ['IPTC:Caption-Abstract'])
+            read_tags = DATE_TAGS_PRIORITY + CONDITIONAL_DATE_READ_TAGS + (DESC_READ_TAGS if self.blocked_descriptions else ['IPTC:Caption-Abstract'])
 
             try:
                 tag_results = self._et.get_tags(file_paths, read_tags)
@@ -644,7 +662,7 @@ class GooglePhotosExportMerger(AbstractMediaMerger):
                     info.has_iptc_caption = True
 
                 # Record which XMP date tags exist in the source file.
-                existing = {t for t in XMP_DATE_TAGS_CONDITIONAL if tags.get(t)}
+                existing = {t for t in CONDITIONAL_DATE_READ_TAGS if tags.get(t)}
                 if existing:
                     info.existing_xmp_dates = existing
 

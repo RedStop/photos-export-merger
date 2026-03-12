@@ -856,23 +856,25 @@ class TestGooglePhotosExportMerger(unittest.TestCase):
                     pass  # PNG/GIF may reject some tags — that is acceptable
 
         # ── XmpConditionalDates ───────────────────────────────────────────
-        # Files with pre-existing XMP date tags.  The merger should update
-        # only the tags that already exist, leaving absent tags absent.
+        # Files with pre-existing XMP/IPTC date tags.  The merger should
+        # update only the tags that already exist, leaving absent tags absent.
         d = inp / 'XmpConditionalDates'
-        # Matched JPG with XMP-photoshop:DateCreated and XMP-xmp:MetadataDate
+        # Matched JPG with several conditional date tags
         make_media_file(d / 'xmp_dates.jpg')
         make_json_file(d / 'xmp_dates.jpg.json', title='xmp_dates.jpg')
         # Matched JPG with none of the conditional tags (control case)
         make_media_file(d / 'xmp_no_dates.jpg')
         make_json_file(d / 'xmp_no_dates.jpg.json', title='xmp_no_dates.jpg')
 
-        _xmp_date_tags = {
+        _conditional_date_tags = {
             'XMP-photoshop:DateCreated': '2014:07:12 12:38:02',
             'XMP-xmp:MetadataDate':      '2014:07:13 21:06:45+02:00',
+            'IPTC:DateCreated':          '2014:07:12',
+            'IPTC:TimeCreated':          '12:38:42+00:00',
         }
         with exiftool.ExifToolHelper() as _et:
             try:
-                _et.set_tags([str(d / 'xmp_dates.jpg')], _xmp_date_tags,
+                _et.set_tags([str(d / 'xmp_dates.jpg')], _conditional_date_tags,
                              params=['-overwrite_original'])
             except Exception:
                 pass
@@ -2556,33 +2558,52 @@ class TestGooglePhotosExportMerger(unittest.TestCase):
     # Tags that were absent in the source should remain absent.
 
     def test_xmp_conditional_dates_updated(self) -> None:
-        """Pre-existing XMP-photoshop:DateCreated and XMP-xmp:MetadataDate
+        """Pre-existing XMP:DateCreated, XMP:MetadataDate, and IPTC date/time
         are updated to the resolved datetime (with timezone)."""
         tags = self._read_tags('xmp_dates.jpg', [
-            'XMP-photoshop:DateCreated', 'XMP-xmp:MetadataDate',
+            'XMP:DateCreated', 'XMP:MetadataDate',
+            'IPTC:DateCreated', 'IPTC:TimeCreated',
         ])
-        date_created = tags.get('XMP-photoshop:DateCreated')
-        metadata_date = tags.get('XMP-xmp:MetadataDate')
-        self.assertIsNotNone(date_created,
-                             "xmp_dates.jpg: XMP-photoshop:DateCreated should still exist")
-        self.assertIsNotNone(metadata_date,
-                             "xmp_dates.jpg: XMP-xmp:MetadataDate should still exist")
         # Default epoch 1723113846 → 2024:08:08 12:44:06+02:00 in GMT+2.
         # The old values (2014) should be replaced.
+        date_created = tags.get('XMP:DateCreated')
+        self.assertIsNotNone(date_created,
+                             "xmp_dates.jpg: XMP:DateCreated should still exist")
         self.assertIn('2024:08:08 12:44:06', str(date_created),
-                      f"XMP-photoshop:DateCreated not updated: {date_created!r}")
+                      f"XMP:DateCreated not updated: {date_created!r}")
+
+        metadata_date = tags.get('XMP:MetadataDate')
+        self.assertIsNotNone(metadata_date,
+                             "xmp_dates.jpg: XMP:MetadataDate should still exist")
         self.assertIn('2024:08:08 12:44:06', str(metadata_date),
-                      f"XMP-xmp:MetadataDate not updated: {metadata_date!r}")
+                      f"XMP:MetadataDate not updated: {metadata_date!r}")
+
+        iptc_date = tags.get('IPTC:DateCreated')
+        self.assertIsNotNone(iptc_date,
+                             "xmp_dates.jpg: IPTC:DateCreated should still exist")
+        self.assertIn('2024:08:08', str(iptc_date),
+                      f"IPTC:DateCreated not updated: {iptc_date!r}")
+
+        iptc_time = tags.get('IPTC:TimeCreated')
+        self.assertIsNotNone(iptc_time,
+                             "xmp_dates.jpg: IPTC:TimeCreated should still exist")
+        self.assertIn('12:44:06', str(iptc_time),
+                      f"IPTC:TimeCreated not updated: {iptc_time!r}")
 
     def test_xmp_conditional_dates_absent_remain_absent(self) -> None:
-        """XMP date tags that were absent in the source are not added."""
+        """Conditional date tags that were absent in the source are not added."""
         tags = self._read_tags('xmp_no_dates.jpg', [
-            'XMP-photoshop:DateCreated', 'XMP-xmp:MetadataDate',
+            'XMP:DateCreated', 'XMP:MetadataDate',
+            'IPTC:DateCreated', 'IPTC:TimeCreated',
         ])
-        self.assertIsNone(tags.get('XMP-photoshop:DateCreated'),
-                          "xmp_no_dates.jpg: XMP-photoshop:DateCreated should not be added")
-        self.assertIsNone(tags.get('XMP-xmp:MetadataDate'),
-                          "xmp_no_dates.jpg: XMP-xmp:MetadataDate should not be added")
+        self.assertIsNone(tags.get('XMP:DateCreated'),
+                          "xmp_no_dates.jpg: XMP:DateCreated should not be added")
+        self.assertIsNone(tags.get('XMP:MetadataDate'),
+                          "xmp_no_dates.jpg: XMP:MetadataDate should not be added")
+        self.assertIsNone(tags.get('IPTC:DateCreated'),
+                          "xmp_no_dates.jpg: IPTC:DateCreated should not be added")
+        self.assertIsNone(tags.get('IPTC:TimeCreated'),
+                          "xmp_no_dates.jpg: IPTC:TimeCreated should not be added")
 
     # ------------------------------------------------------------------
     # Infrastructure Validation
