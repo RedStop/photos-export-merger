@@ -495,6 +495,22 @@ def _do_create_sidecar(et, info: MediaFileInfo,
         logger.info("Created XMP sidecar for %s: %s", info.source_path, info.sidecar_path.name)
     except Exception as e:
         logger.warning("Failed to create XMP sidecar for %s: %s", info.source_path, e)
+        return
+
+    # ExifTool's -o copies existing XMP from the source file before applying
+    # overrides.  Pre-existing tags (e.g. XMP-xmp:ModifyDate) win over the
+    # params we pass, so a second in-place pass is needed to fix them.
+    if info.resolved_datetime and info.existing_xmp_dates:
+        dt_str = info.resolved_datetime.strftime('%Y:%m:%d %H:%M:%S')
+        tz_str = _format_tz_offset(info.resolved_datetime.tzinfo)
+        fixup_params = _build_conditional_date_params(info, dt_str, tz_str)
+        if fixup_params:
+            fixup_params = ['-charset', 'filename=utf8', '-overwrite_original'] + fixup_params
+            fixup_params.append(str(info.sidecar_path))
+            try:
+                _execute_et(et, fixup_params)
+            except Exception as e:
+                logger.debug("Sidecar fixup warnings for %s: %s", info.sidecar_path.name, e)
 
 
 def _do_set_filesystem_timestamps(et, info: MediaFileInfo, logger: logging.Logger):
