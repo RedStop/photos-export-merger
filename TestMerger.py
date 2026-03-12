@@ -1347,12 +1347,11 @@ class TestGooglePhotosExportMerger(unittest.TestCase):
     }
 
     # Sidecar formats — verify XMP:DateTimeOriginal in .xmp file
-    # Image sidecars (PNG, GIF) store local time; video sidecars store UTC.
     _TZ_SIDECAR_FALLBACK_CASES: dict = {
         'tz_fallback.png.xmp': '2024:08:08 12:44:06',
         'tz_fallback.gif.xmp': '2024:08:08 12:44:06',
-        'tz_fallback.mp4.xmp': '2024:08:08 10:44:06',
-        'tz_fallback.avi.xmp': '2024:08:08 10:44:06',
+        'tz_fallback.mp4.xmp': '2024:08:08 12:44:06',
+        'tz_fallback.avi.xmp': '2024:08:08 12:44:06',
     }
 
     def _assert_timezone_sidecar(self, sidecar_name: str,
@@ -1397,12 +1396,12 @@ class TestGooglePhotosExportMerger(unittest.TestCase):
         self._assert_timezone_sidecar('tz_fallback.gif.xmp', '2024:08:08 12:44:06')
 
     def test_timezone_fallback_mp4_sidecar(self) -> None:
-        """MP4 sidecar: UTC datetime in XMP (video sidecars use UTC)."""
-        self._assert_timezone_sidecar('tz_fallback.mp4.xmp', '2024:08:08 10:44:06')
+        """MP4 sidecar: GMT+02:00 fallback datetime in XMP."""
+        self._assert_timezone_sidecar('tz_fallback.mp4.xmp', '2024:08:08 12:44:06')
 
     def test_timezone_fallback_avi_sidecar(self) -> None:
-        """AVI sidecar: UTC datetime in XMP (video sidecars use UTC)."""
-        self._assert_timezone_sidecar('tz_fallback.avi.xmp', '2024:08:08 10:44:06')
+        """AVI sidecar: GMT+02:00 fallback datetime in XMP."""
+        self._assert_timezone_sidecar('tz_fallback.avi.xmp', '2024:08:08 12:44:06')
 
     def test_timezone_direct_fallback_consistency(self) -> None:
         """All direct-write fallback formats have correct TZ and datetime.

@@ -98,13 +98,8 @@ def _build_sidecar_params(info: MediaFileInfo, gps: Optional[Dict[str, float]]) 
         params.append(f'-XMP:Title={Path(info.new_title).stem}')
 
     if info.resolved_datetime:
-        if info.write_strategy == WriteStrategy.VIDEO_WITH_SIDECAR:
-            # Video sidecars store dates as UTC to match QuickTime convention.
-            utc_dt = info.resolved_datetime.astimezone(timezone.utc)
-            dt_str = utc_dt.strftime('%Y:%m:%d %H:%M:%S')
-        else:
-            tz_str = _format_tz_offset(info.resolved_datetime.tzinfo)
-            dt_str = info.resolved_datetime.strftime('%Y:%m:%d %H:%M:%S') + tz_str
+        tz_str = _format_tz_offset(info.resolved_datetime.tzinfo)
+        dt_str = info.resolved_datetime.strftime('%Y:%m:%d %H:%M:%S') + tz_str
         params.append(f'-XMP:DateTimeOriginal={dt_str}')
         params.append(f'-XMP:CreateDate={dt_str}')
         params.append(f'-XMP:ModifyDate={dt_str}')
@@ -165,12 +160,12 @@ def _do_process_matched(et, info: MediaFileInfo, stats: MergeStats,
             utc_str = utc_dt.strftime('%Y:%m:%d %H:%M:%S')
             params.append(f'-QuickTime:CreateDate={utc_str}')
             params.append(f'-QuickTime:ModifyDate={utc_str}')
-            # UserData:DateTimeOriginal carries local time with timezone suffix.
-            params.append(f'-UserData:DateTimeOriginal={dt_str}{tz_str}')
-            # XMP tags embedded in the video should also be UTC.
-            params.append(f'-XMP-exif:DateTimeOriginal={utc_str}')
-            params.append(f'-XMP-xmp:CreateDate={utc_str}')
-            params.append(f'-XMP-xmp:ModifyDate={utc_str}')
+            # UserData and XMP tags carry local time with timezone suffix.
+            local_with_tz = f'{dt_str}{tz_str}'
+            params.append(f'-UserData:DateTimeOriginal={local_with_tz}')
+            params.append(f'-XMP-exif:DateTimeOriginal={local_with_tz}')
+            params.append(f'-XMP-xmp:CreateDate={local_with_tz}')
+            params.append(f'-XMP-xmp:ModifyDate={local_with_tz}')
         else:
             params.append(f'-alldates={dt_str}')
             params.append(f'-EXIF:ExifIFD:OffsetTime={tz_str}')
