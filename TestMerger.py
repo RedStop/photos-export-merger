@@ -1347,11 +1347,12 @@ class TestGooglePhotosExportMerger(unittest.TestCase):
     }
 
     # Sidecar formats — verify XMP:DateTimeOriginal in .xmp file
+    # Image sidecars (PNG, GIF) store local time; video sidecars store UTC.
     _TZ_SIDECAR_FALLBACK_CASES: dict = {
         'tz_fallback.png.xmp': '2024:08:08 12:44:06',
         'tz_fallback.gif.xmp': '2024:08:08 12:44:06',
-        'tz_fallback.mp4.xmp': '2024:08:08 12:44:06',
-        'tz_fallback.avi.xmp': '2024:08:08 12:44:06',
+        'tz_fallback.mp4.xmp': '2024:08:08 10:44:06',
+        'tz_fallback.avi.xmp': '2024:08:08 10:44:06',
     }
 
     def _assert_timezone_sidecar(self, sidecar_name: str,
@@ -1396,12 +1397,12 @@ class TestGooglePhotosExportMerger(unittest.TestCase):
         self._assert_timezone_sidecar('tz_fallback.gif.xmp', '2024:08:08 12:44:06')
 
     def test_timezone_fallback_mp4_sidecar(self) -> None:
-        """MP4 sidecar: GMT+02:00 fallback datetime in XMP."""
-        self._assert_timezone_sidecar('tz_fallback.mp4.xmp', '2024:08:08 12:44:06')
+        """MP4 sidecar: UTC datetime in XMP (video sidecars use UTC)."""
+        self._assert_timezone_sidecar('tz_fallback.mp4.xmp', '2024:08:08 10:44:06')
 
     def test_timezone_fallback_avi_sidecar(self) -> None:
-        """AVI sidecar: GMT+02:00 fallback datetime in XMP."""
-        self._assert_timezone_sidecar('tz_fallback.avi.xmp', '2024:08:08 12:44:06')
+        """AVI sidecar: UTC datetime in XMP (video sidecars use UTC)."""
+        self._assert_timezone_sidecar('tz_fallback.avi.xmp', '2024:08:08 10:44:06')
 
     def test_timezone_direct_fallback_consistency(self) -> None:
         """All direct-write fallback formats have correct TZ and datetime.
@@ -2240,7 +2241,8 @@ class TestGooglePhotosExportMerger(unittest.TestCase):
     _VIDEO_DATE_TAGS: list = ['QuickTime:CreateDate']
 
     def test_mp4_time_utc(self) -> None:
-        """MP4: QuickTime:CreateDate is present and has no timezone offset suffix."""
+        """MP4: QuickTime:CreateDate is present, has no timezone offset suffix,
+        and contains the correct UTC time (not local time)."""
         import re
         tags = self._read_tags('test.mp4', ['QuickTime:CreateDate'])
         dt = tags.get('QuickTime:CreateDate')
@@ -2248,9 +2250,14 @@ class TestGooglePhotosExportMerger(unittest.TestCase):
         self.assertTrue(str(dt).strip(), "test.mp4: QuickTime:CreateDate is empty")
         self.assertNotRegex(str(dt), r'[+-]\d{2}:\d{2}$',
                             f"test.mp4: QuickTime:CreateDate has unexpected tz suffix: {dt!r}")
+        # The default epoch 1723113846 is 2024:08:08 10:44:06 UTC.
+        # Local GMT+02:00 would be 12:44:06 — QuickTime must store UTC.
+        self.assertIn('2024:08:08 10:44:06', str(dt),
+                      f"test.mp4: QuickTime:CreateDate should be UTC (10:44:06), got: {dt!r}")
 
     def test_mov_time_utc(self) -> None:
-        """MOV: QuickTime:CreateDate is present and has no timezone offset suffix."""
+        """MOV: QuickTime:CreateDate is present, has no timezone offset suffix,
+        and contains the correct UTC time (not local time)."""
         import re
         tags = self._read_tags('test.mov', ['QuickTime:CreateDate'])
         dt = tags.get('QuickTime:CreateDate')
@@ -2258,9 +2265,13 @@ class TestGooglePhotosExportMerger(unittest.TestCase):
         self.assertTrue(str(dt).strip(), "test.mov: QuickTime:CreateDate is empty")
         self.assertNotRegex(str(dt), r'[+-]\d{2}:\d{2}$',
                             f"test.mov: QuickTime:CreateDate has unexpected tz suffix: {dt!r}")
+        # The default epoch 1723113846 is 2024:08:08 10:44:06 UTC.
+        self.assertIn('2024:08:08 10:44:06', str(dt),
+                      f"test.mov: QuickTime:CreateDate should be UTC (10:44:06), got: {dt!r}")
 
     def test_video_utc_consistency(self) -> None:
-        """Every video format has a recognised date tag with no timezone offset suffix."""
+        """Every video format has a recognised date tag with no timezone offset suffix
+        and the correct UTC time value."""
         for filename in self._VIDEO_CASES:
             with self.subTest(file=filename):
                 tags = self._read_tags(filename, self._VIDEO_DATE_TAGS)
@@ -2274,6 +2285,11 @@ class TestGooglePhotosExportMerger(unittest.TestCase):
                 self.assertNotRegex(
                     str(dt), r'[+-]\d{2}:\d{2}$',
                     f"{filename}: date tag has unexpected tz suffix: {dt!r}",
+                )
+                # Epoch 1723113846 → 2024:08:08 10:44:06 UTC (not 12:44:06 local).
+                self.assertIn(
+                    '2024:08:08 10:44:06', str(dt),
+                    f"{filename}: date should be UTC (10:44:06), got: {dt!r}",
                 )
 
     # ------------------------------------------------------------------
