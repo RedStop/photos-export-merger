@@ -2130,6 +2130,9 @@ class TestGooglePhotosExportMerger(unittest.TestCase):
         'photo_basic.jpg': 1723113846,
         'gps_ne.jpg':      1723113846,
         'desc_utf8.jpg':   1723113846,
+        'test.avi':        1723113846,
+        'test.mkv':        1723113846,
+        'test.webm':       1723113846,
     }
 
     # (media_filename, sidecar_filename) pairs whose mtimes must match within 2 s

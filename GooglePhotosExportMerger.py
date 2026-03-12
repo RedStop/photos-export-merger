@@ -209,6 +209,11 @@ def _do_process_matched(et, info: MediaFileInfo, stats: MergeStats,
             logger.error("Failed to copy %s: %s", info.source_path, e)
             stats.errors += 1
             return
+        # Stats for metadata that will be written to the XMP sidecar.
+        if info.gps:
+            stats.gps_written += 1
+        if info.clear_descriptions:
+            stats.descriptions_cleared += 1
     else:
         params = ['-charset', 'filename=utf8']
 
