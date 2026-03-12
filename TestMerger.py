@@ -855,6 +855,28 @@ class TestGooglePhotosExportMerger(unittest.TestCase):
                 except Exception:
                     pass  # PNG/GIF may reject some tags — that is acceptable
 
+        # ── XmpConditionalDates ───────────────────────────────────────────
+        # Files with pre-existing XMP date tags.  The merger should update
+        # only the tags that already exist, leaving absent tags absent.
+        d = inp / 'XmpConditionalDates'
+        # Matched JPG with XMP-photoshop:DateCreated and XMP-xmp:MetadataDate
+        make_media_file(d / 'xmp_dates.jpg')
+        make_json_file(d / 'xmp_dates.jpg.json', title='xmp_dates.jpg')
+        # Matched JPG with none of the conditional tags (control case)
+        make_media_file(d / 'xmp_no_dates.jpg')
+        make_json_file(d / 'xmp_no_dates.jpg.json', title='xmp_no_dates.jpg')
+
+        _xmp_date_tags = {
+            'XMP-photoshop:DateCreated': '2014:07:12 12:38:02',
+            'XMP-xmp:MetadataDate':      '2014:07:13 21:06:45+02:00',
+        }
+        with exiftool.ExifToolHelper() as _et:
+            try:
+                _et.set_tags([str(d / 'xmp_dates.jpg')], _xmp_date_tags,
+                             params=['-overwrite_original'])
+            except Exception:
+                pass
+
     # ------------------------------------------------------------------
     # Helpers
     # ------------------------------------------------------------------
@@ -997,6 +1019,8 @@ class TestGooglePhotosExportMerger(unittest.TestCase):
             'preserve_tiff.tiff', 'preserve_tif.tif',
             'preserve_dng.dng', 'preserve_cr2.cr2', 'preserve_heic.heic',
             'preserve_png.png', 'preserve_gif.gif',
+            # XmpConditionalDates
+            'xmp_dates.jpg', 'xmp_no_dates.jpg',
         ]
 
         missing = [name for name in expected if name not in output_names]
@@ -2196,14 +2220,14 @@ class TestGooglePhotosExportMerger(unittest.TestCase):
     #   errors=0
 
     def test_stats_total_count(self) -> None:
-        """Total media files processed = 175 (168 matched + 7 orphans)."""
-        self.assertEqual(self.stats.total_media_files, 175,
-                         f"Expected 175 total, got {self.stats.total_media_files}")
+        """Total media files processed = 177 (170 matched + 7 orphans)."""
+        self.assertEqual(self.stats.total_media_files, 177,
+                         f"Expected 177 total, got {self.stats.total_media_files}")
 
     def test_stats_matched_count(self) -> None:
-        """Matched files (with JSON) = 168."""
-        self.assertEqual(self.stats.matched, 168,
-                         f"Expected 168 matched, got {self.stats.matched}")
+        """Matched files (with JSON) = 170."""
+        self.assertEqual(self.stats.matched, 170,
+                         f"Expected 170 matched, got {self.stats.matched}")
 
     def test_stats_orphan_count(self) -> None:
         """Orphan files (no JSON) = 7."""
@@ -2226,9 +2250,9 @@ class TestGooglePhotosExportMerger(unittest.TestCase):
                          f"Expected 0 errors, got {self.stats.errors}")
 
     def test_stats_written_count(self) -> None:
-        """Files written = 175 (total_media_files when errors == 0)."""
-        self.assertEqual(self.stats.written, 175,
-                         f"Expected 175 written, got {self.stats.written}")
+        """Files written = 177 (total_media_files when errors == 0)."""
+        self.assertEqual(self.stats.written, 177,
+                         f"Expected 177 written, got {self.stats.written}")
 
     def test_stats_descriptions_cleared(self) -> None:
         """descriptions_cleared = 3 (desc_blocked.jpg + desc_blocked.png + desc_iptc_blocked.jpg)."""
@@ -2524,6 +2548,43 @@ class TestGooglePhotosExportMerger(unittest.TestCase):
                 self._assert_preservation(filename, supports_full_exif)
 
     # ------------------------------------------------------------------
+    # Category 16 — XMP Conditional Date Update
+    # ------------------------------------------------------------------
+    # When source files have pre-existing XMP date tags (e.g.
+    # XMP-photoshop:DateCreated, XMP-xmp:MetadataDate), those tags
+    # should be updated to the resolved datetime with timezone.
+    # Tags that were absent in the source should remain absent.
+
+    def test_xmp_conditional_dates_updated(self) -> None:
+        """Pre-existing XMP-photoshop:DateCreated and XMP-xmp:MetadataDate
+        are updated to the resolved datetime (with timezone)."""
+        tags = self._read_tags('xmp_dates.jpg', [
+            'XMP-photoshop:DateCreated', 'XMP-xmp:MetadataDate',
+        ])
+        date_created = tags.get('XMP-photoshop:DateCreated')
+        metadata_date = tags.get('XMP-xmp:MetadataDate')
+        self.assertIsNotNone(date_created,
+                             "xmp_dates.jpg: XMP-photoshop:DateCreated should still exist")
+        self.assertIsNotNone(metadata_date,
+                             "xmp_dates.jpg: XMP-xmp:MetadataDate should still exist")
+        # Default epoch 1723113846 → 2024:08:08 12:44:06+02:00 in GMT+2.
+        # The old values (2014) should be replaced.
+        self.assertIn('2024:08:08 12:44:06', str(date_created),
+                      f"XMP-photoshop:DateCreated not updated: {date_created!r}")
+        self.assertIn('2024:08:08 12:44:06', str(metadata_date),
+                      f"XMP-xmp:MetadataDate not updated: {metadata_date!r}")
+
+    def test_xmp_conditional_dates_absent_remain_absent(self) -> None:
+        """XMP date tags that were absent in the source are not added."""
+        tags = self._read_tags('xmp_no_dates.jpg', [
+            'XMP-photoshop:DateCreated', 'XMP-xmp:MetadataDate',
+        ])
+        self.assertIsNone(tags.get('XMP-photoshop:DateCreated'),
+                          "xmp_no_dates.jpg: XMP-photoshop:DateCreated should not be added")
+        self.assertIsNone(tags.get('XMP-xmp:MetadataDate'),
+                          "xmp_no_dates.jpg: XMP-xmp:MetadataDate should not be added")
+
+    # ------------------------------------------------------------------
     # Infrastructure Validation
     # ------------------------------------------------------------------
     # Tests that validate the test framework itself: failure detection,
@@ -2684,20 +2745,20 @@ class TestSingleWorker(unittest.TestCase):
     # ------------------------------------------------------------------
 
     def test_serial_stats_total_count(self) -> None:
-        """Serial: total media files = 175."""
-        self.assertEqual(self.stats.total_media_files, 175)
+        """Serial: total media files = 177."""
+        self.assertEqual(self.stats.total_media_files, 177)
 
     def test_serial_stats_matched_count(self) -> None:
-        """Serial: matched files = 168."""
-        self.assertEqual(self.stats.matched, 168)
+        """Serial: matched files = 170."""
+        self.assertEqual(self.stats.matched, 170)
 
     def test_serial_stats_orphan_count(self) -> None:
         """Serial: orphan files = 7."""
         self.assertEqual(self.stats.orphans, 7)
 
     def test_serial_stats_written_count(self) -> None:
-        """Serial: written files = 175."""
-        self.assertEqual(self.stats.written, 175)
+        """Serial: written files = 177."""
+        self.assertEqual(self.stats.written, 177)
 
     def test_serial_stats_zero_errors(self) -> None:
         """Serial: zero errors."""
@@ -2777,6 +2838,7 @@ if __name__ == '__main__':
         ("Descriptions (UTF-8, etc)", ("test_description_",)),
         ("File Types (matched)",      ("test_matched_",        "test_filetype_")),
         ("Orphan Files",              ("test_orphan_",)),
+        ("XMP Conditional Dates",     ("test_xmp_conditional_",)),
         ("XMP Sidecars",              ("test_xmp_",            "test_sidecar_consistency_")),
         ("Duplicates",                ("test_duplicate_",)),
         ("Bracket Notation",          ("test_bracket_",)),

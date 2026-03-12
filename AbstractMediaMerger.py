@@ -33,6 +33,8 @@ class MediaFileInfo:
     # Pre-extracted fields for processing (avoids shipping full json_data to workers)
     description: Optional[str] = None
     gps: Optional[Dict[str, float]] = None
+    # XMP date tags present in source file (conditionally updated during processing)
+    existing_xmp_dates: Optional[Set[str]] = None
 
 
 @dataclass
