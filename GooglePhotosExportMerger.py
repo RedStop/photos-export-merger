@@ -254,6 +254,11 @@ class _ext_mismatch_rename:
 def _do_process_matched(et, info: MediaFileInfo, stats: MergeStats,
                         logger: logging.Logger):
     """Core logic for processing a matched media file."""
+    if info.output_path.exists():
+        logger.warning("Output file already exists, skipping: %s", info.output_path)
+        stats.skipped_existing += 1
+        return
+
     info.output_path.parent.mkdir(parents=True, exist_ok=True)
 
     # Non-QuickTime video containers (AVI, MKV, WebM) cannot have tags
@@ -405,6 +410,11 @@ def _do_process_matched(et, info: MediaFileInfo, stats: MergeStats,
 def _do_process_orphan(et, info: MediaFileInfo, stats: MergeStats,
                        logger: logging.Logger):
     """Core logic for processing an orphan media file."""
+    if info.output_path.exists():
+        logger.warning("Output file already exists, skipping orphan: %s", info.output_path)
+        stats.skipped_existing += 1
+        return
+
     info.output_path.parent.mkdir(parents=True, exist_ok=True)
 
     try:
