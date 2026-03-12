@@ -18,6 +18,10 @@ import sys
 DIRECT_WRITE_EXTS = {'.jpg', '.jpeg', '.tiff', '.tif', '.dng', '.cr2', '.heic'}
 PARTIAL_WRITE_EXTS = {'.png', '.gif'}
 VIDEO_EXTS = {'.avi', '.mkv', '.mov', '.mp4', '.m4v', '.webm'}
+# QuickTime-based containers where ExifTool can write QT/UserData/XMP tags
+# directly into the file.  Non-QT video containers (AVI, MKV, WebM) are
+# copy-only; all metadata lives in the XMP sidecar.
+QUICKTIME_VIDEO_EXTS = {'.mov', '.mp4', '.m4v'}
 ALL_MEDIA_EXTS = DIRECT_WRITE_EXTS | PARTIAL_WRITE_EXTS | VIDEO_EXTS
 
 DATE_TAGS_PRIORITY = [
@@ -188,91 +192,107 @@ def _do_process_matched(et, info: MediaFileInfo, stats: MergeStats,
     """Core logic for processing a matched media file."""
     info.output_path.parent.mkdir(parents=True, exist_ok=True)
 
-    params = ['-charset', 'filename=utf8']
+    # Non-QuickTime video containers (AVI, MKV, WebM) cannot have tags
+    # written directly — ExifTool does not support writing to these formats.
+    # Just copy the file; all metadata lives in the XMP sidecar.
+    is_qt_video = (info.write_strategy == WriteStrategy.VIDEO_WITH_SIDECAR
+                   and info.source_path.suffix.lower() in QUICKTIME_VIDEO_EXTS)
+    is_non_qt_video = (info.write_strategy == WriteStrategy.VIDEO_WITH_SIDECAR
+                       and not is_qt_video)
 
-    if info.resolved_datetime:
-        dt_str = info.resolved_datetime.strftime('%Y:%m:%d %H:%M:%S')
-        tz_str = _format_tz_offset(info.resolved_datetime.tzinfo)
+    if is_non_qt_video:
+        try:
+            shutil.copy2(str(info.source_path), str(info.output_path))
+        except Exception as e:
+            logger.error("Failed to copy %s: %s", info.source_path, e)
+            stats.errors += 1
+            return
+    else:
+        params = ['-charset', 'filename=utf8']
 
-        if info.write_strategy == WriteStrategy.VIDEO_WITH_SIDECAR:
-            # QuickTime spec stores dates as UTC (no timezone field).
-            # Convert local resolved_datetime back to UTC for QT tags.
-            utc_dt = info.resolved_datetime.astimezone(timezone.utc)
-            utc_str = utc_dt.strftime('%Y:%m:%d %H:%M:%S')
-            params.append(f'-QuickTime:CreateDate={utc_str}')
-            params.append(f'-QuickTime:ModifyDate={utc_str}')
-            # UserData and XMP tags carry local time with timezone suffix.
-            local_with_tz = f'{dt_str}{tz_str}'
-            params.append(f'-UserData:DateTimeOriginal={local_with_tz}')
-            params.append(f'-XMP-exif:DateTimeOriginal={local_with_tz}')
-            params.append(f'-XMP-xmp:CreateDate={local_with_tz}')
-            params.append(f'-XMP-xmp:ModifyDate={local_with_tz}')
-        elif info.write_strategy == WriteStrategy.PARTIAL_WITH_SIDECAR:
-            # PNG/GIF lack EXIF; -alldates writes to XMP but drops the
-            # timezone suffix.  Write XMP date tags explicitly so the
-            # timezone is preserved in both the file and its sidecar.
-            local_with_tz = f'{dt_str}{tz_str}'
-            params.append(f'-XMP-exif:DateTimeOriginal={local_with_tz}')
-            params.append(f'-XMP-xmp:CreateDate={local_with_tz}')
-            params.append(f'-XMP-xmp:ModifyDate={local_with_tz}')
-        else:
-            params.append(f'-alldates={dt_str}')
-            params.append(f'-EXIF:ExifIFD:OffsetTime={tz_str}')
-            params.append(f'-EXIF:ExifIFD:OffsetTimeOriginal={tz_str}')
-            params.append(f'-EXIF:ExifIFD:OffsetTimeDigitized={tz_str}')
+        if info.resolved_datetime:
+            dt_str = info.resolved_datetime.strftime('%Y:%m:%d %H:%M:%S')
+            tz_str = _format_tz_offset(info.resolved_datetime.tzinfo)
 
-        # Update any pre-existing XMP date tags to the resolved datetime
-        # (e.g. XMP-photoshop:DateCreated, XMP-xmp:MetadataDate).
-        params.extend(_build_conditional_date_params(info, dt_str, tz_str))
+            if is_qt_video:
+                # QuickTime spec stores dates as UTC (no timezone field).
+                # Convert local resolved_datetime back to UTC for QT tags.
+                utc_dt = info.resolved_datetime.astimezone(timezone.utc)
+                utc_str = utc_dt.strftime('%Y:%m:%d %H:%M:%S')
+                params.append(f'-QuickTime:CreateDate={utc_str}')
+                params.append(f'-QuickTime:ModifyDate={utc_str}')
+                # UserData and XMP tags carry local time with timezone suffix.
+                local_with_tz = f'{dt_str}{tz_str}'
+                params.append(f'-UserData:DateTimeOriginal={local_with_tz}')
+                params.append(f'-XMP-exif:DateTimeOriginal={local_with_tz}')
+                params.append(f'-XMP-xmp:CreateDate={local_with_tz}')
+                params.append(f'-XMP-xmp:ModifyDate={local_with_tz}')
+            elif info.write_strategy == WriteStrategy.PARTIAL_WITH_SIDECAR:
+                # PNG/GIF lack EXIF; -alldates writes to XMP but drops the
+                # timezone suffix.  Write XMP date tags explicitly so the
+                # timezone is preserved in both the file and its sidecar.
+                local_with_tz = f'{dt_str}{tz_str}'
+                params.append(f'-XMP-exif:DateTimeOriginal={local_with_tz}')
+                params.append(f'-XMP-xmp:CreateDate={local_with_tz}')
+                params.append(f'-XMP-xmp:ModifyDate={local_with_tz}')
+            else:
+                params.append(f'-alldates={dt_str}')
+                params.append(f'-EXIF:ExifIFD:OffsetTime={tz_str}')
+                params.append(f'-EXIF:ExifIFD:OffsetTimeOriginal={tz_str}')
+                params.append(f'-EXIF:ExifIFD:OffsetTimeDigitized={tz_str}')
 
-    if info.clear_descriptions:
-        params.append('-EXIF:UserComment=')
-        params.append('-EXIF:ImageDescription=')
-        params.append('-XMP-dc:Description=')
-        if info.has_iptc_caption:
-            params.append('-IPTC:Caption-Abstract=')
-        stats.descriptions_cleared += 1
-    elif info.description and info.description.strip():
-        escaped, needs_E = _escape_description(info.description)
-        if needs_E:
-            params.append('-E')
-        params.append(f'-XMP-dc:Description={escaped}')
-        params.append(f'-EXIF:ImageDescription={escaped}')
-        if info.has_iptc_caption:
-            params.append(f'-IPTC:Caption-Abstract={escaped}')
+            # Update any pre-existing XMP date tags to the resolved datetime
+            # (e.g. XMP-photoshop:DateCreated, XMP-xmp:MetadataDate).
+            params.extend(_build_conditional_date_params(info, dt_str, tz_str))
 
-    if info.gps:
-        params.extend(_build_gps_params(info.gps))
-        stats.gps_written += 1
+        if info.clear_descriptions:
+            params.append('-EXIF:UserComment=')
+            params.append('-EXIF:ImageDescription=')
+            params.append('-XMP-dc:Description=')
+            if info.has_iptc_caption:
+                params.append('-IPTC:Caption-Abstract=')
+            stats.descriptions_cleared += 1
+        elif info.description and info.description.strip():
+            escaped, needs_E = _escape_description(info.description)
+            if needs_E:
+                params.append('-E')
+            params.append(f'-XMP-dc:Description={escaped}')
+            params.append(f'-EXIF:ImageDescription={escaped}')
+            if info.has_iptc_caption:
+                params.append(f'-IPTC:Caption-Abstract={escaped}')
 
-    # Use -o to copy source to output with metadata in one step
-    params.append('-o')
-    params.append(str(info.output_path))
-    params.append(str(info.source_path))
+        if info.gps:
+            params.extend(_build_gps_params(info.gps))
+            stats.gps_written += 1
 
-    try:
-        _execute_et(et, params)
-    except Exception as e:
-        if info.output_path.exists():
-            # ExifTool status 1 = warnings (e.g. unsupported tags for this format).
-            # The -o copy still succeeded, so treat as success with warnings.
-            logger.debug("ExifTool warnings for %s: %s (output created successfully)",
-                         info.source_path, e)
-        else:
-            # Genuine failure: output not created. Fallback to copy + in-place write.
-            logger.warning("ExifTool -o failed for %s: %s, falling back to copy+write",
-                           info.source_path, e)
-            try:
-                shutil.copy2(str(info.source_path), str(info.output_path))
-                fallback_params = ['-charset', 'filename=utf8', '-overwrite_original']
-                fallback_params.extend(params[2:-3])  # tag params only (skip charset/filename, -o/output/source)
-                fallback_params.append(str(info.output_path))
-                _execute_et(et, fallback_params)
-            except Exception as e2:
-                if not info.output_path.exists():
-                    logger.error("Failed to process %s: %s", info.source_path, e2)
-                    stats.errors += 1
-                    return
+        # Use -o to copy source to output with metadata in one step
+        params.append('-o')
+        params.append(str(info.output_path))
+        params.append(str(info.source_path))
+
+        try:
+            _execute_et(et, params)
+        except Exception as e:
+            if info.output_path.exists():
+                # ExifTool status 1 = warnings (e.g. unsupported tags for this format).
+                # The -o copy still succeeded, so treat as success with warnings.
+                logger.debug("ExifTool warnings for %s: %s (output created successfully)",
+                             info.source_path, e)
+            else:
+                # Genuine failure: output not created. Fallback to copy + in-place write.
+                logger.warning("ExifTool -o failed for %s: %s, falling back to copy+write",
+                               info.source_path, e)
+                try:
+                    shutil.copy2(str(info.source_path), str(info.output_path))
+                    fallback_params = ['-charset', 'filename=utf8', '-overwrite_original']
+                    fallback_params.extend(params[2:-3])  # tag params only (skip charset/filename, -o/output/source)
+                    fallback_params.append(str(info.output_path))
+                    _execute_et(et, fallback_params)
+                except Exception as e2:
+                    if not info.output_path.exists():
+                        logger.error("Failed to process %s: %s", info.source_path, e2)
+                        stats.errors += 1
+                        return
 
     stats.written += 1
 
@@ -307,7 +327,11 @@ def _do_process_orphan(et, info: MediaFileInfo, stats: MergeStats,
         stats.descriptions_cleared += 1
 
     # Fill in any missing date tags and add timezone offsets.
-    if info.resolved_datetime:
+    # Non-QuickTime video containers cannot have tags written in-place.
+    is_non_qt_video = (info.write_strategy == WriteStrategy.VIDEO_WITH_SIDECAR
+                       and info.source_path.suffix.lower() not in QUICKTIME_VIDEO_EXTS)
+
+    if info.resolved_datetime and not is_non_qt_video:
         dt_str = info.resolved_datetime.strftime('%Y:%m:%d %H:%M:%S')
         tz_str = _format_tz_offset(info.resolved_datetime.tzinfo)
 
