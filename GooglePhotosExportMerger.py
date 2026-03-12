@@ -149,13 +149,10 @@ def _build_gps_params(gps: Dict[str, float]) -> List[str]:
 def _build_conditional_date_params(info: MediaFileInfo, dt_str: str, tz_str: str) -> List[str]:
     """Build ExifTool params to update date tags that already exist in the source.
 
-    Only applies to DIRECT and PARTIAL_WITH_SIDECAR strategies.
     Uses CONDITIONAL_DATE_TAGS mapping to translate read-tag names into the
     correct write parameters.
     """
     if not info.existing_xmp_dates:
-        return []
-    if info.write_strategy == WriteStrategy.VIDEO_WITH_SIDECAR:
         return []
     params: List[str] = []
     for read_tag in info.existing_xmp_dates:

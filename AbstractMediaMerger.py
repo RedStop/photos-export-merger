@@ -56,6 +56,7 @@ class MergeStats:
     gps_written: int = 0
     descriptions_cleared: int = 0
     ext_mismatches: int = 0
+    skipped_existing: int = 0
 
     def merge(self, other: 'MergeStats') -> None:
         """Add all counters from *other* into this instance.
@@ -71,6 +72,7 @@ class MergeStats:
         self.errors += other.errors
         self.gps_written += other.gps_written
         self.descriptions_cleared += other.descriptions_cleared
+        self.skipped_existing += other.skipped_existing
 
 
 def _resolve_gps(json_data: Dict[str, Any]) -> Optional[Dict[str, float]]:
@@ -316,6 +318,7 @@ class AbstractMediaMerger(ABC):
         self.logger.info("Duplicates renamed:           %d", stats.duplicates_renamed)
         self.logger.info("Skipped JSON files:           %d", stats.skipped_json)
         self.logger.info("Ext mismatches fixed:         %d", stats.ext_mismatches)
+        self.logger.info("Skipped (existing):           %d", stats.skipped_existing)
         self.logger.info("Errors:                       %d", stats.errors)
         if stats.date_from_exif > 0:
             self.logger.info("Orphan dates from EXIF:       %d", stats.date_from_exif)

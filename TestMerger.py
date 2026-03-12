@@ -903,6 +903,32 @@ class TestGooglePhotosExportMerger(unittest.TestCase):
                            'latitudeSpan': 0.0, 'longitudeSpan': 0.0,
                        })
 
+        # ── VideoXmpDates ─────────────────────────────────────────────────
+        # Test that conditional XMP date tags are updated for video files.
+        # MP4 (QuickTime): can have XMP written directly + sidecar.
+        # AVI (non-QT): copy-only, dates go only to the XMP sidecar.
+        d = inp / 'VideoXmpDates'
+        make_media_file(d / 'vid_xmp.mp4')
+        make_json_file(d / 'vid_xmp.mp4.json', title='vid_xmp.mp4')
+        make_media_file(d / 'vid_xmp.avi')
+        make_json_file(d / 'vid_xmp.avi.json', title='vid_xmp.avi')
+
+        # Pre-write XMP date tags into the MP4 source file.
+        _vid_xmp_tags = {
+            'XMP-exif:DateTimeOriginal': '2014:07:12 12:38:02',
+            'XMP-xmp:CreateDate':        '2014:07:12 12:38:02',
+            'XMP-xmp:ModifyDate':        '2014:07:12 12:38:02',
+        }
+        with exiftool.ExifToolHelper() as _et:
+            try:
+                _et.set_tags([str(d / 'vid_xmp.mp4')], _vid_xmp_tags,
+                             params=['-overwrite_original'])
+            except Exception:
+                pass
+            # AVI: ExifTool cannot write XMP to RIFF containers, so no
+            # pre-write.  The sidecar should still get correct dates from
+            # _build_sidecar_params.
+
     # ------------------------------------------------------------------
     # Helpers
     # ------------------------------------------------------------------
@@ -1049,6 +1075,8 @@ class TestGooglePhotosExportMerger(unittest.TestCase):
             'xmp_dates.jpg', 'xmp_no_dates.jpg',
             # ExtMismatch
             'mismatch_photo.dng',
+            # VideoXmpDates
+            'vid_xmp.mp4', 'vid_xmp.avi',
         ]
 
         missing = [name for name in expected if name not in output_names]
@@ -2251,14 +2279,14 @@ class TestGooglePhotosExportMerger(unittest.TestCase):
     #   errors=0
 
     def test_stats_total_count(self) -> None:
-        """Total media files processed = 178 (171 matched + 7 orphans)."""
-        self.assertEqual(self.stats.total_media_files, 178,
-                         f"Expected 178 total, got {self.stats.total_media_files}")
+        """Total media files processed = 180 (173 matched + 7 orphans)."""
+        self.assertEqual(self.stats.total_media_files, 180,
+                         f"Expected 180 total, got {self.stats.total_media_files}")
 
     def test_stats_matched_count(self) -> None:
         """Matched files (with JSON) = 170."""
-        self.assertEqual(self.stats.matched, 171,
-                         f"Expected 171 matched, got {self.stats.matched}")
+        self.assertEqual(self.stats.matched, 173,
+                         f"Expected 173 matched, got {self.stats.matched}")
 
     def test_stats_orphan_count(self) -> None:
         """Orphan files (no JSON) = 7."""
@@ -2271,9 +2299,9 @@ class TestGooglePhotosExportMerger(unittest.TestCase):
                          f"Expected 101 GPS writes, got {self.stats.gps_written}")
 
     def test_stats_sidecars_created(self) -> None:
-        """XMP sidecars created = 80."""
-        self.assertEqual(self.stats.sidecars_created, 80,
-                         f"Expected 80 sidecars, got {self.stats.sidecars_created}")
+        """XMP sidecars created = 82."""
+        self.assertEqual(self.stats.sidecars_created, 82,
+                         f"Expected 82 sidecars, got {self.stats.sidecars_created}")
 
     def test_stats_zero_errors(self) -> None:
         """Merger reports zero errors for well-formed test data."""
@@ -2281,9 +2309,9 @@ class TestGooglePhotosExportMerger(unittest.TestCase):
                          f"Expected 0 errors, got {self.stats.errors}")
 
     def test_stats_written_count(self) -> None:
-        """Files written = 178 (total_media_files when errors == 0)."""
-        self.assertEqual(self.stats.written, 178,
-                         f"Expected 178 written, got {self.stats.written}")
+        """Files written = 180 (total_media_files when errors == 0)."""
+        self.assertEqual(self.stats.written, 180,
+                         f"Expected 180 written, got {self.stats.written}")
 
     def test_stats_descriptions_cleared(self) -> None:
         """descriptions_cleared = 3 (desc_blocked.jpg + desc_blocked.png + desc_iptc_blocked.jpg)."""
@@ -2304,6 +2332,11 @@ class TestGooglePhotosExportMerger(unittest.TestCase):
         """ext_mismatches = 1 (mismatch_photo.dng is actually JPEG)."""
         self.assertEqual(self.stats.ext_mismatches, 1,
                          f"Expected 1 ext_mismatches, got {self.stats.ext_mismatches}")
+
+    def test_stats_skipped_existing(self) -> None:
+        """skipped_existing = 0 (clean output directory, no pre-existing files)."""
+        self.assertEqual(self.stats.skipped_existing, 0,
+                         f"Expected 0 skipped_existing, got {self.stats.skipped_existing}")
 
     # ------------------------------------------------------------------
     # Category 13 — Video UTC Time
@@ -2711,6 +2744,78 @@ class TestGooglePhotosExportMerger(unittest.TestCase):
         self._assert_output_mtime('mismatch_photo.dng', 1723113846)
 
     # ------------------------------------------------------------------
+    # Category 18 — Video XMP Conditional Dates
+    # ------------------------------------------------------------------
+    # Verify that pre-existing XMP date tags in video files are updated
+    # to the resolved datetime.  QuickTime (MP4) can have XMP written
+    # directly; non-QT (AVI) gets dates only in the XMP sidecar.
+
+    # ── QuickTime (MP4) — file + sidecar ──
+
+    def test_video_xmp_mp4_file_dates_updated(self) -> None:
+        """MP4: pre-existing XMP date tags in the file are updated."""
+        tags = self._read_tags('vid_xmp.mp4', [
+            'XMP:DateTimeOriginal', 'XMP:CreateDate', 'XMP:ModifyDate',
+        ])
+        # Default epoch 1723113846 → 2024:08:08 12:44:06 in GMT+2.
+        for tag in ('XMP:DateTimeOriginal', 'XMP:CreateDate', 'XMP:ModifyDate'):
+            val = tags.get(tag)
+            self.assertIsNotNone(val, f"vid_xmp.mp4: {tag} missing")
+            self.assertIn('2024:08:08 12:44:06', str(val),
+                          f"vid_xmp.mp4: {tag} not updated: {val!r}")
+
+    def test_video_xmp_mp4_file_dates_have_timezone(self) -> None:
+        """MP4: updated XMP date tags in the file include timezone."""
+        tags = self._read_tags('vid_xmp.mp4', [
+            'XMP:DateTimeOriginal', 'XMP:CreateDate', 'XMP:ModifyDate',
+        ])
+        for tag in ('XMP:DateTimeOriginal', 'XMP:CreateDate', 'XMP:ModifyDate'):
+            val = tags.get(tag)
+            self.assertIsNotNone(val, f"vid_xmp.mp4: {tag} missing")
+            self.assertIn('+02:00', str(val),
+                          f"vid_xmp.mp4: {tag} missing timezone: {val!r}")
+
+    def test_video_xmp_mp4_sidecar_dates(self) -> None:
+        """MP4 sidecar: XMP dates match the resolved datetime with timezone."""
+        tags = self._read_tags('vid_xmp.mp4.xmp', [
+            'XMP:DateTimeOriginal', 'XMP:CreateDate', 'XMP:ModifyDate',
+        ])
+        for tag in ('XMP:DateTimeOriginal', 'XMP:CreateDate', 'XMP:ModifyDate'):
+            val = tags.get(tag)
+            self.assertIsNotNone(val, f"vid_xmp.mp4.xmp: {tag} missing")
+            self.assertIn('2024:08:08 12:44:06', str(val),
+                          f"vid_xmp.mp4.xmp: {tag} not correct: {val!r}")
+
+    # ── Non-QuickTime (AVI) — sidecar only ──
+
+    def test_video_xmp_avi_sidecar_exists(self) -> None:
+        """AVI sidecar is created."""
+        xmp = self._find_output_file('vid_xmp.avi.xmp')
+        self.assertIsNotNone(xmp, "vid_xmp.avi.xmp not found in output")
+
+    def test_video_xmp_avi_sidecar_dates(self) -> None:
+        """AVI sidecar: XMP dates match the resolved datetime with timezone."""
+        tags = self._read_tags('vid_xmp.avi.xmp', [
+            'XMP:DateTimeOriginal', 'XMP:CreateDate', 'XMP:ModifyDate',
+        ])
+        for tag in ('XMP:DateTimeOriginal', 'XMP:CreateDate', 'XMP:ModifyDate'):
+            val = tags.get(tag)
+            self.assertIsNotNone(val, f"vid_xmp.avi.xmp: {tag} missing")
+            self.assertIn('2024:08:08 12:44:06', str(val),
+                          f"vid_xmp.avi.xmp: {tag} not correct: {val!r}")
+
+    def test_video_xmp_avi_sidecar_dates_have_timezone(self) -> None:
+        """AVI sidecar: XMP dates include timezone suffix."""
+        tags = self._read_tags('vid_xmp.avi.xmp', [
+            'XMP:DateTimeOriginal', 'XMP:CreateDate', 'XMP:ModifyDate',
+        ])
+        for tag in ('XMP:DateTimeOriginal', 'XMP:CreateDate', 'XMP:ModifyDate'):
+            val = tags.get(tag)
+            self.assertIsNotNone(val, f"vid_xmp.avi.xmp: {tag} missing")
+            self.assertIn('+02:00', str(val),
+                          f"vid_xmp.avi.xmp: {tag} missing timezone: {val!r}")
+
+    # ------------------------------------------------------------------
     # Infrastructure Validation
     # ------------------------------------------------------------------
     # Tests that validate the test framework itself: failure detection,
@@ -2776,6 +2881,7 @@ class TestGooglePhotosExportMerger(unittest.TestCase):
         print(f'  Descriptions clrd : {s.descriptions_cleared}')
         print(f'  Duplicates renamed: {s.duplicates_renamed}')
         print(f'  Ext mismatches    : {s.ext_mismatches}')
+        print(f'  Skipped existing  : {s.skipped_existing}')
         print(f'  Errors            : {s.errors}')
         print('=' * 60)
         print(f'\n  Input  : {cls.input_dir}')
@@ -2872,20 +2978,20 @@ class TestSingleWorker(unittest.TestCase):
     # ------------------------------------------------------------------
 
     def test_serial_stats_total_count(self) -> None:
-        """Serial: total media files = 178."""
-        self.assertEqual(self.stats.total_media_files, 178)
+        """Serial: total media files = 180."""
+        self.assertEqual(self.stats.total_media_files, 180)
 
     def test_serial_stats_matched_count(self) -> None:
-        """Serial: matched files = 171."""
-        self.assertEqual(self.stats.matched, 171)
+        """Serial: matched files = 173."""
+        self.assertEqual(self.stats.matched, 173)
 
     def test_serial_stats_orphan_count(self) -> None:
         """Serial: orphan files = 7."""
         self.assertEqual(self.stats.orphans, 7)
 
     def test_serial_stats_written_count(self) -> None:
-        """Serial: written files = 178."""
-        self.assertEqual(self.stats.written, 178)
+        """Serial: written files = 180."""
+        self.assertEqual(self.stats.written, 180)
 
     def test_serial_stats_zero_errors(self) -> None:
         """Serial: zero errors."""
@@ -2896,8 +3002,8 @@ class TestSingleWorker(unittest.TestCase):
         self.assertEqual(self.stats.gps_written, 101)
 
     def test_serial_stats_sidecars_created(self) -> None:
-        """Serial: XMP sidecars created = 80."""
-        self.assertEqual(self.stats.sidecars_created, 80)
+        """Serial: XMP sidecars created = 82."""
+        self.assertEqual(self.stats.sidecars_created, 82)
 
     def test_serial_stats_descriptions_cleared(self) -> None:
         """Serial: descriptions cleared = 3."""
@@ -2914,6 +3020,10 @@ class TestSingleWorker(unittest.TestCase):
     def test_serial_stats_ext_mismatches(self) -> None:
         """Serial: ext mismatches = 1."""
         self.assertEqual(self.stats.ext_mismatches, 1)
+
+    def test_serial_stats_skipped_existing(self) -> None:
+        """Serial: skipped existing = 0."""
+        self.assertEqual(self.stats.skipped_existing, 0)
 
     # ------------------------------------------------------------------
     # Output structure — verify key files exist
@@ -2985,6 +3095,7 @@ if __name__ == '__main__':
                                        "test_special_filename_")),
         ("EXIF Preservation",         ("test_preservation_",)),
         ("Extension Mismatch",        ("test_ext_mismatch_",)),
+        ("Video XMP Dates",           ("test_video_xmp_",)),
         ("Infrastructure Validation", ("test_infra_",)),
         ("Single Worker (serial)",    ("test_serial_",)),
     ]
