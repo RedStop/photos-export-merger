@@ -24,6 +24,32 @@ VIDEO_EXTS = {'.avi', '.mkv', '.mov', '.mp4', '.m4v', '.webm'}
 QUICKTIME_VIDEO_EXTS = {'.mov', '.mp4', '.m4v'}
 ALL_MEDIA_EXTS = DIRECT_WRITE_EXTS | PARTIAL_WRITE_EXTS | VIDEO_EXTS
 
+# Extension groups that are interchangeable — ExifTool handles them the same
+# way, so a "mismatch" within a group is not a real problem.
+_EQUIVALENT_EXTS = [
+    {'.jpg', '.jpeg'},
+    {'.tif', '.tiff'},
+    {'.mov', '.mp4', '.m4v', '.qt'},
+]
+# Build a lookup: extension → frozenset of its equivalents.
+_EXT_EQUIV_MAP: Dict[str, frozenset] = {}
+for _group in _EQUIVALENT_EXTS:
+    _frozen = frozenset(_group)
+    for _ext in _group:
+        _EXT_EQUIV_MAP[_ext] = _frozen
+
+
+def _is_real_ext_mismatch(source_ext: str, actual_ext: str) -> bool:
+    """Return True only if the extensions are genuinely incompatible.
+
+    Returns False when both extensions belong to the same equivalence group
+    (e.g. .mov/.mp4, .jpg/.jpeg) since ExifTool handles them identically.
+    """
+    equiv = _EXT_EQUIV_MAP.get(source_ext)
+    if equiv and actual_ext in equiv:
+        return False
+    return True
+
 DATE_TAGS_PRIORITY = [
     'EXIF:DateTimeOriginal',
     'EXIF:CreateDate',
@@ -705,7 +731,7 @@ class GooglePhotosExportMerger(AbstractMediaMerger):
                 if actual_type_ext:
                     actual = f'.{actual_type_ext.lower()}'
                     source = info.source_path.suffix.lower()
-                    if actual != source:
+                    if actual != source and _is_real_ext_mismatch(source, actual):
                         info.actual_ext = actual
                         self.logger.info("Extension mismatch for %s: content is %s",
                                          self._rel(info.source_path), actual_type_ext)
@@ -781,7 +807,7 @@ class GooglePhotosExportMerger(AbstractMediaMerger):
                 if actual_type_ext:
                     actual = f'.{actual_type_ext.lower()}'
                     source = info.source_path.suffix.lower()
-                    if actual != source:
+                    if actual != source and _is_real_ext_mismatch(source, actual):
                         info.actual_ext = actual
                         self.logger.info("Extension mismatch for orphan %s: content is %s",
                                          self._rel(info.source_path), actual_type_ext)
