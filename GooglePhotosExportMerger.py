@@ -734,7 +734,7 @@ class GooglePhotosExportMerger(AbstractMediaMerger):
                     if actual != source and _is_real_ext_mismatch(source, actual):
                         info.actual_ext = actual
                         stats.ext_mismatches += 1
-                        self.logger.info("Extension mismatch for %s: content is %s",
+                        self.logger.warning("Extension mismatch for %s: content is %s",
                                          self._rel(info.source_path), actual_type_ext)
 
                 # Check blocked descriptions
@@ -773,7 +773,7 @@ class GooglePhotosExportMerger(AbstractMediaMerger):
 
                 if tz is None:
                     tz = GMT_PLUS_2
-                    self.logger.warning("No timezone in EXIF for %s, using GMT+02:00 fallback", self._rel(info.source_path))
+                    self.logger.info("No timezone in EXIF for %s, using GMT+02:00 fallback", self._rel(info.source_path))
 
                 utc_dt = datetime.fromtimestamp(epoch, tz=timezone.utc)
                 local_dt = utc_dt.astimezone(tz)
@@ -811,7 +811,7 @@ class GooglePhotosExportMerger(AbstractMediaMerger):
                     if actual != source and _is_real_ext_mismatch(source, actual):
                         info.actual_ext = actual
                         stats.ext_mismatches += 1
-                        self.logger.info("Extension mismatch for orphan %s: content is %s",
+                        self.logger.warning("Extension mismatch for orphan %s: content is %s",
                                          self._rel(info.source_path), actual_type_ext)
 
                 # Check blocked descriptions on existing EXIF tags
