@@ -189,6 +189,40 @@ def _execute_et(et, params: List[str]):
     et.execute(*[p.encode('utf-8') if isinstance(p, str) else p for p in params])
 
 
+class _ext_mismatch_rename:
+    """Context manager that temporarily renames a file to its actual extension.
+
+    Some files have a mismatched extension (e.g. JPEG content with .DNG
+    extension).  ExifTool refuses to write to these.  This context manager
+    renames the file to the correct extension before the write, then renames
+    it back afterwards.
+
+    Usage::
+
+        with _ext_mismatch_rename(output_path, info.actual_ext) as write_path:
+            # write_path has the correct extension (or is unchanged if no mismatch)
+            _execute_et(et, [..., str(write_path)])
+    """
+    def __init__(self, path: Path, actual_ext: Optional[str]):
+        self.original = path
+        self.actual_ext = actual_ext
+        if actual_ext and path.suffix.lower() != actual_ext:
+            self.temp = path.with_suffix(actual_ext)
+        else:
+            self.temp = None
+
+    def __enter__(self) -> Path:
+        if self.temp and self.original.exists():
+            self.original.rename(self.temp)
+            return self.temp
+        return self.original
+
+    def __exit__(self, *exc):
+        if self.temp and self.temp.exists():
+            self.temp.rename(self.original)
+        return False
+
+
 def _do_process_matched(et, info: MediaFileInfo, stats: MergeStats,
                         logger: logging.Logger):
     """Core logic for processing a matched media file."""
@@ -276,17 +310,34 @@ def _do_process_matched(et, info: MediaFileInfo, stats: MergeStats,
         # Harmless no-op when no IPTC data exists.
         params.append('-IPTCDigest=new')
 
-        # Use -o to copy source to output with metadata in one step
+        # Use -o to copy source to output with metadata in one step.
+        # If the file has a content/extension mismatch, use a temp path with
+        # the correct extension so ExifTool can process it, then rename back.
+        if info.actual_ext:
+            temp_output = info.output_path.with_suffix(info.actual_ext)
+            temp_source = info.source_path.parent / (info.source_path.stem + info.actual_ext)
+        else:
+            temp_output = None
+            temp_source = None
+
+        write_output = temp_output or info.output_path
         params.append('-o')
-        params.append(str(info.output_path))
-        params.append(str(info.source_path))
+        params.append(str(write_output))
+
+        # For -o, ExifTool checks the *source* file extension, so we need to
+        # temporarily rename the source when there's a mismatch.
+        if temp_source:
+            try:
+                info.source_path.rename(temp_source)
+            except OSError:
+                temp_source = None  # rename failed; proceed with original
+
+        params.append(str(temp_source or info.source_path))
 
         try:
             _execute_et(et, params)
         except Exception as e:
-            if info.output_path.exists():
-                # ExifTool status 1 = warnings (e.g. unsupported tags for this format).
-                # The -o copy still succeeded, so treat as success with warnings.
+            if write_output.exists():
                 logger.debug("ExifTool warnings for %s: %s (output created successfully)",
                              info.source_path, e)
             else:
@@ -294,16 +345,26 @@ def _do_process_matched(et, info: MediaFileInfo, stats: MergeStats,
                 logger.warning("ExifTool -o failed for %s: %s, falling back to copy+write",
                                info.source_path, e)
                 try:
-                    shutil.copy2(str(info.source_path), str(info.output_path))
+                    shutil.copy2(str(temp_source or info.source_path), str(write_output))
                     fallback_params = ['-charset', 'filename=utf8', '-overwrite_original']
-                    fallback_params.extend(params[2:-3])  # tag params only (skip charset/filename, -o/output/source)
-                    fallback_params.append(str(info.output_path))
+                    fallback_params.extend(params[2:-3])  # tag params only
+                    fallback_params.append(str(write_output))
                     _execute_et(et, fallback_params)
                 except Exception as e2:
-                    if not info.output_path.exists():
+                    if not write_output.exists():
                         logger.error("Failed to process %s: %s", info.source_path, e2)
                         stats.errors += 1
+                        # Restore source rename before returning
+                        if temp_source and temp_source.exists():
+                            temp_source.rename(info.source_path)
                         return
+        finally:
+            # Restore source file name
+            if temp_source and temp_source.exists():
+                temp_source.rename(info.source_path)
+            # Rename output to the intended path
+            if temp_output and temp_output.exists() and not info.output_path.exists():
+                temp_output.rename(info.output_path)
 
     stats.written += 1
 
@@ -375,14 +436,16 @@ def _do_process_orphan(et, info: MediaFileInfo, stats: MergeStats,
     if len(update_params) > 3:
         # Recompute IPTCDigest so it stays in sync after any IPTC changes.
         update_params.append('-IPTCDigest=new')
-        update_params.append(str(info.output_path))
-        try:
-            _execute_et(et, update_params)
-        except Exception as e:
-            if info.output_path.exists():
-                logger.debug("ExifTool warnings for orphan %s: %s", info.source_path, e)
-            else:
-                logger.warning("Failed to update orphan %s: %s", info.source_path, e)
+        # Temporarily rename output file if extension/content mismatch.
+        with _ext_mismatch_rename(info.output_path, info.actual_ext) as write_path:
+            update_params.append(str(write_path))
+            try:
+                _execute_et(et, update_params)
+            except Exception as e:
+                if write_path.exists():
+                    logger.debug("ExifTool warnings for orphan %s: %s", info.source_path, e)
+                else:
+                    logger.warning("Failed to update orphan %s: %s", info.source_path, e)
 
     _do_set_filesystem_timestamps(et, info, logger)
 
@@ -618,7 +681,7 @@ class GooglePhotosExportMerger(AbstractMediaMerger):
         for dir_path, infos in matched_by_dir.items():
             file_paths = [str(info.source_path) for info in infos]
             tz_tags = ['EXIF:OffsetTimeOriginal', 'EXIF:OffsetTime']
-            read_tags = tz_tags + CONDITIONAL_DATE_READ_TAGS + (DESC_READ_TAGS if self.blocked_descriptions else ['IPTC:Caption-Abstract'])
+            read_tags = tz_tags + CONDITIONAL_DATE_READ_TAGS + ['File:FileTypeExtension'] + (DESC_READ_TAGS if self.blocked_descriptions else ['IPTC:Caption-Abstract'])
 
             try:
                 tag_results = self._et.get_tags(file_paths, read_tags)
@@ -636,6 +699,16 @@ class GooglePhotosExportMerger(AbstractMediaMerger):
                 existing = {t for t in CONDITIONAL_DATE_READ_TAGS if tags.get(t)}
                 if existing:
                     info.existing_xmp_dates = existing
+
+                # Detect extension/content mismatch (e.g. JPEG with .DNG extension).
+                actual_type_ext = tags.get('File:FileTypeExtension')
+                if actual_type_ext:
+                    actual = f'.{actual_type_ext.lower()}'
+                    source = info.source_path.suffix.lower()
+                    if actual != source:
+                        info.actual_ext = actual
+                        self.logger.info("Extension mismatch for %s: content is %s",
+                                         self._rel(info.source_path), actual_type_ext)
 
                 # Check blocked descriptions
                 if self.blocked_descriptions and info.json_data:
@@ -685,7 +758,7 @@ class GooglePhotosExportMerger(AbstractMediaMerger):
         # Resolve dates for orphan files (batch read per directory)
         for dir_path, infos in orphans_by_dir.items():
             file_paths = [str(info.source_path) for info in infos]
-            read_tags = DATE_TAGS_PRIORITY + CONDITIONAL_DATE_READ_TAGS + (DESC_READ_TAGS if self.blocked_descriptions else ['IPTC:Caption-Abstract'])
+            read_tags = DATE_TAGS_PRIORITY + CONDITIONAL_DATE_READ_TAGS + ['File:FileTypeExtension'] + (DESC_READ_TAGS if self.blocked_descriptions else ['IPTC:Caption-Abstract'])
 
             try:
                 tag_results = self._et.get_tags(file_paths, read_tags)
@@ -702,6 +775,16 @@ class GooglePhotosExportMerger(AbstractMediaMerger):
                 existing = {t for t in CONDITIONAL_DATE_READ_TAGS if tags.get(t)}
                 if existing:
                     info.existing_xmp_dates = existing
+
+                # Detect extension/content mismatch.
+                actual_type_ext = tags.get('File:FileTypeExtension')
+                if actual_type_ext:
+                    actual = f'.{actual_type_ext.lower()}'
+                    source = info.source_path.suffix.lower()
+                    if actual != source:
+                        info.actual_ext = actual
+                        self.logger.info("Extension mismatch for orphan %s: content is %s",
+                                         self._rel(info.source_path), actual_type_ext)
 
                 # Check blocked descriptions on existing EXIF tags
                 if self.blocked_descriptions:

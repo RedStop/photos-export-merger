@@ -35,6 +35,10 @@ class MediaFileInfo:
     gps: Optional[Dict[str, float]] = None
     # XMP date tags present in source file (conditionally updated during processing)
     existing_xmp_dates: Optional[Set[str]] = None
+    # Actual file extension (from ExifTool FileTypeExtension) when it differs
+    # from the source file's extension (e.g. JPEG content with .DNG extension).
+    # None when the extension matches or is unknown.
+    actual_ext: Optional[str] = None
 
 
 @dataclass
