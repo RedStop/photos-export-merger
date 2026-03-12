@@ -693,6 +693,19 @@ class TestGooglePhotosExportMerger(unittest.TestCase):
             make_media_file(d / f'tz_fallback{ext}')
             make_json_file(d / f'tz_fallback{ext}.json')
 
+        # Sidecar format with an explicit timezone — verifies that sidecar
+        # date tags carry the source file's timezone, not the +02:00 fallback.
+        # epoch 1723113846 = 2024-08-08 10:44:06 UTC → -07:00 → 2024:08:08 03:44:06
+        make_media_file(d / 'tz_minus7.png')
+        make_json_file(d / 'tz_minus7.png.json')
+        with exiftool.ExifToolHelper() as _et:
+            try:
+                _et.set_tags([str(d / 'tz_minus7.png')],
+                             {'EXIF:OffsetTimeOriginal': '-07:00'},
+                             params=['-overwrite_original'])
+            except Exception:
+                pass
+
         # ── Descriptions ───────────────────────────────────────────────────
         d = inp / 'Descriptions'
         _desc_cases = [
@@ -1065,6 +1078,8 @@ class TestGooglePhotosExportMerger(unittest.TestCase):
             'tz_plus8.jpg', 'tz_plus530.jpg', 'tz_minus930.jpg',
             # Timezones (fallback — non-JPG formats)
             *[f'tz_fallback{ext}' for ext in ('.tiff', '.heic', '.png', '.gif', '.mp4', '.avi')],
+            # Timezones (sidecar with explicit timezone)
+            'tz_minus7.png',
             # Descriptions (JPG)
             'desc_utf8.jpg', 'desc_escaped.jpg', 'desc_newline.jpg',
             'desc_crlf.jpg', 'desc_empty.jpg', 'desc_blocked.jpg', 'desc_long.jpg',
@@ -1460,25 +1475,24 @@ class TestGooglePhotosExportMerger(unittest.TestCase):
 
     # Sidecar formats — verify XMP:DateTimeOriginal in .xmp file
     _TZ_SIDECAR_FALLBACK_CASES: dict = {
-        'tz_fallback.png.xmp': '2024:08:08 12:44:06',
-        'tz_fallback.gif.xmp': '2024:08:08 12:44:06',
-        'tz_fallback.mp4.xmp': '2024:08:08 12:44:06',
-        'tz_fallback.avi.xmp': '2024:08:08 12:44:06',
+        'tz_fallback.png.xmp': ('2024:08:08 12:44:06', '+02:00'),
+        'tz_fallback.gif.xmp': ('2024:08:08 12:44:06', '+02:00'),
+        'tz_fallback.mp4.xmp': ('2024:08:08 12:44:06', '+02:00'),
+        'tz_fallback.avi.xmp': ('2024:08:08 12:44:06', '+02:00'),
     }
 
     def _assert_timezone_sidecar(self, sidecar_name: str,
-                                 expected_dt_substring: str) -> None:
-        """Assert that an XMP sidecar contains the expected datetime.
-
-        ExifTool may strip the timezone suffix when reading XMP dates back,
-        so we only check the datetime portion, not the +HH:MM suffix.
-        """
+                                 expected_dt_substring: str,
+                                 expected_tz: str = '+02:00') -> None:
+        """Assert that an XMP sidecar contains the expected datetime with timezone."""
         tags = self._read_tags(sidecar_name,
                                ['XMP:DateTimeOriginal', 'XMP:CreateDate'])
         dt = tags.get('XMP:DateTimeOriginal') or tags.get('XMP:CreateDate')
         self.assertIsNotNone(dt, f"{sidecar_name}: no date tag in sidecar")
         self.assertIn(expected_dt_substring, str(dt),
                       f"{sidecar_name}: expected {expected_dt_substring!r} in {dt!r}")
+        self.assertIn(expected_tz, str(dt),
+                      f"{sidecar_name}: expected timezone {expected_tz!r} in {dt!r}")
 
     def test_timezone_fallback_tiff(self) -> None:
         """TIFF: no EXIF TZ → falls back to GMT+02:00."""
@@ -1501,19 +1515,26 @@ class TestGooglePhotosExportMerger(unittest.TestCase):
 
     def test_timezone_fallback_png_sidecar(self) -> None:
         """PNG sidecar: GMT+02:00 fallback datetime in XMP."""
-        self._assert_timezone_sidecar('tz_fallback.png.xmp', '2024:08:08 12:44:06')
+        self._assert_timezone_sidecar('tz_fallback.png.xmp', '2024:08:08 12:44:06', '+02:00')
 
     def test_timezone_fallback_gif_sidecar(self) -> None:
         """GIF sidecar: GMT+02:00 fallback datetime in XMP."""
-        self._assert_timezone_sidecar('tz_fallback.gif.xmp', '2024:08:08 12:44:06')
+        self._assert_timezone_sidecar('tz_fallback.gif.xmp', '2024:08:08 12:44:06', '+02:00')
 
     def test_timezone_fallback_mp4_sidecar(self) -> None:
         """MP4 sidecar: GMT+02:00 fallback datetime in XMP."""
-        self._assert_timezone_sidecar('tz_fallback.mp4.xmp', '2024:08:08 12:44:06')
+        self._assert_timezone_sidecar('tz_fallback.mp4.xmp', '2024:08:08 12:44:06', '+02:00')
 
     def test_timezone_fallback_avi_sidecar(self) -> None:
         """AVI sidecar: GMT+02:00 fallback datetime in XMP."""
-        self._assert_timezone_sidecar('tz_fallback.avi.xmp', '2024:08:08 12:44:06')
+        self._assert_timezone_sidecar('tz_fallback.avi.xmp', '2024:08:08 12:44:06', '+02:00')
+
+    def test_timezone_minus7_png_sidecar(self) -> None:
+        """PNG sidecar with embedded -07:00: datetime and timezone are correct.
+
+        epoch 1723113846 = 2024-08-08 10:44:06 UTC → -07:00 → 03:44:06 local.
+        """
+        self._assert_timezone_sidecar('tz_minus7.png.xmp', '2024:08:08 03:44:06', '-07:00')
 
     def test_timezone_direct_fallback_consistency(self) -> None:
         """All direct-write fallback formats have correct TZ and datetime.
@@ -1533,9 +1554,9 @@ class TestGooglePhotosExportMerger(unittest.TestCase):
 
     def test_timezone_sidecar_fallback_consistency(self) -> None:
         """All sidecar fallback formats have GMT+02:00 datetime in XMP."""
-        for sidecar_name, expected_dt in self._TZ_SIDECAR_FALLBACK_CASES.items():
+        for sidecar_name, (expected_dt, expected_tz) in self._TZ_SIDECAR_FALLBACK_CASES.items():
             with self.subTest(sidecar=sidecar_name):
-                self._assert_timezone_sidecar(sidecar_name, expected_dt)
+                self._assert_timezone_sidecar(sidecar_name, expected_dt, expected_tz)
 
     # ------------------------------------------------------------------
     # Category 5 — Descriptions
@@ -2311,14 +2332,14 @@ class TestGooglePhotosExportMerger(unittest.TestCase):
     #   errors=0
 
     def test_stats_total_count(self) -> None:
-        """Total media files processed = 181 (174 matched + 7 orphans)."""
-        self.assertEqual(self.stats.total_media_files, 181,
-                         f"Expected 181 total, got {self.stats.total_media_files}")
+        """Total media files processed = 182 (175 matched + 7 orphans)."""
+        self.assertEqual(self.stats.total_media_files, 182,
+                         f"Expected 182 total, got {self.stats.total_media_files}")
 
     def test_stats_matched_count(self) -> None:
-        """Matched files (with JSON) = 174."""
-        self.assertEqual(self.stats.matched, 174,
-                         f"Expected 174 matched, got {self.stats.matched}")
+        """Matched files (with JSON) = 175."""
+        self.assertEqual(self.stats.matched, 175,
+                         f"Expected 175 matched, got {self.stats.matched}")
 
     def test_stats_orphan_count(self) -> None:
         """Orphan files (no JSON) = 7."""
@@ -2331,9 +2352,9 @@ class TestGooglePhotosExportMerger(unittest.TestCase):
                          f"Expected 101 GPS writes, got {self.stats.gps_written}")
 
     def test_stats_sidecars_created(self) -> None:
-        """XMP sidecars created = 83."""
-        self.assertEqual(self.stats.sidecars_created, 83,
-                         f"Expected 83 sidecars, got {self.stats.sidecars_created}")
+        """XMP sidecars created = 84."""
+        self.assertEqual(self.stats.sidecars_created, 84,
+                         f"Expected 84 sidecars, got {self.stats.sidecars_created}")
 
     def test_stats_zero_errors(self) -> None:
         """Merger reports zero errors for well-formed test data."""
@@ -2341,9 +2362,9 @@ class TestGooglePhotosExportMerger(unittest.TestCase):
                          f"Expected 0 errors, got {self.stats.errors}")
 
     def test_stats_written_count(self) -> None:
-        """Files written = 181 (total_media_files when errors == 0)."""
-        self.assertEqual(self.stats.written, 181,
-                         f"Expected 181 written, got {self.stats.written}")
+        """Files written = 182 (total_media_files when errors == 0)."""
+        self.assertEqual(self.stats.written, 182,
+                         f"Expected 182 written, got {self.stats.written}")
 
     def test_stats_descriptions_cleared(self) -> None:
         """descriptions_cleared = 3 (desc_blocked.jpg + desc_blocked.png + desc_iptc_blocked.jpg)."""
@@ -3038,20 +3059,20 @@ class TestSingleWorker(unittest.TestCase):
     # ------------------------------------------------------------------
 
     def test_serial_stats_total_count(self) -> None:
-        """Serial: total media files = 181."""
-        self.assertEqual(self.stats.total_media_files, 181)
+        """Serial: total media files = 182."""
+        self.assertEqual(self.stats.total_media_files, 182)
 
     def test_serial_stats_matched_count(self) -> None:
-        """Serial: matched files = 174."""
-        self.assertEqual(self.stats.matched, 174)
+        """Serial: matched files = 175."""
+        self.assertEqual(self.stats.matched, 175)
 
     def test_serial_stats_orphan_count(self) -> None:
         """Serial: orphan files = 7."""
         self.assertEqual(self.stats.orphans, 7)
 
     def test_serial_stats_written_count(self) -> None:
-        """Serial: written files = 181."""
-        self.assertEqual(self.stats.written, 181)
+        """Serial: written files = 182."""
+        self.assertEqual(self.stats.written, 182)
 
     def test_serial_stats_zero_errors(self) -> None:
         """Serial: zero errors."""
@@ -3062,8 +3083,8 @@ class TestSingleWorker(unittest.TestCase):
         self.assertEqual(self.stats.gps_written, 101)
 
     def test_serial_stats_sidecars_created(self) -> None:
-        """Serial: XMP sidecars created = 83."""
-        self.assertEqual(self.stats.sidecars_created, 83)
+        """Serial: XMP sidecars created = 84."""
+        self.assertEqual(self.stats.sidecars_created, 84)
 
     def test_serial_stats_descriptions_cleared(self) -> None:
         """Serial: descriptions cleared = 3."""
