@@ -135,7 +135,16 @@ Blocked descriptions are cleared from `EXIF:UserComment`, `EXIF:ImageDescription
 
 ## JSON metadata format
 
-Each media file in a Google Takeout export has a companion `.json` file containing metadata. The filename of the `.json` file is used to find the matching media file. The merger uses the following fields (all other fields are ignored):
+Each media file in a Google Takeout export has a companion `.json` file containing metadata. The filename of the `.json` file is used to find the matching media file using the following cascade:
+
+1. **Strip the `.json` extension** to get the expected media filename (e.g. `IMG_1234.jpg.json` → `IMG_1234.jpg`).
+2. **Handle bracket duplicates.** Google Takeout appends `(N)` after the extension for duplicates (e.g. `IMG_1234.jpg(2).json`). The matcher detects this, strips the bracket suffix, and reinserts it before the extension to reconstruct the expected filename (`IMG_1234(2).jpg`).
+3. **Try an exact match** against the files in the same directory.
+4. **Fall back to a prefix search.** If no exact match is found, all files in the directory whose name starts with the JSON base (without any bracket suffix) and whose extension matches the `title` field's extension are collected. If exactly one candidate exists, it is used. If multiple candidates exist, the one whose `(N)` bracket number matches the JSON's bracket number is selected.
+
+Files that have no matching JSON are flagged as **orphans** and copied to the output with their existing EXIF metadata preserved.
+
+The merger uses the following JSON fields (all other fields are ignored):
 
 ```json
 {
@@ -159,7 +168,7 @@ Each media file in a Google Takeout export has a companion `.json` file containi
 
 | Field | Required | Usage |
 |-------|----------|-------|
-| `title` | Yes | Used as the output filename. Must include the file extension (e.g. `IMG_1234.jpg`, `VID_001.MOV`). |
+| `title` | Yes | Used as the output filename, with the extention always converted to lowercase. Must include the file extension (e.g. `IMG_1234.jpg`, `VID_001.MOV`). |
 | `description` | No | Written to `EXIF:ImageDescription`, `XMP-dc:Description`, and `IPTC:Caption-Abstract` (if already present). Supports UTF-8 and newlines. |
 | `photoTakenTime.timestamp` | Yes | Unix epoch (seconds since 1970-01-01 UTC). Combined with the EXIF timezone offset to produce the local datetime used for date tags and the `YYYY/MM/` output directory structure. |
 | `geoData` | No | GPS coordinates written to EXIF and XMP GPS tags. Ignored when both latitude and longitude are `0.0`. |
