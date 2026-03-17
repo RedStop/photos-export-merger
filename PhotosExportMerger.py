@@ -1222,10 +1222,6 @@ if __name__ == '__main__':
         # Add unwanted description strings here
         "SONY DSC",
         "OLYMPUS DIGITAL CAMERA",
-        "DCIM\\100MEDIA\\DJI_0009.JPG",
-        "DCIM\\100MEDIA\\DJI_0021.JPG",
-        "DCIM\\100MEDIA\\DJI_0036.JPG",
-        "DCIM\\100MEDIA\\DJI_0040.JPG",
     ]
 
     merger = PhotosExportMerger(args.input_dir, args.output_dir,
