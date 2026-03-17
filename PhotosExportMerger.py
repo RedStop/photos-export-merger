@@ -715,7 +715,7 @@ def _process_chunk(chunk: List[MediaFileInfo]) -> MergeStats:
     return stats
 
 
-class GooglePhotosExportMerger(AbstractMediaMerger):
+class PhotosExportMerger(AbstractMediaMerger):
     def __init__(self, input_dir: str, output_dir: str, dry_run: bool = False,
                  blocked_descriptions: Optional[List[str]] = None,
                  num_workers: int = 1,
@@ -1141,32 +1141,32 @@ if __name__ == '__main__':
     _profiles = ', '.join(METADATA_STRIP_PROFILES.keys())
 
     parser = argparse.ArgumentParser(
-        prog='GooglePhotosExportMerger.py',
+        prog='PhotosExportMerger.py',
         description=(
-            'Merge JSON metadata from Google Photos Takeout exports into '
+            'Merge JSON metadata from Photos Takeout exports into '
             'image/video EXIF properties using ExifTool.  Copies files into '
             'a date-organized output directory (YYYY/MM/filename).'
         ),
         epilog=(
             'examples:\n'
             '  # Basic merge\n'
-            '  python GooglePhotosExportMerger.py input/ output/\n'
+            '  python PhotosExportMerger.py input/ output/\n'
             '\n'
             '  # Dry run — preview without writing\n'
-            '  python GooglePhotosExportMerger.py input/ output/ --dry-run\n'
+            '  python PhotosExportMerger.py input/ output/ --dry-run\n'
             '\n'
-            '  # Use 4 workers and strip Google metadata\n'
-            '  python GooglePhotosExportMerger.py input/ output/ --workers 4 --strip-metadata google\n'
+            '  # Use 4 workers and strip Google camera metadata\n'
+            '  python PhotosExportMerger.py input/ output/ --workers 4 --strip-metadata google\n'
             '\n'
             '  # Set fallback timezone and override for a trip\n'
-            '  python GooglePhotosExportMerger.py input/ output/ \\\n'
+            '  python PhotosExportMerger.py input/ output/ \\\n'
             '    --tz-fallback "+02:00" \\\n'
             '    --tz-override "2019-11-20 02:00:00,2019-11-22 17:00:50,+05:30"\n'
         ),
         formatter_class=argparse.RawDescriptionHelpFormatter,
     )
     parser.add_argument('input_dir',
-                        help='Root of the Google Photos Takeout export.')
+                        help='Root of the Photos Takeout export.')
     parser.add_argument('output_dir',
                         help='Destination directory (created if needed). '
                              'Must not be inside input_dir.')
@@ -1219,8 +1219,7 @@ if __name__ == '__main__':
                 "Expected format: +HH:MM or -HH:MM (e.g. +02:00, -05:30)")
 
     blocked_descriptions = [
-        # Add unwanted description strings here, e.g.:
-        # "Photo uploaded by Google Photos",
+        # Add unwanted description strings here
         "SONY DSC",
         "OLYMPUS DIGITAL CAMERA",
         "DCIM\\100MEDIA\\DJI_0009.JPG",
@@ -1229,11 +1228,11 @@ if __name__ == '__main__':
         "DCIM\\100MEDIA\\DJI_0040.JPG",
     ]
 
-    merger = GooglePhotosExportMerger(args.input_dir, args.output_dir,
-                                     dry_run=args.dry_run,
-                                     blocked_descriptions=blocked_descriptions,
-                                     num_workers=args.workers,
-                                     metadata_strip_params=metadata_strip_params,
-                                     tz_overrides=tz_overrides or None,
-                                     fallback_tz=fallback_tz)
+    merger = PhotosExportMerger(args.input_dir, args.output_dir,
+                                dry_run=args.dry_run,
+                                blocked_descriptions=blocked_descriptions,
+                                num_workers=args.workers,
+                                metadata_strip_params=metadata_strip_params,
+                                tz_overrides=tz_overrides or None,
+                                fallback_tz=fallback_tz)
     result = merger.run()

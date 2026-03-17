@@ -1,9 +1,9 @@
-# setup.ps1 — Google Photos Export Merger environment setup (Windows/PowerShell)
+# setup.ps1 — Photos Export Merger environment setup (Windows/PowerShell)
 
 Set-StrictMode -Version Latest
 $ErrorActionPreference = "Stop"
 
-Write-Host "`n=== Google Photos Export Merger — Setup ===" -ForegroundColor Cyan
+Write-Host "`n=== Photos Export Merger — Setup ===" -ForegroundColor Cyan
 
 # 1. Check Python
 Write-Host "`n[1/4] Checking Python..." -ForegroundColor Yellow
@@ -110,5 +110,5 @@ if ($exiftoolFound) {
     Write-Host "  ExifTool:     NOT FOUND — see instructions above" -ForegroundColor Red
     Write-Host "`nSetup partially complete. Install ExifTool to finish." -ForegroundColor Yellow
 }
-Write-Host "  python GooglePhotosExportMerger.py" -ForegroundColor White
+Write-Host "  python PhotosExportMerger.py" -ForegroundColor White
 Write-Host ""

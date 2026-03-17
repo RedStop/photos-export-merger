@@ -1,6 +1,8 @@
-# Google Photos Export Merger
+# Photos Export Merger
 
-Merges JSON metadata from Google Photos Takeout exports into image/video EXIF properties using ExifTool. Two-phase workflow: **analyse** your export, then **merge** the metadata into your media files.
+Merges JSON metadata from Photos Takeout exports into image/video EXIF properties using ExifTool. Two-phase workflow: **analyse** your export, then **merge** the metadata into your media files.
+
+> **Disclaimer:** This project is designed to process data exported from Google Photos via Google Takeout. It is not affiliated with, endorsed by, sponsored by, or otherwise authorised by Google LLC. "Google", "Google Photos", and "Google Takeout" are trademarks of Google LLC. Use of these names herein is solely for the purpose of identifying the third-party service whose export format this tool supports.
 
 **Back up your photos before running this.**
 
@@ -36,30 +38,30 @@ This generates `combined_structure.json`, `individual_files.json`, and `file_typ
 ### Phase 2: Merge
 
 ```bash
-python GooglePhotosExportMerger.py <input_dir> <output_dir> [options]
+python PhotosExportMerger.py <input_dir> <output_dir> [options]
 ```
 
-Run `python GooglePhotosExportMerger.py --help` for full option details.
+Run `python PhotosExportMerger.py --help` for full option details.
 
 #### Examples
 
 ```bash
 # Basic merge using all CPU cores
-python GooglePhotosExportMerger.py input/ output/
+python PhotosExportMerger.py input/ output/
 
 # Dry run — preview without writing files
-python GooglePhotosExportMerger.py input/ output/ --dry-run
+python PhotosExportMerger.py input/ output/ --dry-run
 
 # Single-threaded with fallback timezone set to UTC+2
-python GooglePhotosExportMerger.py input/ output/ --workers 1 --tz-fallback "+02:00"
+python PhotosExportMerger.py input/ output/ --workers 1 --tz-fallback "+02:00"
 
 # Strip Google camera metadata and override timezone for a trip
-python GooglePhotosExportMerger.py input/ output/ \
+python PhotosExportMerger.py input/ output/ \
   --strip-metadata google \
   --tz-override "2019-11-20 02:00:00,2019-11-22 17:00:50,+05:30"
 
 # Multiple timezone overrides for two trips
-python GooglePhotosExportMerger.py input/ output/ \
+python PhotosExportMerger.py input/ output/ \
   --tz-override "2023-03-10 00:00:00,2023-03-20 23:59:59,+09:00" \
   --tz-override "2023-06-01 00:00:00,2023-06-15 23:59:59,-04:00"
 ```
@@ -116,11 +118,11 @@ For travel photos, use `--tz-override` to specify UTC time ranges and the timezo
 | `google` | `XMP-GCamera:All`, `Google:All` |
 | `photoshop` | `Photoshop:All`, `XMP-photoshop:DocumentAncestors` |
 
-Use `--strip-metadata` (no args) for all profiles, or name specific ones: `--strip-metadata google photoshop`. Add new profiles to `METADATA_STRIP_PROFILES` in `GooglePhotosExportMerger.py`.
+Use `--strip-metadata` (no args) for all profiles, or name specific ones: `--strip-metadata google photoshop`. Add new profiles to `METADATA_STRIP_PROFILES` in `PhotosExportMerger.py`.
 
 ### Blocking unwanted descriptions
 
-Edit the `blocked_descriptions` list in the `__main__` block of `GooglePhotosExportMerger.py`:
+Edit the `blocked_descriptions` list in the `__main__` block of `PhotosExportMerger.py`:
 
 ```python
 blocked_descriptions = [
@@ -136,9 +138,9 @@ Blocked descriptions are cleared from `EXIF:UserComment`, `EXIF:ImageDescription
 | Module | Role |
 |--------|------|
 | `AbstractMediaMerger.py` | Base class: 9-step pipeline, dataclasses, GPS/duplicate resolution |
-| `GooglePhotosExportMerger.py` | Concrete implementation, ExifTool integration, CLI, parallel processing |
+| `PhotosExportMerger.py` | Concrete implementation, ExifTool integration, CLI, parallel processing |
 | `JsonFileIdentifier.py` | Matches JSON metadata files to media files |
 | `JsonKeyExtractor.py` | Analysis tool — scans exports and generates structural reports |
 | `TestMerger.py` | Integration test suite (185+ tests across multiple configurations) |
 
-**Data flow:** `JsonKeyExtractor` scans → `JsonFileIdentifier` matches JSON to media → `GooglePhotosExportMerger` writes EXIF metadata.
+**Data flow:** `JsonKeyExtractor` scans → `JsonFileIdentifier` matches JSON to media → `PhotosExportMerger` writes EXIF metadata.

@@ -1,5 +1,5 @@
 """
-test_merger.py — Comprehensive unit tests for GooglePhotosExportMerger.
+test_merger.py — Comprehensive unit tests for PhotosExportMerger.
 
 This file is built in stages:
   Part 1  (done):    File factories — minimal valid binary files + JSON files.
@@ -22,7 +22,7 @@ from datetime import datetime, timezone, timedelta
 from typing import Any, Dict
 
 import exiftool
-from GooglePhotosExportMerger import GooglePhotosExportMerger, MergeStats
+from PhotosExportMerger import PhotosExportMerger, MergeStats
 
 # Custom log level below DEBUG (10) — used by infrastructure-validation tests
 # to document intent without cluttering normal output.
@@ -489,7 +489,7 @@ def make_media_file(path: Path) -> Path:
 
 
 def make_json_file(path: Path, **fields: Any) -> Path:
-    """Write a Google Photos Takeout-style JSON metadata file at *path*.
+    """Write a Photos Takeout-style JSON metadata file at *path*.
 
     Sensible defaults are provided for every field; pass keyword arguments
     to override individual top-level keys.  Nested dicts (geoData, geoDataExif,
@@ -557,9 +557,9 @@ _EPOCH_DEFAULT = '1723113846'
 # Test class
 # ---------------------------------------------------------------------------
 
-class TestGooglePhotosExportMerger(unittest.TestCase):
+class TestPhotosExportMerger(unittest.TestCase):
     """
-    Single-pass integration test for GooglePhotosExportMerger.
+    Single-pass integration test for PhotosExportMerger.
 
     setUpClass builds the full input tree, runs the merger once, and stores
     the resulting MergeStats and a pre-run input-directory snapshot.
@@ -601,7 +601,7 @@ class TestGooglePhotosExportMerger(unittest.TestCase):
         # Uses all CPU cores to exercise parallel processing by default.
         # Explicit fallback_tz=+02:00 so tests are independent of host timezone.
         num_workers = os.cpu_count() or 1
-        merger = GooglePhotosExportMerger(
+        merger = PhotosExportMerger(
             str(cls.input_dir),
             str(cls.output_dir),
             blocked_descriptions=_BLOCKED_DESCRIPTIONS,
@@ -790,7 +790,7 @@ class TestGooglePhotosExportMerger(unittest.TestCase):
             )
 
         # ── BracketNotation ────────────────────────────────────────────────
-        # Google Photos names duplicated exports as  photo.jpg(1).json  (bracket
+        # Photos Takeout names duplicated exports as  photo.jpg(1).json  (bracket
         # before the .json suffix, not inside the extension).
         # JsonFileFinder strips the bracket and matches the correct media file.
         d = inp / 'BracketNotation'
@@ -924,7 +924,7 @@ class TestGooglePhotosExportMerger(unittest.TestCase):
         # mismatch).  The merger should detect this, temporarily rename for
         # ExifTool, write tags correctly, and keep the JSON title.
         d = inp / 'ExtMismatch'
-        # Write JPEG bytes to a .dng path (simulates Google Photos export quirk).
+        # Write JPEG bytes to a .dng path (because some camera app saved a JPEG to a .dng file).
         mismatch_path = d / 'mismatch_photo.dng'
         mismatch_path.parent.mkdir(parents=True, exist_ok=True)
         mismatch_path.write_bytes(_MEDIA_BYTES['.jpg'])
@@ -2776,7 +2776,7 @@ class TestGooglePhotosExportMerger(unittest.TestCase):
     # Category 17 — Extension Mismatch
     # ------------------------------------------------------------------
     # Files where the extension does not match the actual content type
-    # (e.g. JPEG content with .DNG extension from Google Photos export).
+    # (e.g. JPEG content with .DNG extension from Photos Takeout export).
     # The merger should detect the mismatch, temporarily rename for
     # ExifTool, write all tags correctly, and preserve the original
     # filename (including the JSON title).
@@ -3087,15 +3087,15 @@ class TestSingleWorker(unittest.TestCase):
         # Reuse the same input-tree builder from the main test class.
         # _create_input_tree is a classmethod that reads cls.input_dir, so we
         # temporarily point it at our input directory, then restore it.
-        saved_input_dir = getattr(TestGooglePhotosExportMerger, 'input_dir', None)
-        TestGooglePhotosExportMerger.input_dir = cls.input_dir
-        TestGooglePhotosExportMerger._create_input_tree()
+        saved_input_dir = getattr(TestPhotosExportMerger, 'input_dir', None)
+        TestPhotosExportMerger.input_dir = cls.input_dir
+        TestPhotosExportMerger._create_input_tree()
         if saved_input_dir is not None:
-            TestGooglePhotosExportMerger.input_dir = saved_input_dir
+            TestPhotosExportMerger.input_dir = saved_input_dir
 
         # Run with num_workers=1 (serial mode)
         # Explicit fallback_tz=+02:00 so tests are independent of host timezone.
-        merger = GooglePhotosExportMerger(
+        merger = PhotosExportMerger(
             str(cls.input_dir),
             str(cls.output_dir),
             blocked_descriptions=_BLOCKED_DESCRIPTIONS,
@@ -3246,7 +3246,7 @@ class TestMetadataStripping(unittest.TestCase):
 
         # Run merger with all strip profiles enabled
         # Explicit fallback_tz=+02:00 so tests are independent of host timezone.
-        merger = GooglePhotosExportMerger(
+        merger = PhotosExportMerger(
             str(cls.input_dir),
             str(cls.output_dir),
             num_workers=1,
@@ -3396,7 +3396,7 @@ class TestTimezoneOverride(unittest.TestCase):
             tz=timezone(timedelta(hours=-5, minutes=-30)),
         )
 
-        merger = GooglePhotosExportMerger(
+        merger = PhotosExportMerger(
             str(cls.input_dir),
             str(cls.output_dir),
             num_workers=1,
@@ -3558,7 +3558,7 @@ class TestFallbackTimezone(unittest.TestCase):
                        photoTakenTime={'timestamp': cls._EPOCH, 'formatted': ''})
 
         # Run merger with custom fallback timezone -05:00
-        merger = GooglePhotosExportMerger(
+        merger = PhotosExportMerger(
             str(cls.input_dir),
             str(cls.output_dir),
             num_workers=1,
@@ -3712,7 +3712,7 @@ if __name__ == '__main__':
     # ── Argument parser ──────────────────────────────────────────────────────
     parser = argparse.ArgumentParser(
         prog='test_merger.py',
-        description='Run GooglePhotosExportMerger tests with optional filtering.',
+        description='Run PhotosExportMerger tests with optional filtering.',
     )
     parser.add_argument(
         '-c', '--category', dest='categories', action='append', metavar='NAME',
@@ -3759,9 +3759,9 @@ if __name__ == '__main__':
 
     # ── Set cleanup mode ─────────────────────────────────────────────────────
     if args.cleanup:
-        TestGooglePhotosExportMerger._cleanup_mode = 'auto_delete'
+        TestPhotosExportMerger._cleanup_mode = 'auto_delete'
     elif args.keep:
-        TestGooglePhotosExportMerger._cleanup_mode = 'auto_keep'
+        TestPhotosExportMerger._cleanup_mode = 'auto_keep'
     # else leave default 'prompt'
 
     # ── Enable single-worker tests if requested ──────────────────────────────
@@ -3895,7 +3895,7 @@ if __name__ == '__main__':
     )
     loader = unittest.TestLoader()
     suite = unittest.TestSuite()
-    suite.addTests(loader.loadTestsFromTestCase(TestGooglePhotosExportMerger))
+    suite.addTests(loader.loadTestsFromTestCase(TestPhotosExportMerger))
     if args.single_worker:
         suite.addTests(loader.loadTestsFromTestCase(TestSingleWorker))
     if args.categories or args.file_types:

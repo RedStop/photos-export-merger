@@ -1,10 +1,10 @@
 #!/usr/bin/env bash
-# setup.sh — Google Photos Export Merger environment setup (Linux/macOS/WSL)
+# setup.sh — Photos Export Merger environment setup (Linux/macOS/WSL)
 
 set -euo pipefail
 
 echo ""
-echo "=== Google Photos Export Merger — Setup ==="
+echo "=== Photos Export Merger — Setup ==="
 
 # 1. Check Python
 echo ""
@@ -101,5 +101,5 @@ else
     echo ""
     echo "Setup partially complete. Install ExifTool to finish."
 fi
-echo "  python3 GooglePhotosExportMerger.py"
+echo "  python3 PhotosExportMerger.py"
 echo ""

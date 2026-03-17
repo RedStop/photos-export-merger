@@ -4,7 +4,7 @@ This file provides guidance to Claude Code (claude.ai/code) when working with co
 
 ## Project Overview
 
-Google Photos Export Merger — a Python utility that merges JSON metadata from Google Photos Takeout exports into image/video EXIF properties using ExifTool. Developed and tested on Windows; setup scripts also support Linux/macOS/WSL, though the `FileCreateDate` tag used for filesystem creation times is Windows-only (on other platforms only the modification time is reliably set).
+Photos Export Merger — a Python utility that merges JSON metadata from Photos Takeout exports into image/video EXIF properties using ExifTool. Developed and tested on Windows; setup scripts also support Linux/macOS/WSL, though the `FileCreateDate` tag used for filesystem creation times is Windows-only (on other platforms only the modification time is reliably set).
 
 ## Requirements
 
@@ -19,7 +19,7 @@ Google Photos Export Merger — a Python utility that merges JSON metadata from 
 python JsonKeyExtractor.py <input_directory> [output_directory]
 
 # Merge metadata into media files (uses all CPU cores by default)
-python GooglePhotosExportMerger.py <input_dir> <output_dir> [--dry-run] [--workers N] [--strip-metadata [PROFILE ...]] [--tz-fallback OFFSET] [--tz-override "START_UTC,END_UTC,OFFSET" ...]
+python PhotosExportMerger.py <input_dir> <output_dir> [--dry-run] [--workers N] [--strip-metadata [PROFILE ...]] [--tz-fallback OFFSET] [--tz-override "START_UTC,END_UTC,OFFSET" ...]
 
 # Run tests
 python -m pytest TestMerger.py
@@ -37,15 +37,15 @@ Five modules with clear separation of concerns:
 
 1. **AbstractMediaMerger.py** — Abstract base class defining the 9-step merge pipeline. Defines `WriteStrategy` enum (DIRECT, PARTIAL_WITH_SIDECAR, VIDEO_WITH_SIDECAR), `MediaFileInfo` dataclass (includes pre-extracted `description` and `gps` fields to avoid shipping full `json_data` to workers, plus `existing_xmp_dates` for conditional date updates and `actual_ext` for extension mismatch handling), and `MergeStats` dataclass (with a `merge()` method for aggregating partial stats from parallel workers). Implements GPS resolution, duplicate filename resolution (appending `_2`, `_3`, etc.), dry-run logging, and summary reporting. Accepts a `num_workers` parameter (default 1); `_process_files` owns the serial-vs-parallel decision and writer lifecycle.
 
-2. **GooglePhotosExportMerger.py** — Concrete implementation of AbstractMediaMerger and the CLI entry point. Builds ExifTool parameters for dates, descriptions, GPS, and timezones. Has a `blocked_descriptions` list in `__main__` for filtering unwanted descriptions. Implements parallel file processing via `ProcessPoolExecutor`: files are round-robin distributed across N worker processes, each with its own ExifTool instance. Core processing logic lives in shared module-level functions (`_do_process_matched`, `_do_process_orphan`, `_do_create_sidecar`, `_do_set_filesystem_timestamps`) that are used by both the serial class methods and the parallel worker. The parallel entry point `_process_chunk` configures worker logging and opens a per-worker ExifTool instance. To reduce IPC serialisation overhead, `description` and `gps` are pre-extracted onto `MediaFileInfo` and `json_data` is cleared before dispatch to workers.
+2. **PhotosExportMerger.py** — Concrete implementation of AbstractMediaMerger and the CLI entry point. Builds ExifTool parameters for dates, descriptions, GPS, and timezones. Has a `blocked_descriptions` list in `__main__` for filtering unwanted descriptions. Implements parallel file processing via `ProcessPoolExecutor`: files are round-robin distributed across N worker processes, each with its own ExifTool instance. Core processing logic lives in shared module-level functions (`_do_process_matched`, `_do_process_orphan`, `_do_create_sidecar`, `_do_set_filesystem_timestamps`) that are used by both the serial class methods and the parallel worker. The parallel entry point `_process_chunk` configures worker logging and opens a per-worker ExifTool instance. To reduce IPC serialisation overhead, `description` and `gps` are pre-extracted onto `MediaFileInfo` and `json_data` is cleared before dispatch to workers.
 
-3. **JsonFileIdentifier.py** — Matches JSON metadata files to their corresponding media files. Uses `SortedSet` for O(log n + k) prefix-based lookups. Handles Google's bracket notation (e.g., `filename(2).jpg`) and case-insensitive extension matching.
+3. **JsonFileIdentifier.py** — Matches JSON metadata files to their corresponding media files. Uses `SortedSet` for O(log n + k) prefix-based lookups. Handles Takeout bracket notation (e.g., `filename(2).jpg`) and case-insensitive extension matching.
 
 4. **JsonKeyExtractor.py** — Analysis entry point. Scans a directory tree once, groups files by directory, extracts JSON structure (2-level depth), and generates analysis output (combined_structure.json, individual_files.json, file_types.json, plus conditional error/conflict files).
 
 5. **TestMerger.py** — Integration test suite (see Testing section above).
 
-**Data flow:** JsonKeyExtractor scans directories → JsonFileIdentifier matches JSON-to-media files → GooglePhotosExportMerger writes metadata to EXIF.
+**Data flow:** JsonKeyExtractor scans directories → JsonFileIdentifier matches JSON-to-media files → PhotosExportMerger writes metadata to EXIF.
 
 ## Key Design Details
 
