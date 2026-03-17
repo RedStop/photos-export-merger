@@ -133,6 +133,38 @@ blocked_descriptions = [
 
 Blocked descriptions are cleared from `EXIF:UserComment`, `EXIF:ImageDescription`, `XMP-dc:Description`, and `IPTC:Caption-Abstract` (if present).
 
+## JSON metadata format
+
+Each media file in a Google Takeout export has a companion `.json` file containing metadata. The merger uses the following fields (all other fields are ignored):
+
+```json
+{
+  "title": "PXL_20200808_180006041.jpg",
+  "description": "Some fancy description with special chars like é, ô and even 郭.\nOh, and new lines are also supported!",
+  "photoTakenTime": {
+    "timestamp": "1723113846"
+  },
+  "geoData": {
+    "latitude": 13.8121437,
+    "longitude": 21.6436809,
+    "altitude": 30.2
+  },
+  "geoDataExif": {
+    "latitude": 13.8121437,
+    "longitude": 21.6436809,
+    "altitude": 30.2
+  }
+}
+```
+
+| Field | Required | Usage |
+|-------|----------|-------|
+| `title` | Yes | Used as the output filename. Must include the file extension (e.g. `IMG_1234.jpg`, `VID_001.MOV`). |
+| `description` | No | Written to `EXIF:ImageDescription`, `XMP-dc:Description`, and `IPTC:Caption-Abstract` (if already present). Supports UTF-8 and newlines. |
+| `photoTakenTime.timestamp` | Yes | Unix epoch (seconds since 1970-01-01 UTC). Combined with the EXIF timezone offset to produce the local datetime used for date tags and the `YYYY/MM/` output directory structure. |
+| `geoData` | No | GPS coordinates written to EXIF and XMP GPS tags. Ignored when both latitude and longitude are `0.0`. |
+| `geoDataExif` | No | Fallback GPS source — used only when `geoData` has no valid coordinates. Same format as `geoData`. |
+
 ## Architecture
 
 | Module | Role |
