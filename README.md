@@ -135,7 +135,7 @@ Blocked descriptions are cleared from `EXIF:UserComment`, `EXIF:ImageDescription
 
 ## JSON metadata format
 
-Each media file in a Google Takeout export has a companion `.json` file containing metadata. The merger uses the following fields (all other fields are ignored):
+Each media file in a Google Takeout export has a companion `.json` file containing metadata. The filename of the `.json` file is used to find the matching media file. The merger uses the following fields (all other fields are ignored):
 
 ```json
 {
