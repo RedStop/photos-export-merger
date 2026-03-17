@@ -599,12 +599,14 @@ class TestGooglePhotosExportMerger(unittest.TestCase):
 
         # Single merge run shared by all test_* methods
         # Uses all CPU cores to exercise parallel processing by default.
+        # Explicit fallback_tz=+02:00 so tests are independent of host timezone.
         num_workers = os.cpu_count() or 1
         merger = GooglePhotosExportMerger(
             str(cls.input_dir),
             str(cls.output_dir),
             blocked_descriptions=_BLOCKED_DESCRIPTIONS,
             num_workers=num_workers,
+            fallback_tz=timezone(timedelta(hours=2)),
         )
         cls.stats = merger.run()
 
@@ -3092,11 +3094,13 @@ class TestSingleWorker(unittest.TestCase):
             TestGooglePhotosExportMerger.input_dir = saved_input_dir
 
         # Run with num_workers=1 (serial mode)
+        # Explicit fallback_tz=+02:00 so tests are independent of host timezone.
         merger = GooglePhotosExportMerger(
             str(cls.input_dir),
             str(cls.output_dir),
             blocked_descriptions=_BLOCKED_DESCRIPTIONS,
             num_workers=1,
+            fallback_tz=timezone(timedelta(hours=2)),
         )
         cls.stats = merger.run()
 
@@ -3241,6 +3245,7 @@ class TestMetadataStripping(unittest.TestCase):
                 pass
 
         # Run merger with all strip profiles enabled
+        # Explicit fallback_tz=+02:00 so tests are independent of host timezone.
         merger = GooglePhotosExportMerger(
             str(cls.input_dir),
             str(cls.output_dir),
@@ -3249,6 +3254,7 @@ class TestMetadataStripping(unittest.TestCase):
                 '-XMP-GCamera:All=', '-Google:All=',
                 '-Photoshop:All=', '-XMP-photoshop:DocumentAncestors=',
             ],
+            fallback_tz=timezone(timedelta(hours=2)),
         )
         cls.stats = merger.run()
 
@@ -3395,6 +3401,7 @@ class TestTimezoneOverride(unittest.TestCase):
             str(cls.output_dir),
             num_workers=1,
             tz_overrides=[override],
+            fallback_tz=timezone(timedelta(hours=2)),
         )
         cls.stats = merger.run()
 
@@ -3489,6 +3496,168 @@ class TestTimezoneOverride(unittest.TestCase):
         self.assertIsNotNone(f, "tz_in_range.jpg not found in output")
         self.assertIn('2019', str(f))
         self.assertIn('11', str(f))
+
+
+class TestFallbackTimezone(unittest.TestCase):
+    """Run the merger with a custom --tz-fallback and verify it is applied.
+
+    Builds a minimal input tree with files that have no embedded EXIF
+    timezone, so the fallback timezone is used.  Uses -05:00 as the
+    custom fallback (instead of the default host timezone) to verify:
+      - matched files get the custom fallback timezone
+      - orphan files get the custom fallback timezone
+      - sidecar XMP dates carry the custom fallback timezone
+      - a file with an embedded EXIF timezone ignores the fallback
+
+    Uses the same JSON epoch as the main test suite:
+      epoch 1723117446 = 2024-08-08 11:44:06 UTC
+      At -05:00 this is 2024-08-08 06:44:06
+      At +08:00 (EXIF) this is 2024-08-08 19:44:06
+    """
+
+    tmp_dir:    Path
+    input_dir:  Path
+    output_dir: Path
+    stats:      MergeStats
+
+    _EPOCH = '1723117446'  # 2024-08-08 10:44:06 UTC
+
+    @classmethod
+    def setUpClass(cls) -> None:
+        cls.tmp_dir    = Path(tempfile.mkdtemp(prefix='gpem_tz_fallback_test_'))
+        cls.input_dir  = cls.tmp_dir / 'input'
+        cls.output_dir = cls.tmp_dir / 'output'
+        cls.input_dir.mkdir()
+
+        d = cls.input_dir / 'FallbackTz'
+
+        # Matched file, no EXIF timezone → should use fallback -05:00
+        make_media_file(d / 'fb_matched.jpg')
+        make_json_file(d / 'fb_matched.jpg.json',
+                       title='fb_matched.jpg',
+                       photoTakenTime={'timestamp': cls._EPOCH, 'formatted': ''})
+
+        # PNG matched file, no EXIF timezone → sidecar should use -05:00
+        make_media_file(d / 'fb_sidecar.png')
+        make_json_file(d / 'fb_sidecar.png.json',
+                       title='fb_sidecar.png',
+                       photoTakenTime={'timestamp': cls._EPOCH, 'formatted': ''})
+
+        # AVI matched file, no EXIF timezone → sidecar should use -05:00
+        make_media_file(d / 'fb_video.avi')
+        make_json_file(d / 'fb_video.avi.json',
+                       title='fb_video.avi',
+                       photoTakenTime={'timestamp': cls._EPOCH, 'formatted': ''})
+
+        # Matched file WITH embedded EXIF timezone +08:00 → fallback ignored
+        p = d / 'fb_has_exif.jpg'
+        p.parent.mkdir(parents=True, exist_ok=True)
+        p.write_bytes(_make_jpeg_with_exif_tz('+08:00'))
+        make_json_file(d / 'fb_has_exif.jpg.json',
+                       title='fb_has_exif.jpg',
+                       photoTakenTime={'timestamp': cls._EPOCH, 'formatted': ''})
+
+        # Run merger with custom fallback timezone -05:00
+        merger = GooglePhotosExportMerger(
+            str(cls.input_dir),
+            str(cls.output_dir),
+            num_workers=1,
+            fallback_tz=timezone(timedelta(hours=-5)),
+        )
+        cls.stats = merger.run()
+
+    @classmethod
+    def tearDownClass(cls) -> None:
+        tmp = getattr(cls, 'tmp_dir', None)
+        if tmp is not None:
+            shutil.rmtree(str(tmp), ignore_errors=True)
+
+    def _find_output_file(self, name: str) -> 'Path | None':
+        for f in self.output_dir.rglob('*'):
+            if f.is_file() and f.name == name:
+                return f
+        return None
+
+    def _read_tags(self, name: str, tags: list) -> dict:
+        f = self._find_output_file(name)
+        if f is None:
+            return {}
+        with exiftool.ExifToolHelper() as et:
+            result = et.get_tags([str(f)], tags)
+            return result[0] if result else {}
+
+    def test_fallback_tz_zero_errors(self) -> None:
+        """No errors during the fallback timezone merger run."""
+        self.assertEqual(self.stats.errors, 0,
+                         f"Expected 0 errors, got {self.stats.errors}")
+
+    def test_fallback_tz_matched_jpg_datetime(self) -> None:
+        """Matched JPG with no EXIF tz: DateTimeOriginal uses fallback -05:00.
+
+        epoch 1723117446 = 2024-08-08 11:44:06 UTC → -05:00 → 06:44:06.
+        """
+        tags = self._read_tags('fb_matched.jpg',
+                               ['EXIF:DateTimeOriginal', 'EXIF:OffsetTimeOriginal'])
+        dt = str(tags.get('EXIF:DateTimeOriginal', ''))
+        offset = str(tags.get('EXIF:OffsetTimeOriginal', ''))
+        self.assertIn('2024:08:08 06:44:06', dt,
+                      f"Expected 06:44:06 (-05:00 from UTC 11:44:06), got {dt!r}")
+        self.assertIn('-05:00', offset,
+                      f"Expected offset -05:00, got {offset!r}")
+
+    def test_fallback_tz_sidecar_png_datetime(self) -> None:
+        """PNG sidecar: XMP dates use fallback -05:00.
+
+        epoch 1723117446 = 2024-08-08 11:44:06 UTC → -05:00 → 06:44:06.
+        """
+        tags = self._read_tags('fb_sidecar.png.xmp',
+                               ['XMP:DateTimeOriginal', 'XMP:CreateDate'])
+        for tag in ('XMP:DateTimeOriginal', 'XMP:CreateDate'):
+            val = str(tags.get(tag, ''))
+            with self.subTest(tag=tag):
+                self.assertIn('2024:08:08 06:44:06', val,
+                              f"Expected 06:44:06, got {val!r}")
+                self.assertIn('-05:00', val,
+                              f"Expected -05:00 in {val!r}")
+
+    def test_fallback_tz_sidecar_avi_datetime(self) -> None:
+        """AVI sidecar: XMP dates use fallback -05:00.
+
+        epoch 1723117446 = 2024-08-08 11:44:06 UTC → -05:00 → 06:44:06.
+        """
+        tags = self._read_tags('fb_video.avi.xmp',
+                               ['XMP:DateTimeOriginal', 'XMP:CreateDate'])
+        for tag in ('XMP:DateTimeOriginal', 'XMP:CreateDate'):
+            val = str(tags.get(tag, ''))
+            with self.subTest(tag=tag):
+                self.assertIn('2024:08:08 06:44:06', val,
+                              f"Expected 06:44:06, got {val!r}")
+                self.assertIn('-05:00', val,
+                              f"Expected -05:00 in {val!r}")
+
+    def test_fallback_tz_exif_wins_over_fallback(self) -> None:
+        """File with embedded EXIF timezone +08:00: EXIF wins, fallback ignored.
+
+        epoch 1723117446 = 2024-08-08 11:44:06 UTC → +08:00 → 19:44:06.
+        """
+        tags = self._read_tags('fb_has_exif.jpg',
+                               ['EXIF:DateTimeOriginal', 'EXIF:OffsetTimeOriginal'])
+        dt = str(tags.get('EXIF:DateTimeOriginal', ''))
+        offset = str(tags.get('EXIF:OffsetTimeOriginal', ''))
+        self.assertIn('2024:08:08 19:44:06', dt,
+                      f"Expected 19:44:06 (+08:00 from UTC 11:44:06), got {dt!r}")
+        self.assertIn('+08:00', offset,
+                      f"Expected offset +08:00, got {offset!r}")
+
+    def test_fallback_tz_output_organized_by_fallback_date(self) -> None:
+        """Matched file is organized by local date in the fallback timezone.
+
+        2024-08-08 06:44:06 -05:00 → year=2024, month=08.
+        """
+        f = self._find_output_file('fb_matched.jpg')
+        self.assertIsNotNone(f, "fb_matched.jpg not found in output")
+        self.assertIn('2024', str(f))
+        self.assertIn('08', str(f))
 
 
 # ---------------------------------------------------------------------------

@@ -19,7 +19,7 @@ Google Photos Export Merger — a Python utility that merges JSON metadata from 
 python JsonKeyExtractor.py <input_directory> [output_directory]
 
 # Merge metadata into media files (uses all CPU cores by default)
-python GooglePhotosExportMerger.py <input_dir> <output_dir> [--dry-run] [--workers N] [--strip-metadata [PROFILE ...]] [--tz-override "START_UTC,END_UTC,OFFSET" ...]
+python GooglePhotosExportMerger.py <input_dir> <output_dir> [--dry-run] [--workers N] [--strip-metadata [PROFILE ...]] [--tz-fallback OFFSET] [--tz-override "START_UTC,END_UTC,OFFSET" ...]
 
 # Run tests
 python -m pytest TestMerger.py
@@ -29,7 +29,7 @@ python -m pytest TestMerger.py
 
 `TestMerger.py` is a comprehensive `unittest`-based test suite with 185+ test methods (including subtests). It runs as a single-pass integration test: `setUpClass` builds an input tree with programmatically generated binary test files (JPEG, PNG, GIF, TIFF, CR2, DNG, HEIC, MP4, MOV, AVI, MKV, WebM — including variants with embedded EXIF timezone offsets and Nikon maker-note dates), runs the merger once, then individual tests assert on the output. Test categories include: input integrity, output structure, GPS (8 compass directions × 12 formats), timezones (including sidecar timezone verification), descriptions (UTF-8, escaping, newlines, blocked, IPTC), file types, orphan files, XMP conditional dates, XMP sidecars, duplicates, bracket notation, file timestamps, stats verification, video UTC time, special filenames, EXIF preservation, extension mismatch, video XMP dates (including Nikon maker-note sidecar fixup), metadata stripping (profile building and default-off verification), infrastructure validation, and single-worker (serial) mode.
 
-Separate test classes exercise features that require different merger configurations: `TestMetadataStripping` (runs with strip params enabled), `TestTimezoneOverride` (runs with `--tz-override` ranges to verify override/fallback/EXIF-priority behaviour for matched files, orphans, and sidecars), and `TestSingleWorker` (re-runs with `num_workers=1`).
+Separate test classes exercise features that require different merger configurations: `TestMetadataStripping` (runs with strip params enabled), `TestTimezoneOverride` (runs with `--tz-override` ranges to verify override/fallback/EXIF-priority behaviour for matched files, orphans, and sidecars), `TestFallbackTimezone` (runs with a non-default `--tz-fallback` to verify the custom fallback timezone is applied to files without EXIF timezone), and `TestSingleWorker` (re-runs with `num_workers=1`).
 
 ## Architecture
 
@@ -59,7 +59,8 @@ Five modules with clear separation of concerns:
 - Orphan files (no matching JSON) are still copied; dates resolved from existing EXIF or filesystem creation date
 - Duplicate output filenames resolved by appending `_2`, `_3`, etc. (including renaming associated sidecars)
 - Metadata stripping (`--strip-metadata`): optional post-write ExifTool pass that removes unwanted metadata groups from output files. Controlled by named profiles defined in `METADATA_STRIP_PROFILES` (currently `google` and `photoshop`). The special name `all` enables every profile. Strip params are stored on `MediaFileInfo.strip_metadata_params` so they are available to parallel workers. Non-QuickTime video containers are skipped (ExifTool cannot modify them in-place)
-- Timezone overrides (`--tz-override`): repeatable option that specifies UTC time ranges and a timezone offset. When a file has no EXIF timezone and its UTC timestamp falls within an override range, the override timezone is used instead of the GMT+02:00 fallback. Defined via `TimezoneOverride` dataclass in `AbstractMediaMerger.py`. `_find_tz_override()` does linear scan of overrides (first match wins). Applies to both matched and orphan files. For orphans resolved from EXIF dates (which are naive/local), the parsed datetime is treated as a UTC approximation for range matching
+- Timezone fallback (`--tz-fallback`): sets the fallback timezone offset used when no EXIF timezone is found and no `--tz-override` matches. Defaults to the host machine's local timezone if not specified. Stored on `self.fallback_tz` and propagated to parallel workers via `MediaFileInfo.fallback_tz`
+- Timezone overrides (`--tz-override`): repeatable option that specifies UTC time ranges and a timezone offset. When a file has no EXIF timezone and its UTC timestamp falls within an override range, the override timezone is used instead of the fallback timezone. Defined via `TimezoneOverride` dataclass in `AbstractMediaMerger.py`. `_find_tz_override()` does linear scan of overrides (first match wins). Applies to both matched and orphan files. For orphans resolved from EXIF dates (which are naive/local), the parsed datetime is treated as a UTC approximation for range matching
 - `.gitignore` excludes all media and JSON files — only Python source is tracked
 
 ## Pipeline Steps

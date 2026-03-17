@@ -13,7 +13,8 @@ class TimezoneOverride:
 
     When a media file has no embedded timezone and its UTC timestamp falls
     within [start_utc, end_utc], the given *tz* is used instead of the
-    system default (GMT+02:00).  Useful for travel photos taken in a
+    fallback timezone (configurable via ``--tz-fallback``; defaults to the
+    host machine's timezone).  Useful for travel photos taken in a
     different timezone.
     """
     start_utc: datetime   # inclusive, must be timezone-aware (UTC)
@@ -57,6 +58,15 @@ class MediaFileInfo:
     # file (e.g. ['-XMP-GCamera:All=', '-Google:All=']).  Set once during
     # pre-extraction and shared across all files; None when stripping is off.
     strip_metadata_params: Optional[List[str]] = None
+    # Whether the source file actually contains metadata targeted by
+    # strip_metadata_params.  Determined during the batch EXIF read in
+    # _resolve_dates_and_paths so that _do_strip_metadata can skip files
+    # with nothing to strip (avoiding a per-file ExifTool round-trip).
+    has_strip_metadata: bool = False
+    # Fallback timezone used when no EXIF timezone is found and no
+    # --tz-override matches.  Set during pre-extraction so parallel workers
+    # have access.  None until set by _resolve_dates_and_paths.
+    fallback_tz: Optional[timezone] = None
 
 
 @dataclass
@@ -115,7 +125,8 @@ class AbstractMediaMerger(ABC):
     def __init__(self, input_dir: str, output_dir: str, dry_run: bool = False,
                  blocked_descriptions=None, num_workers: int = 1,
                  metadata_strip_params: Optional[List[str]] = None,
-                 tz_overrides: Optional[List[TimezoneOverride]] = None):
+                 tz_overrides: Optional[List[TimezoneOverride]] = None,
+                 fallback_tz: Optional[timezone] = None):
         self.input_path = Path(input_dir).resolve()
         self.output_path = Path(output_dir).resolve()
         self.dry_run = dry_run
@@ -123,6 +134,12 @@ class AbstractMediaMerger(ABC):
         self.blocked_descriptions: set = set(blocked_descriptions) if blocked_descriptions else set()
         self.metadata_strip_params: Optional[List[str]] = metadata_strip_params
         self.tz_overrides: List[TimezoneOverride] = tz_overrides or []
+        # Fallback timezone: use the provided value, or detect the host
+        # machine's local UTC offset as a fixed-offset timezone.
+        if fallback_tz is not None:
+            self.fallback_tz: timezone = fallback_tz
+        else:
+            self.fallback_tz = datetime.now(timezone.utc).astimezone().tzinfo
         self.logger = logging.getLogger(self.__class__.__name__)
         self.logger.setLevel(logging.DEBUG)
         if not self.logger.handlers:
@@ -133,6 +150,14 @@ class AbstractMediaMerger(ABC):
 
     def run(self) -> MergeStats:
         stats = MergeStats()
+
+        # Log the fallback timezone that will be used for files without EXIF tz
+        _fb_offset = self.fallback_tz.utcoffset(None)
+        _fb_secs = int(_fb_offset.total_seconds())
+        _fb_sign = '+' if _fb_secs >= 0 else '-'
+        _fb_secs = abs(_fb_secs)
+        _fb_str = f"{_fb_sign}{_fb_secs // 3600:02d}:{(_fb_secs % 3600) // 60:02d}"
+        self.logger.info("Fallback timezone: %s", _fb_str)
 
         # Step 1: Validate directories
         self._validate_directories()

@@ -87,7 +87,6 @@ CONDITIONAL_DATE_TAGS: Dict[str, Any] = {
 # Read-tag list for batch reads (keys of the mapping above).
 CONDITIONAL_DATE_READ_TAGS: List[str] = list(CONDITIONAL_DATE_TAGS.keys())
 
-GMT_PLUS_2 = timezone(timedelta(hours=2))
 
 # ---------------------------------------------------------------------------
 # Metadata stripping profiles
@@ -619,8 +618,10 @@ def _do_set_filesystem_timestamps(et, info: MediaFileInfo, logger: logging.Logge
     if info.resolved_datetime is None:
         return
 
-    gmt2_dt = info.resolved_datetime.astimezone(GMT_PLUS_2)
-    dt_str = gmt2_dt.strftime('%Y:%m:%d %H:%M:%S') + '+02:00'
+    fb_tz = info.fallback_tz or timezone.utc
+    local_dt = info.resolved_datetime.astimezone(fb_tz)
+    tz_str = _format_tz_offset(fb_tz)
+    dt_str = local_dt.strftime('%Y:%m:%d %H:%M:%S') + tz_str
 
     files_to_update = [info.output_path]
     if info.sidecar_path and info.sidecar_path.exists():
@@ -643,12 +644,19 @@ def _do_strip_metadata(et, info: MediaFileInfo, stats: MergeStats,
                        logger: logging.Logger):
     """Remove unwanted metadata groups from the output file.
 
-    Only runs when info.strip_metadata_params is set (non-None, non-empty).
+    Only runs when info.strip_metadata_params is set (non-None, non-empty)
+    **and** the source file was found to contain metadata targeted by those
+    params during the batch EXIF read in _resolve_dates_and_paths (stored
+    as info.has_strip_metadata).  Skips files with nothing to strip,
+    avoiding unnecessary ExifTool calls and log noise.
+
     Operates on the output file in-place after all other writes are complete.
     Video containers that ExifTool cannot write to (AVI, MKV, WebM) are
     skipped — their metadata lives in the XMP sidecar which is built fresh.
     """
     if not info.strip_metadata_params:
+        return
+    if not info.has_strip_metadata:
         return
     if not info.output_path or not info.output_path.exists():
         return
@@ -712,11 +720,13 @@ class GooglePhotosExportMerger(AbstractMediaMerger):
                  blocked_descriptions: Optional[List[str]] = None,
                  num_workers: int = 1,
                  metadata_strip_params: Optional[List[str]] = None,
-                 tz_overrides: Optional[List[TimezoneOverride]] = None):
+                 tz_overrides: Optional[List[TimezoneOverride]] = None,
+                 fallback_tz: Optional[timezone] = None):
         super().__init__(input_dir, output_dir, dry_run, blocked_descriptions,
                          num_workers=num_workers,
                          metadata_strip_params=metadata_strip_params,
-                         tz_overrides=tz_overrides)
+                         tz_overrides=tz_overrides,
+                         fallback_tz=fallback_tz)
 
     def _open_writer(self) -> None:
         self._et_helper = exiftool.ExifToolHelper()
@@ -853,6 +863,14 @@ class GooglePhotosExportMerger(AbstractMediaMerger):
             else:
                 matched_by_dir[info.source_path.parent].append(info)
 
+        # Derive read-tag names from strip params (e.g. "-XMP-GCamera:All="
+        # → "XMP-GCamera:All") so the batch read can detect whether each
+        # source file actually contains metadata that needs stripping.
+        strip_read_tags: List[str] = []
+        if self.metadata_strip_params:
+            strip_read_tags = [p.lstrip('-').rstrip('=')
+                               for p in self.metadata_strip_params]
+
         # Resolve timezone for matched files (batch read per directory)
         for dir_path, infos in matched_by_dir.items():
             file_paths = [str(info.source_path) for info in infos]
@@ -929,9 +947,9 @@ class GooglePhotosExportMerger(AbstractMediaMerger):
                         self.logger.info("No timezone in EXIF for %s, using override %s",
                                          self._rel(info.source_path), _format_tz_offset(tz))
                     else:
-                        tz = GMT_PLUS_2
-                        self.logger.info("No timezone in EXIF for %s, using GMT+02:00 fallback",
-                                         self._rel(info.source_path))
+                        tz = self.fallback_tz
+                        self.logger.info("No timezone in EXIF for %s, using %s fallback",
+                                         self._rel(info.source_path), _format_tz_offset(tz))
 
                 utc_dt = datetime.fromtimestamp(epoch, tz=timezone.utc)
                 local_dt = utc_dt.astimezone(tz)
@@ -939,6 +957,21 @@ class GooglePhotosExportMerger(AbstractMediaMerger):
                 info.date_source = 'json_photoTakenTime'
                 info.year = local_dt.strftime('%Y')
                 info.month = local_dt.strftime('%m')
+
+            # Separate batch read for strip-metadata detection.
+            # ExifTool normalises group names in returned keys (e.g.
+            # XMP-GCamera:All → XMP:SpecialTypeID), so we cannot match
+            # returned keys against strip param names.  Instead we query
+            # only the strip tags and flag any file whose result contains
+            # keys beyond the always-present SourceFile.
+            if strip_read_tags:
+                try:
+                    strip_results = self._et.get_tags(file_paths, strip_read_tags)
+                except Exception:
+                    strip_results = [{} for _ in infos]
+                for info, sr in zip(infos, strip_results):
+                    if len(sr) > 1:
+                        info.has_strip_metadata = True
 
         # Resolve dates for orphan files (batch read per directory)
         for dir_path, infos in orphans_by_dir.items():
@@ -993,8 +1026,8 @@ class GooglePhotosExportMerger(AbstractMediaMerger):
                             # approximation for range matching.
                             approx_utc = parsed.replace(tzinfo=timezone.utc)
                             override_tz = _find_tz_override(approx_utc, self.tz_overrides)
-                            fallback_tz = override_tz if override_tz is not None else GMT_PLUS_2
-                            resolved_dt = parsed.replace(tzinfo=fallback_tz)
+                            resolved_tz = override_tz if override_tz is not None else self.fallback_tz
+                            resolved_dt = parsed.replace(tzinfo=resolved_tz)
                             date_source = tag_key
                             stats.date_from_exif += 1
                             break
@@ -1007,8 +1040,8 @@ class GooglePhotosExportMerger(AbstractMediaMerger):
                         ctime = info.source_path.stat().st_ctime
                         utc_ctime = datetime.fromtimestamp(ctime, tz=timezone.utc)
                         override_tz = _find_tz_override(utc_ctime, self.tz_overrides)
-                        fallback_tz = override_tz if override_tz is not None else GMT_PLUS_2
-                        resolved_dt = datetime.fromtimestamp(ctime, tz=fallback_tz)
+                        resolved_tz = override_tz if override_tz is not None else self.fallback_tz
+                        resolved_dt = datetime.fromtimestamp(ctime, tz=resolved_tz)
                         date_source = 'file_creation_date'
                         stats.date_from_filesystem += 1
                         self.logger.warning("Using file creation date for orphan: %s", self._rel(info.source_path))
@@ -1020,6 +1053,17 @@ class GooglePhotosExportMerger(AbstractMediaMerger):
                     info.date_source = date_source
                     info.year = resolved_dt.strftime('%Y')
                     info.month = resolved_dt.strftime('%m')
+
+            # Separate batch read for strip-metadata detection (see matched
+            # files above for rationale).
+            if strip_read_tags:
+                try:
+                    strip_results = self._et.get_tags(file_paths, strip_read_tags)
+                except Exception:
+                    strip_results = [{} for _ in infos]
+                for info, sr in zip(infos, strip_results):
+                    if len(sr) > 1:
+                        info.has_strip_metadata = True
 
         # Build output paths
         for info in media_files:
@@ -1050,6 +1094,7 @@ class GooglePhotosExportMerger(AbstractMediaMerger):
                 info.gps = _resolve_gps(info.json_data)
                 info.json_data = None
             info.strip_metadata_params = self.metadata_strip_params
+            info.fallback_tz = self.fallback_tz
 
     def _process_matched(self, info: MediaFileInfo, stats: MergeStats):
         if self.dry_run:
@@ -1091,54 +1136,87 @@ class GooglePhotosExportMerger(AbstractMediaMerger):
 
 
 if __name__ == '__main__':
-    if len(sys.argv) < 3:
-        _profiles = ', '.join(METADATA_STRIP_PROFILES.keys())
-        print(f"Usage: python {sys.argv[0]} <input_dir> <output_dir> [--dry-run] [--workers N]")
-        print(f"       [--strip-metadata [PROFILE ...]] [--tz-override \"START_UTC,END_UTC,OFFSET\" ...]")
-        print(f"\nStrip profiles: {_profiles}, all")
-        print(f"\nTimezone override example:")
-        print(f'  --tz-override "2019-11-20 02:00:00,2019-11-22 17:00:50,-05:30"')
-        sys.exit(1)
+    import argparse
 
-    input_dir = sys.argv[1]
-    output_dir = sys.argv[2]
-    dry_run = '--dry-run' in sys.argv
+    _profiles = ', '.join(METADATA_STRIP_PROFILES.keys())
 
-    # Parse --workers N (default: CPU count)
-    num_workers = os.cpu_count() or 1
-    for i, arg in enumerate(sys.argv):
-        if arg == '--workers' and i + 1 < len(sys.argv):
-            try:
-                num_workers = int(sys.argv[i + 1])
-            except ValueError:
-                print(f"Invalid --workers value: {sys.argv[i + 1]}")
-                sys.exit(1)
+    parser = argparse.ArgumentParser(
+        prog='GooglePhotosExportMerger.py',
+        description=(
+            'Merge JSON metadata from Google Photos Takeout exports into '
+            'image/video EXIF properties using ExifTool.  Copies files into '
+            'a date-organized output directory (YYYY/MM/filename).'
+        ),
+        epilog=(
+            'examples:\n'
+            '  # Basic merge\n'
+            '  python GooglePhotosExportMerger.py input/ output/\n'
+            '\n'
+            '  # Dry run — preview without writing\n'
+            '  python GooglePhotosExportMerger.py input/ output/ --dry-run\n'
+            '\n'
+            '  # Use 4 workers and strip Google metadata\n'
+            '  python GooglePhotosExportMerger.py input/ output/ --workers 4 --strip-metadata google\n'
+            '\n'
+            '  # Set fallback timezone and override for a trip\n'
+            '  python GooglePhotosExportMerger.py input/ output/ \\\n'
+            '    --tz-fallback "+02:00" \\\n'
+            '    --tz-override "2019-11-20 02:00:00,2019-11-22 17:00:50,+05:30"\n'
+        ),
+        formatter_class=argparse.RawDescriptionHelpFormatter,
+    )
+    parser.add_argument('input_dir',
+                        help='Root of the Google Photos Takeout export.')
+    parser.add_argument('output_dir',
+                        help='Destination directory (created if needed). '
+                             'Must not be inside input_dir.')
+    parser.add_argument('--dry-run', action='store_true',
+                        help='Simulate the merge without writing any files.')
+    parser.add_argument('--workers', type=int, default=os.cpu_count() or 1,
+                        metavar='N',
+                        help='Number of parallel worker processes '
+                             '(default: CPU count = %(default)s).')
+    parser.add_argument('--strip-metadata', nargs='*', default=None,
+                        metavar='PROFILE',
+                        help=f'Remove unwanted metadata groups from output files. '
+                             f'Available profiles: {_profiles}, all.  '
+                             f'With no profile names, all profiles are enabled.')
+    parser.add_argument('--tz-fallback', default=None, metavar='OFFSET',
+                        help='Fallback timezone offset (e.g. +02:00, -05:30) '
+                             'used when no EXIF timezone is found and no '
+                             '--tz-override matches.  Defaults to the host '
+                             "machine's local timezone.")
+    parser.add_argument('--tz-override', action='append', default=[],
+                        metavar='"START_UTC,END_UTC,OFFSET"',
+                        help='Override the fallback timezone for files whose '
+                             'UTC timestamp falls within the given range.  '
+                             'Repeatable.  Format: '
+                             '"YYYY-MM-DD HH:MM:SS,YYYY-MM-DD HH:MM:SS,+HH:MM".')
 
-    # Parse --strip-metadata [PROFILE ...]
-    # With no profile names: enables all profiles.
-    # With profile names: enables only the listed profiles.
+    args = parser.parse_args()
+
+    # Resolve strip profiles
     strip_profiles: Optional[List[str]] = None
-    for i, arg in enumerate(sys.argv):
-        if arg == '--strip-metadata':
-            profiles: List[str] = []
-            for j in range(i + 1, len(sys.argv)):
-                val = sys.argv[j]
-                if val.startswith('--'):
-                    break
-                profiles.append(val)
-            strip_profiles = profiles if profiles else ['all']
-            break
+    if args.strip_metadata is not None:
+        strip_profiles = args.strip_metadata if args.strip_metadata else ['all']
     metadata_strip_params = _build_strip_params(strip_profiles)
 
-    # Parse --tz-override "START_UTC,END_UTC,OFFSET" (repeatable)
+    # Resolve timezone overrides
     tz_overrides: List[TimezoneOverride] = []
-    for i, arg in enumerate(sys.argv):
-        if arg == '--tz-override' and i + 1 < len(sys.argv):
-            try:
-                tz_overrides.append(_parse_tz_override(sys.argv[i + 1]))
-            except ValueError as e:
-                print(f"Invalid --tz-override: {e}")
-                sys.exit(1)
+    for val in args.tz_override:
+        try:
+            tz_overrides.append(_parse_tz_override(val))
+        except ValueError as e:
+            parser.error(f"Invalid --tz-override: {e}")
+
+    # Resolve fallback timezone
+    fallback_tz: Optional[timezone] = None
+    if args.tz_fallback is not None:
+        fallback_tz = _parse_tz_offset(args.tz_fallback)
+        if fallback_tz is None:
+            parser.error(
+                f"Invalid --tz-fallback value: {args.tz_fallback!r}\n"
+                "Expected format: +HH:MM or -HH:MM (e.g. +02:00, -05:30)")
 
     blocked_descriptions = [
         # Add unwanted description strings here, e.g.:
@@ -1151,9 +1229,11 @@ if __name__ == '__main__':
         "DCIM\\100MEDIA\\DJI_0040.JPG",
     ]
 
-    merger = GooglePhotosExportMerger(input_dir, output_dir, dry_run=dry_run,
+    merger = GooglePhotosExportMerger(args.input_dir, args.output_dir,
+                                     dry_run=args.dry_run,
                                      blocked_descriptions=blocked_descriptions,
-                                     num_workers=num_workers,
+                                     num_workers=args.workers,
                                      metadata_strip_params=metadata_strip_params,
-                                     tz_overrides=tz_overrides or None)
+                                     tz_overrides=tz_overrides or None,
+                                     fallback_tz=fallback_tz)
     result = merger.run()
