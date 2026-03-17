@@ -674,9 +674,9 @@ def _do_strip_metadata(et, info: MediaFileInfo, stats: MergeStats,
     try:
         _execute_et(et, params)
         stats.metadata_stripped += 1
-        logger.debug("Stripped metadata from %s", info.output_path.name)
+        logger.info("Stripped metadata from %s", info.output_path.name)
     except Exception as e:
-        logger.debug("Metadata strip warnings for %s: %s", info.output_path.name, e)
+        logger.warning("Metadata strip warnings for %s: %s", info.output_path.name, e)
 
 def _setup_worker_logging() -> logging.Logger:
     """Configure and return a logger for the current worker process."""
