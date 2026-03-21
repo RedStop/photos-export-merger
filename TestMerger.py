@@ -2420,6 +2420,21 @@ class TestPhotosExportMerger(unittest.TestCase):
         self.assertEqual(self.stats.skipped_existing, 0,
                          f"Expected 0 skipped_existing, got {self.stats.skipped_existing}")
 
+    def test_stats_jpeg_compressed_disabled(self) -> None:
+        """jpeg_compressed = 0 when --jpeg-quality is not set."""
+        self.assertEqual(self.stats.jpeg_compressed, 0,
+                         f"Expected 0 jpeg_compressed, got {self.stats.jpeg_compressed}")
+
+    def test_stats_jpeg_quality_checked_disabled(self) -> None:
+        """jpeg_quality_checked = 0 when --jpeg-quality is not set."""
+        self.assertEqual(self.stats.jpeg_quality_checked, 0,
+                         f"Expected 0 jpeg_quality_checked, got {self.stats.jpeg_quality_checked}")
+
+    def test_stats_jpeg_quality_unknown_disabled(self) -> None:
+        """jpeg_quality_unknown = 0 when --jpeg-quality is not set."""
+        self.assertEqual(self.stats.jpeg_quality_unknown, 0,
+                         f"Expected 0 jpeg_quality_unknown, got {self.stats.jpeg_quality_unknown}")
+
     # ------------------------------------------------------------------
     # Category 13 — Video UTC Time
     # ------------------------------------------------------------------
@@ -3661,6 +3676,315 @@ class TestFallbackTimezone(unittest.TestCase):
 
 
 # ---------------------------------------------------------------------------
+# JPEG compression integration test
+# ---------------------------------------------------------------------------
+
+def _make_pillow_jpeg(quality: int, seed: int = 42) -> bytes:
+    """Generate a 64×64 random-noise JPEG at the given Pillow quality level.
+
+    Uses a fixed seed for deterministic output.  The random noise ensures
+    ExifTool's JPEGQualityEstimate returns meaningful values (flat-colour
+    images produce unreliable estimates).
+
+    Returns raw JPEG bytes (no EXIF metadata — Pillow strips it by default).
+    """
+    import random as _rng
+    from PIL import Image as _Img
+    from io import BytesIO as _Bio
+
+    r = _rng.Random(seed)
+    img = _Img.new('RGB', (64, 64))
+    img.putdata([(r.randint(0, 255), r.randint(0, 255), r.randint(0, 255))
+                 for _ in range(64 * 64)])
+    buf = _Bio()
+    img.save(buf, format='JPEG', quality=quality)
+    img.close()
+    return buf.getvalue()
+
+
+class TestJpegCompression(unittest.TestCase):
+    """Run the merger with --jpeg-quality and verify compression behaviour.
+
+    Builds a minimal input tree with Pillow-generated JPEGs at different
+    quality levels, runs the merger with jpeg_compress_quality=80, and
+    asserts that:
+    - A high-quality JPEG (q=98) is compressed (output smaller than source)
+    - A low-quality JPEG (q=50) is NOT compressed (output ≈ source size)
+    - An orphan high-quality JPEG is compressed
+    - All stats counters are correct
+    - Dates and metadata survive the compression pipeline
+    """
+
+    tmp_dir:    Path
+    input_dir:  Path
+    output_dir: Path
+    stats:      MergeStats
+    # Source file sizes for comparison
+    high_q_source_size: int
+    low_q_source_size:  int
+    orphan_source_size: int
+
+    _COMPRESS_QUALITY = 80
+
+    @classmethod
+    def setUpClass(cls) -> None:
+        cls.tmp_dir    = Path(tempfile.mkdtemp(prefix='gpem_jpeg_test_'))
+        cls.input_dir  = cls.tmp_dir / 'input'
+        cls.output_dir = cls.tmp_dir / 'output'
+        cls.input_dir.mkdir()
+
+        d = cls.input_dir / 'JpegCompress'
+        d.mkdir(parents=True)
+
+        # High-quality matched JPEG (q=98, above threshold → should compress)
+        high_q_bytes = _make_pillow_jpeg(quality=98, seed=42)
+        (d / 'high_quality.jpg').write_bytes(high_q_bytes)
+        cls.high_q_source_size = len(high_q_bytes)
+        make_json_file(d / 'high_quality.jpg.json', title='high_quality.jpg')
+
+        # Low-quality matched JPEG (q=50, below threshold → should NOT compress)
+        low_q_bytes = _make_pillow_jpeg(quality=50, seed=42)
+        (d / 'low_quality.jpg').write_bytes(low_q_bytes)
+        cls.low_q_source_size = len(low_q_bytes)
+        make_json_file(d / 'low_quality.jpg.json', title='low_quality.jpg')
+
+        # High-quality orphan JPEG (no JSON → orphan, should still compress)
+        orphan_bytes = _make_pillow_jpeg(quality=98, seed=99)
+        (d / 'orphan_high.jpg').write_bytes(orphan_bytes)
+        cls.orphan_source_size = len(orphan_bytes)
+
+        # Non-JPEG file (should be untouched by compression logic)
+        make_media_file(d / 'not_a_jpeg.png')
+        make_json_file(d / 'not_a_jpeg.png.json', title='not_a_jpeg.png')
+
+        # Run merger with JPEG compression enabled
+        merger = PhotosExportMerger(
+            str(cls.input_dir),
+            str(cls.output_dir),
+            num_workers=1,
+            fallback_tz=timezone(timedelta(hours=2)),
+            jpeg_compress_quality=cls._COMPRESS_QUALITY,
+        )
+        cls.stats = merger.run()
+
+    @classmethod
+    def tearDownClass(cls) -> None:
+        tmp = getattr(cls, 'tmp_dir', None)
+        if tmp is not None:
+            shutil.rmtree(str(tmp), ignore_errors=True)
+
+    def _find_output_file(self, name: str) -> 'Path | None':
+        for f in self.output_dir.rglob('*'):
+            if f.is_file() and f.name == name:
+                return f
+        return None
+
+    def _read_tags(self, name: str, tags: list) -> dict:
+        f = self._find_output_file(name)
+        if f is None:
+            return {}
+        with exiftool.ExifToolHelper() as et:
+            result = et.get_tags([str(f)], tags)
+            return result[0] if result else {}
+
+    # -- File existence --
+
+    def test_jpeg_compress_high_exists(self) -> None:
+        """High-quality JPEG output exists."""
+        self.assertIsNotNone(self._find_output_file('high_quality.jpg'))
+
+    def test_jpeg_compress_low_exists(self) -> None:
+        """Low-quality JPEG output exists."""
+        self.assertIsNotNone(self._find_output_file('low_quality.jpg'))
+
+    def test_jpeg_compress_orphan_exists(self) -> None:
+        """Orphan high-quality JPEG output exists."""
+        self.assertIsNotNone(self._find_output_file('orphan_high.jpg'))
+
+    def test_jpeg_compress_png_exists(self) -> None:
+        """Non-JPEG file output exists (unaffected by compression)."""
+        self.assertIsNotNone(self._find_output_file('not_a_jpeg.png'))
+
+    # -- Compression happened / didn't --
+
+    def test_jpeg_compress_high_was_compressed(self) -> None:
+        """High-quality JPEG (q=98) output is smaller than source (was compressed)."""
+        f = self._find_output_file('high_quality.jpg')
+        self.assertIsNotNone(f)
+        output_size = f.stat().st_size
+        self.assertLess(output_size, self.high_q_source_size,
+                        f"high_quality.jpg should be compressed: "
+                        f"output={output_size} vs source={self.high_q_source_size}")
+
+    def test_jpeg_compress_low_not_compressed(self) -> None:
+        """Low-quality JPEG (q=50) output is NOT smaller than source (copied as-is).
+
+        The output may be slightly larger due to metadata written by ExifTool,
+        so we check that it is NOT significantly smaller (i.e. not recompressed).
+        A recompressed-at-80 file from a q=50 source would be larger anyway,
+        but the key signal is that _needs_jpeg_compression returned False.
+        """
+        f = self._find_output_file('low_quality.jpg')
+        self.assertIsNotNone(f)
+        output_size = f.stat().st_size
+        # Output should be at least as large as source (metadata adds bytes).
+        # A recompressed file from q=50 source at q=80 would actually be larger,
+        # but the point is that the compression path was NOT taken.
+        self.assertGreaterEqual(output_size, self.low_q_source_size,
+                                f"low_quality.jpg should NOT be compressed: "
+                                f"output={output_size} vs source={self.low_q_source_size}")
+
+    def test_jpeg_compress_orphan_was_compressed(self) -> None:
+        """Orphan high-quality JPEG output is smaller than source (was compressed)."""
+        f = self._find_output_file('orphan_high.jpg')
+        self.assertIsNotNone(f)
+        output_size = f.stat().st_size
+        self.assertLess(output_size, self.orphan_source_size,
+                        f"orphan_high.jpg should be compressed: "
+                        f"output={output_size} vs source={self.orphan_source_size}")
+
+    # -- Metadata survives compression --
+
+    def test_jpeg_compress_dates_preserved(self) -> None:
+        """Compressed JPEG has DateTimeOriginal written by the merger."""
+        tags = self._read_tags('high_quality.jpg',
+                               ['EXIF:DateTimeOriginal', 'EXIF:CreateDate'])
+        dt = tags.get('EXIF:DateTimeOriginal') or tags.get('EXIF:CreateDate')
+        self.assertIsNotNone(dt,
+                             "high_quality.jpg: dates should survive compression")
+
+    def test_jpeg_compress_orphan_dates_preserved(self) -> None:
+        """Compressed orphan JPEG retains date metadata."""
+        tags = self._read_tags('orphan_high.jpg',
+                               ['EXIF:DateTimeOriginal', 'EXIF:CreateDate'])
+        # Orphan dates come from EXIF or filesystem — Pillow-generated files
+        # have no EXIF dates, so the merger uses filesystem creation date.
+        # Either way, some date should be set.
+        dt = tags.get('EXIF:DateTimeOriginal') or tags.get('EXIF:CreateDate')
+        self.assertIsNotNone(dt,
+                             "orphan_high.jpg: dates should survive compression")
+
+    # -- Stats counters --
+
+    def test_jpeg_compress_stats_zero_errors(self) -> None:
+        """No errors during the compression merger run."""
+        self.assertEqual(self.stats.errors, 0,
+                         f"Expected 0 errors, got {self.stats.errors}")
+
+    def test_jpeg_compress_stats_written(self) -> None:
+        """All 4 files written (3 JPEG + 1 PNG)."""
+        self.assertEqual(self.stats.written, 4,
+                         f"Expected 4 written, got {self.stats.written}")
+
+    def test_jpeg_compress_stats_compressed(self) -> None:
+        """jpeg_compressed = 2 (high_quality.jpg + orphan_high.jpg)."""
+        self.assertEqual(self.stats.jpeg_compressed, 2,
+                         f"Expected 2 jpeg_compressed, got {self.stats.jpeg_compressed}")
+
+    def test_jpeg_compress_stats_quality_checked(self) -> None:
+        """jpeg_quality_checked = 3 (all three JPEGs were checked)."""
+        self.assertEqual(self.stats.jpeg_quality_checked, 3,
+                         f"Expected 3 jpeg_quality_checked, got {self.stats.jpeg_quality_checked}")
+
+    def test_jpeg_compress_stats_quality_unknown(self) -> None:
+        """jpeg_quality_unknown = 0 (Pillow JPEGs have deterministic quality)."""
+        self.assertEqual(self.stats.jpeg_quality_unknown, 0,
+                         f"Expected 0 jpeg_quality_unknown, got {self.stats.jpeg_quality_unknown}")
+
+
+# ---------------------------------------------------------------------------
+# JPEG compression with full input tree (regression guard)
+# ---------------------------------------------------------------------------
+# Runs by default.  To skip (e.g. for faster iteration), set
+# GPEM_SKIP_JPEG_FULL_TREE=1 or pass --skip-jpeg-full-tree to the runner.
+
+class TestJpegCompressionWithFullTree(unittest.TestCase):
+    """Re-run the full input tree with --jpeg-quality to verify no regressions.
+
+    Uses the same _create_input_tree as the main test class and runs with
+    jpeg_compress_quality=80.  Verifies that all files are still written
+    successfully (same written count) and no errors occur — confirming the
+    JPEG compression code path doesn't break non-JPEG files or edge cases.
+    """
+
+    tmp_dir:    Path
+    input_dir:  Path
+    output_dir: Path
+    stats:      MergeStats
+
+    @classmethod
+    def setUpClass(cls) -> None:
+        if os.environ.get('GPEM_SKIP_JPEG_FULL_TREE') == '1':
+            raise unittest.SkipTest(
+                'JPEG full-tree tests skipped '
+                '(use --skip-jpeg-full-tree or set GPEM_SKIP_JPEG_FULL_TREE=1)')
+
+        logging.basicConfig(
+            format='%(levelname)s %(name)s: %(message)s',
+            level=logging.WARNING,
+        )
+
+        cls.tmp_dir    = Path(tempfile.mkdtemp(prefix='gpem_jpeg_full_test_'))
+        cls.input_dir  = cls.tmp_dir / 'input'
+        cls.output_dir = cls.tmp_dir / 'output'
+        cls.input_dir.mkdir()
+
+        # Reuse the main test class's input-tree builder.
+        saved_input_dir = getattr(TestPhotosExportMerger, 'input_dir', None)
+        TestPhotosExportMerger.input_dir = cls.input_dir
+        TestPhotosExportMerger._create_input_tree()
+        if saved_input_dir is not None:
+            TestPhotosExportMerger.input_dir = saved_input_dir
+
+        num_workers = os.cpu_count() or 1
+        merger = PhotosExportMerger(
+            str(cls.input_dir),
+            str(cls.output_dir),
+            blocked_descriptions=_BLOCKED_DESCRIPTIONS,
+            num_workers=num_workers,
+            fallback_tz=timezone(timedelta(hours=2)),
+            jpeg_compress_quality=80,
+        )
+        cls.stats = merger.run()
+
+    @classmethod
+    def tearDownClass(cls) -> None:
+        tmp = getattr(cls, 'tmp_dir', None)
+        if tmp is not None:
+            shutil.rmtree(str(tmp), ignore_errors=True)
+
+    def test_jpeg_full_tree_stats_written(self) -> None:
+        """All 184 files written when JPEG compression is enabled."""
+        self.assertEqual(self.stats.written, 184,
+                         f"Expected 184 written, got {self.stats.written}")
+
+    def test_jpeg_full_tree_stats_zero_errors(self) -> None:
+        """No errors with JPEG compression enabled on the full input tree."""
+        self.assertEqual(self.stats.errors, 0,
+                         f"Expected 0 errors, got {self.stats.errors}")
+
+    def test_jpeg_full_tree_stats_quality_checked(self) -> None:
+        """jpeg_quality_checked > 0 (the tree contains JPEG files)."""
+        self.assertGreater(self.stats.jpeg_quality_checked, 0,
+                           "Expected jpeg_quality_checked > 0 on full tree")
+
+    def test_jpeg_full_tree_stats_matched_count(self) -> None:
+        """Matched files still = 177 (compression doesn't affect matching)."""
+        self.assertEqual(self.stats.matched, 177,
+                         f"Expected 177 matched, got {self.stats.matched}")
+
+    def test_jpeg_full_tree_stats_orphan_count(self) -> None:
+        """Orphan files still = 7 (compression doesn't affect orphan detection)."""
+        self.assertEqual(self.stats.orphans, 7,
+                         f"Expected 7 orphans, got {self.stats.orphans}")
+
+    def test_jpeg_full_tree_stats_sidecars(self) -> None:
+        """Sidecar count still = 84 (JPEG compression doesn't affect sidecars)."""
+        self.assertEqual(self.stats.sidecars_created, 84,
+                         f"Expected 84 sidecars, got {self.stats.sidecars_created}")
+
+
+# ---------------------------------------------------------------------------
 if __name__ == '__main__':
 
     # ── Category mapping ─────────────────────────────────────────────────────
@@ -3697,6 +4021,7 @@ if __name__ == '__main__':
         ("Metadata Stripping",        ("test_strip_",)),
         ("Infrastructure Validation", ("test_infra_",)),
         ("Single Worker (serial)",    ("test_serial_",)),
+        ("JPEG Compression",          ("test_jpeg_",)),
     ]
 
     def _cat(name: str) -> str:
@@ -3742,6 +4067,10 @@ if __name__ == '__main__':
         '--single-worker', action='store_true',
         help='Also run single-worker (serial mode) regression tests',
     )
+    parser.add_argument(
+        '--skip-jpeg-full-tree', action='store_true',
+        help='Skip JPEG compression full-tree regression tests',
+    )
     args = parser.parse_args()
 
     # ── Early exit for --list-* ──────────────────────────────────────────────
@@ -3767,6 +4096,10 @@ if __name__ == '__main__':
     # ── Enable single-worker tests if requested ──────────────────────────────
     if args.single_worker:
         os.environ['GPEM_SINGLE_WORKER'] = '1'
+
+    # ── Skip JPEG full-tree tests if requested ──────────────────────────────
+    if args.skip_jpeg_full_tree:
+        os.environ['GPEM_SKIP_JPEG_FULL_TREE'] = '1'
 
     # ── Suite filter helper ──────────────────────────────────────────────────
     def _filter_suite(suite, categories, file_types):
@@ -3896,6 +4229,8 @@ if __name__ == '__main__':
     loader = unittest.TestLoader()
     suite = unittest.TestSuite()
     suite.addTests(loader.loadTestsFromTestCase(TestPhotosExportMerger))
+    suite.addTests(loader.loadTestsFromTestCase(TestJpegCompression))
+    suite.addTests(loader.loadTestsFromTestCase(TestJpegCompressionWithFullTree))
     if args.single_worker:
         suite.addTests(loader.loadTestsFromTestCase(TestSingleWorker))
     if args.categories or args.file_types:

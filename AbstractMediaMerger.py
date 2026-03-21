@@ -67,6 +67,14 @@ class MediaFileInfo:
     # --tz-override matches.  Set during pre-extraction so parallel workers
     # have access.  None until set by _resolve_dates_and_paths.
     fallback_tz: Optional[timezone] = None
+    # JPEG quality estimate from ExifTool (0-100).  None when the source is
+    # not a JPEG or when ExifTool could not determine the quality.
+    jpeg_quality: Optional[int] = None
+    # Target JPEG compression quality threshold from CLI.  When set and the
+    # source is a JPEG whose estimated quality exceeds this value, Pillow
+    # recompresses the image.  None when JPEG compression is disabled.
+    # Propagated to workers alongside fallback_tz / strip_metadata_params.
+    jpeg_compress_quality: Optional[int] = None
 
 
 @dataclass
@@ -86,6 +94,9 @@ class MergeStats:
     ext_mismatches: int = 0
     skipped_existing: int = 0
     metadata_stripped: int = 0
+    jpeg_compressed: int = 0
+    jpeg_quality_unknown: int = 0
+    jpeg_quality_checked: int = 0
 
     def merge(self, other: 'MergeStats') -> None:
         """Add all counters from *other* into this instance.
@@ -103,6 +114,8 @@ class MergeStats:
         self.descriptions_cleared += other.descriptions_cleared
         self.skipped_existing += other.skipped_existing
         self.metadata_stripped += other.metadata_stripped
+        self.jpeg_compressed += other.jpeg_compressed
+        self.jpeg_quality_unknown += other.jpeg_quality_unknown
 
 
 def _resolve_gps(json_data: Dict[str, Any]) -> Optional[Dict[str, float]]:
@@ -126,7 +139,8 @@ class AbstractMediaMerger(ABC):
                  blocked_descriptions=None, num_workers: int = 1,
                  metadata_strip_params: Optional[List[str]] = None,
                  tz_overrides: Optional[List[TimezoneOverride]] = None,
-                 fallback_tz: Optional[timezone] = None):
+                 fallback_tz: Optional[timezone] = None,
+                 jpeg_compress_quality: Optional[int] = None):
         self.input_path = Path(input_dir).resolve()
         self.output_path = Path(output_dir).resolve()
         self.dry_run = dry_run
@@ -134,6 +148,7 @@ class AbstractMediaMerger(ABC):
         self.blocked_descriptions: set = set(blocked_descriptions) if blocked_descriptions else set()
         self.metadata_strip_params: Optional[List[str]] = metadata_strip_params
         self.tz_overrides: List[TimezoneOverride] = tz_overrides or []
+        self.jpeg_compress_quality: Optional[int] = jpeg_compress_quality
         # Fallback timezone: use the provided value, or detect the host
         # machine's local UTC offset as a fixed-offset timezone.
         if fallback_tz is not None:
@@ -371,6 +386,12 @@ class AbstractMediaMerger(ABC):
         self.logger.info("Errors:                       %d", stats.errors)
         if stats.metadata_stripped > 0:
             self.logger.info("Metadata stripped:            %d", stats.metadata_stripped)
+        if stats.jpeg_quality_checked > 0:
+            self.logger.info("JPEG quality checked:         %d", stats.jpeg_quality_checked)
+        if stats.jpeg_quality_unknown > 0:
+            self.logger.info("JPEG quality unknown:         %d", stats.jpeg_quality_unknown)
+        if stats.jpeg_compressed > 0:
+            self.logger.info("JPEG compressed:              %d", stats.jpeg_compressed)
         if stats.date_from_exif > 0:
             self.logger.info("Orphan dates from EXIF:       %d", stats.date_from_exif)
         if stats.date_from_filesystem > 0:

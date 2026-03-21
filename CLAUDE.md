@@ -10,7 +10,7 @@ Photos Export Merger — a Python utility that merges JSON metadata from Photos 
 
 - Python 3.10.11 (virtual environment in `.venv/`)
 - ExifTool 12.45 (must be in system PATH)
-- PyExifTool 0.5.6, sortedcontainers 2.4.0
+- PyExifTool 0.5.6, sortedcontainers 2.4.0, Pillow
 
 ## Running
 
@@ -19,7 +19,7 @@ Photos Export Merger — a Python utility that merges JSON metadata from Photos 
 python JsonKeyExtractor.py <input_directory> [output_directory]
 
 # Merge metadata into media files (uses all CPU cores by default)
-python PhotosExportMerger.py <input_dir> <output_dir> [--dry-run] [--workers N] [--strip-metadata [PROFILE ...]] [--tz-fallback OFFSET] [--tz-override "START_UTC,END_UTC,OFFSET" ...]
+python PhotosExportMerger.py <input_dir> <output_dir> [--dry-run] [--workers N] [--strip-metadata [PROFILE ...]] [--tz-fallback OFFSET] [--tz-override "START_UTC,END_UTC,OFFSET" ...] [--jpeg-quality PERCENT]
 
 # Run tests
 python -m pytest TestMerger.py
@@ -61,6 +61,7 @@ Five modules with clear separation of concerns:
 - Metadata stripping (`--strip-metadata`): optional post-write ExifTool pass that removes unwanted metadata groups from output files. Controlled by named profiles defined in `METADATA_STRIP_PROFILES` (currently `google` and `photoshop`). The special name `all` enables every profile. Strip params are stored on `MediaFileInfo.strip_metadata_params` so they are available to parallel workers. Non-QuickTime video containers are skipped (ExifTool cannot modify them in-place)
 - Timezone fallback (`--tz-fallback`): sets the fallback timezone offset used when no EXIF timezone is found and no `--tz-override` matches. Defaults to the host machine's local timezone if not specified. Stored on `self.fallback_tz` and propagated to parallel workers via `MediaFileInfo.fallback_tz`
 - Timezone overrides (`--tz-override`): repeatable option that specifies UTC time ranges and a timezone offset. When a file has no EXIF timezone and its UTC timestamp falls within an override range, the override timezone is used instead of the fallback timezone. Defined via `TimezoneOverride` dataclass in `AbstractMediaMerger.py`. `_find_tz_override()` does linear scan of overrides (first match wins). Applies to both matched and orphan files. For orphans resolved from EXIF dates (which are naive/local), the parsed datetime is treated as a UTC approximation for range matching
+- JPEG compression (`--jpeg-quality`): optional recompression of JPEG images whose ExifTool `JPEGQualityEstimate` exceeds the configured threshold (1-100, default: disabled). Quality estimates are read during the batch EXIF scan in step 5 and stored on `MediaFileInfo.jpeg_quality`. During processing (steps 7-8), qualifying JPEGs are compressed with Pillow in memory (no metadata transferred), then the compressed bytes are piped via stdin to a standalone `exiftool` subprocess that copies all metadata from the original source (`-TagsFromFile`, `-All:All`) and applies tag modifications — all in a single invocation with zero intermediate disk writes. The piping approach works on both Windows and Linux. Only files with actual JPEG extensions (.jpg, .jpeg, .jpe, .jfif) are eligible — extension-mismatched files (e.g. JPEG content with .dng extension) are not compressed. Files whose quality could not be determined are conservatively recompressed. Metadata stripping (`--strip-metadata`) runs as a separate pass after compression. Two stats counters are tracked: `jpeg_compressed` (files recompressed) and `jpeg_quality_unknown` (files where ExifTool could not estimate quality). Applies to both matched and orphan files. The `jpeg_compress_quality` threshold is propagated to workers via `MediaFileInfo.jpeg_compress_quality`
 - `.gitignore` excludes all media and JSON files — only Python source is tracked
 
 ## Pipeline Steps

@@ -64,6 +64,12 @@ python PhotosExportMerger.py input/ output/ \
 python PhotosExportMerger.py input/ output/ \
   --tz-override "2023-03-10 00:00:00,2023-03-20 23:59:59,+09:00" \
   --tz-override "2023-06-01 00:00:00,2023-06-15 23:59:59,-04:00"
+
+# Recompress JPEGs above 80% quality
+python PhotosExportMerger.py input/ output/ --jpeg-quality 80
+
+# Recompress at 65% quality, strip Google metadata, 4 workers
+python PhotosExportMerger.py input/ output/ --jpeg-quality 65 --strip-metadata google --workers 4
 ```
 
 ### Testing
@@ -119,6 +125,12 @@ For travel photos, use `--tz-override` to specify UTC time ranges and the timezo
 | `photoshop` | `Photoshop:All`, `XMP-photoshop:DocumentAncestors` |
 
 Use `--strip-metadata` (no args) for all profiles, or name specific ones: `--strip-metadata google photoshop`. Add new profiles to `METADATA_STRIP_PROFILES` in `PhotosExportMerger.py`.
+
+### JPEG compression
+
+`--jpeg-quality PERCENT` recompresses JPEG images whose estimated quality exceeds the given threshold (1–100). JPEGs at or below the threshold are copied as-is. The quality is estimated via ExifTool's `JPEGQualityEstimate` during the scan phase; files whose quality cannot be determined are conservatively recompressed.
+
+Compression uses Pillow in memory — the compressed bytes are piped directly into ExifTool via stdin, which copies all metadata from the original source (`-TagsFromFile`) and applies tag modifications in one pass, with no intermediate file written to disk. Metadata stripping (`--strip-metadata`) runs as a separate pass afterward. Applies to both matched and orphan files. Only files with JPEG extensions (`.jpg`, `.jpeg`, `.jpe`, `.jfif`) are eligible.
 
 ### Blocking unwanted descriptions
 

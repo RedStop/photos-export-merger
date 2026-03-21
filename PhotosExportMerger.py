@@ -4,8 +4,10 @@ from AbstractMediaMerger import (AbstractMediaMerger, WriteStrategy,
 from collections import defaultdict
 from concurrent.futures import ProcessPoolExecutor, as_completed
 from datetime import datetime, timezone, timedelta
+from io import BytesIO
 from JsonFileIdentifier import JsonFileFinder
 from pathlib import Path
+from PIL import Image
 from sortedcontainers import SortedSet
 from typing import Dict, List, Optional, Any
 import exiftool
@@ -13,6 +15,7 @@ import json
 import logging
 import os
 import shutil
+import subprocess
 import sys
 
 
@@ -24,6 +27,9 @@ VIDEO_EXTS = {'.avi', '.mkv', '.mov', '.mp4', '.m4v', '.webm'}
 # copy-only; all metadata lives in the XMP sidecar.
 QUICKTIME_VIDEO_EXTS = {'.mov', '.mp4', '.m4v'}
 ALL_MEDIA_EXTS = DIRECT_WRITE_EXTS | PARTIAL_WRITE_EXTS | VIDEO_EXTS
+
+# JPEG file extensions eligible for quality-based recompression.
+JPEG_EXTENSIONS = {'.jpg', '.jpeg', '.jpe', '.jfif'}
 
 # Extension groups that are interchangeable — ExifTool handles them the same
 # way, so a "mismatch" within a group is not a real problem.
@@ -328,6 +334,92 @@ class _ext_mismatch_rename:
         return False
 
 
+def _needs_jpeg_compression(info: MediaFileInfo) -> bool:
+    """Return True if this file is a JPEG that should be recompressed.
+
+    Compression is triggered when all of these are true:
+    - JPEG compression is enabled (jpeg_compress_quality is set)
+    - The source file has a JPEG extension
+    - The estimated quality exceeds the target threshold, OR the quality
+      could not be determined (conservative — recompress to be safe)
+    """
+    if info.jpeg_compress_quality is None:
+        return False
+    if info.source_path.suffix.lower() not in JPEG_EXTENSIONS:
+        return False
+    if info.jpeg_quality is None:
+        return True  # unknown quality — recompress to be safe
+    return info.jpeg_quality > info.jpeg_compress_quality
+
+
+def _compress_jpeg_to_bytes(source_path: Path, quality: int) -> bytes:
+    """Compress a JPEG with Pillow and return the raw bytes (no metadata).
+
+    The image is saved to an in-memory buffer at the given quality level
+    with optimisation enabled.  No EXIF/XMP/IPTC data is transferred —
+    metadata is handled separately by ExifTool.
+    """
+    img = Image.open(source_path)
+    buf = BytesIO()
+    img.save(buf, format='JPEG', quality=quality, optimize=True)
+    img.close()
+    return buf.getvalue()
+
+
+def _write_compressed_jpeg_with_metadata(
+    jpeg_bytes: bytes, source_path: Path, output_path: Path,
+    tag_params: List[str], logger: logging.Logger,
+) -> bool:
+    """Pipe compressed JPEG bytes through exiftool to write metadata.
+
+    Runs a standalone exiftool subprocess that:
+    1. Reads the compressed JPEG from stdin (``-``)
+    2. Copies ALL metadata from the original source via ``-TagsFromFile``
+    3. Applies tag modifications (dates, descriptions, GPS, etc.)
+    4. Writes the result to *output_path*
+
+    This avoids writing the compressed image to disk as an intermediate
+    step.  The piping approach (stdin) works on both Windows and Linux.
+
+    Returns True on success, False on failure.
+    """
+    cmd = [
+        'exiftool',
+        '-charset', 'filename=utf8',
+        '-TagsFromFile', str(source_path),
+        '-All:All',                       # copy every tag group
+    ]
+    cmd.extend(tag_params)
+    cmd.extend(['-o', str(output_path), '-'])
+
+    try:
+        result = subprocess.run(
+            cmd,
+            input=jpeg_bytes,
+            capture_output=True,
+            timeout=120,
+        )
+    except subprocess.TimeoutExpired:
+        logger.error("ExifTool timed out for compressed %s", source_path)
+        return False
+    except Exception as e:
+        logger.error("ExifTool subprocess failed for %s: %s", source_path, e)
+        return False
+
+    if not output_path.exists():
+        stderr_msg = result.stderr.decode('utf-8', errors='replace').strip()
+        logger.error("ExifTool compress+write failed for %s (rc=%d): %s",
+                     source_path, result.returncode, stderr_msg)
+        return False
+
+    if result.returncode != 0:
+        stderr_msg = result.stderr.decode('utf-8', errors='replace').strip()
+        logger.debug("ExifTool warnings for compressed %s (rc=%d): %s",
+                     source_path, result.returncode, stderr_msg)
+
+    return True
+
+
 def _do_process_matched(et, info: MediaFileInfo, stats: MergeStats,
                         logger: logging.Logger):
     """Core logic for processing a matched media file."""
@@ -358,6 +450,67 @@ def _do_process_matched(et, info: MediaFileInfo, stats: MergeStats,
             stats.gps_written += 1
         if info.clear_descriptions:
             stats.descriptions_cleared += 1
+    elif _needs_jpeg_compression(info):
+        # ----- Compressed JPEG path -----
+        # Compress with Pillow (in memory, no metadata), then pipe the
+        # compressed bytes into a standalone exiftool subprocess that
+        # copies ALL metadata from the original via -TagsFromFile and
+        # applies the tag modifications — zero intermediate disk writes.
+        try:
+            jpeg_bytes = _compress_jpeg_to_bytes(info.source_path,
+                                                 info.jpeg_compress_quality)
+        except Exception as e:
+            logger.error("Pillow compression failed for %s: %s",
+                         info.source_path, e)
+            stats.errors += 1
+            return
+
+        # Build tag params (same modifications as the standard path).
+        tag_params = []
+
+        if info.resolved_datetime:
+            dt_str = info.resolved_datetime.strftime('%Y:%m:%d %H:%M:%S')
+            tz_str = _format_tz_offset(info.resolved_datetime.tzinfo)
+
+            tag_params.append(f'-alldates={dt_str}')
+            tag_params.append(f'-EXIF:ExifIFD:OffsetTime={tz_str}')
+            tag_params.append(f'-EXIF:ExifIFD:OffsetTimeOriginal={tz_str}')
+            tag_params.append(f'-EXIF:ExifIFD:OffsetTimeDigitized={tz_str}')
+
+            tag_params.extend(_build_conditional_date_params(info, dt_str, tz_str))
+
+        if info.clear_descriptions:
+            tag_params.append('-EXIF:UserComment=')
+            tag_params.append('-EXIF:ImageDescription=')
+            tag_params.append('-XMP-dc:Description=')
+            if info.has_iptc_caption:
+                tag_params.append('-IPTC:Caption-Abstract=')
+            stats.descriptions_cleared += 1
+        elif info.description and info.description.strip():
+            escaped, needs_E = _escape_description(info.description)
+            if needs_E:
+                tag_params.append('-E')
+            tag_params.append(f'-XMP-dc:Description={escaped}')
+            tag_params.append(f'-EXIF:ImageDescription={escaped}')
+            if info.has_iptc_caption:
+                tag_params.append(f'-IPTC:Caption-Abstract={escaped}')
+
+        if info.gps:
+            tag_params.extend(_build_gps_params(info.gps))
+            stats.gps_written += 1
+
+        tag_params.append('-IPTCDigest=new')
+
+        if not _write_compressed_jpeg_with_metadata(
+            jpeg_bytes, info.source_path, info.output_path, tag_params, logger
+        ):
+            stats.errors += 1
+            return
+
+        q_str = f'{info.jpeg_quality}%' if info.jpeg_quality is not None else 'unknown'
+        logger.info("COMPRESS  %s  (was ~%s -> %d%%)",
+                    info.source_path.name, q_str, info.jpeg_compress_quality)
+        stats.jpeg_compressed += 1
     else:
         params = ['-charset', 'filename=utf8']
 
@@ -494,6 +647,59 @@ def _do_process_orphan(et, info: MediaFileInfo, stats: MergeStats,
         return
 
     info.output_path.parent.mkdir(parents=True, exist_ok=True)
+
+    if _needs_jpeg_compression(info):
+        # ----- Compressed JPEG orphan path -----
+        # Compress with Pillow, pipe through exiftool with -TagsFromFile to
+        # copy all original metadata + apply any modifications.
+        try:
+            jpeg_bytes = _compress_jpeg_to_bytes(info.source_path,
+                                                 info.jpeg_compress_quality)
+        except Exception as e:
+            logger.error("Pillow compression failed for orphan %s: %s",
+                         info.source_path, e)
+            stats.errors += 1
+            return
+
+        tag_params = []
+
+        if info.clear_descriptions:
+            tag_params.append('-EXIF:UserComment=')
+            tag_params.append('-EXIF:ImageDescription=')
+            tag_params.append('-XMP-dc:Description=')
+            if info.has_iptc_caption:
+                tag_params.append('-IPTC:Caption-Abstract=')
+            stats.descriptions_cleared += 1
+
+        if info.resolved_datetime:
+            dt_str = info.resolved_datetime.strftime('%Y:%m:%d %H:%M:%S')
+            tz_str = _format_tz_offset(info.resolved_datetime.tzinfo)
+
+            tag_params.append(f'-alldates={dt_str}')
+            tag_params.append(f'-EXIF:ExifIFD:OffsetTime={tz_str}')
+            tag_params.append(f'-EXIF:ExifIFD:OffsetTimeOriginal={tz_str}')
+            tag_params.append(f'-EXIF:ExifIFD:OffsetTimeDigitized={tz_str}')
+
+            tag_params.extend(_build_conditional_date_params(info, dt_str, tz_str))
+
+        if tag_params:
+            tag_params.append('-IPTCDigest=new')
+
+        if not _write_compressed_jpeg_with_metadata(
+            jpeg_bytes, info.source_path, info.output_path, tag_params, logger
+        ):
+            stats.errors += 1
+            return
+
+        q_str = f'{info.jpeg_quality}%' if info.jpeg_quality is not None else 'unknown'
+        logger.info("COMPRESS  %s  (orphan, was ~%s -> %d%%)",
+                    info.source_path.name, q_str, info.jpeg_compress_quality)
+        stats.jpeg_compressed += 1
+        stats.written += 1
+
+        _do_strip_metadata(et, info, stats, logger)
+        _do_set_filesystem_timestamps(et, info, logger)
+        return
 
     try:
         shutil.copy2(str(info.source_path), str(info.output_path))
@@ -721,12 +927,14 @@ class PhotosExportMerger(AbstractMediaMerger):
                  num_workers: int = 1,
                  metadata_strip_params: Optional[List[str]] = None,
                  tz_overrides: Optional[List[TimezoneOverride]] = None,
-                 fallback_tz: Optional[timezone] = None):
+                 fallback_tz: Optional[timezone] = None,
+                 jpeg_compress_quality: Optional[int] = None):
         super().__init__(input_dir, output_dir, dry_run, blocked_descriptions,
                          num_workers=num_workers,
                          metadata_strip_params=metadata_strip_params,
                          tz_overrides=tz_overrides,
-                         fallback_tz=fallback_tz)
+                         fallback_tz=fallback_tz,
+                         jpeg_compress_quality=jpeg_compress_quality)
 
     def _open_writer(self) -> None:
         self._et_helper = exiftool.ExifToolHelper()
@@ -876,6 +1084,8 @@ class PhotosExportMerger(AbstractMediaMerger):
             file_paths = [str(info.source_path) for info in infos]
             tz_tags = ['EXIF:OffsetTimeOriginal', 'EXIF:OffsetTime']
             read_tags = tz_tags + CONDITIONAL_DATE_READ_TAGS + ['File:FileTypeExtension'] + (DESC_READ_TAGS if self.blocked_descriptions else ['IPTC:Caption-Abstract'])
+            if self.jpeg_compress_quality is not None:
+                read_tags.append('Composite:JPEGQualityEstimate')
 
             try:
                 tag_results = self._et.get_tags(file_paths, read_tags)
@@ -904,6 +1114,20 @@ class PhotosExportMerger(AbstractMediaMerger):
                         stats.ext_mismatches += 1
                         self.logger.warning("Extension mismatch for %s: content is %s",
                                          self._rel(info.source_path), actual_type_ext)
+
+                # Extract JPEG quality estimate (when compression is enabled).
+                if self.jpeg_compress_quality is not None:
+                    if info.source_path.suffix.lower() in JPEG_EXTENSIONS:
+                        stats.jpeg_quality_checked += 1
+                        raw_q = tags.get('Composite:JPEGQualityEstimate')
+                        if raw_q is not None:
+                            try:
+                                info.jpeg_quality = int(raw_q)
+                            except (ValueError, TypeError):
+                                info.jpeg_quality = None
+                                stats.jpeg_quality_unknown += 1
+                        else:
+                            stats.jpeg_quality_unknown += 1
 
                 # Check blocked descriptions
                 if self.blocked_descriptions and info.json_data:
@@ -977,6 +1201,8 @@ class PhotosExportMerger(AbstractMediaMerger):
         for dir_path, infos in orphans_by_dir.items():
             file_paths = [str(info.source_path) for info in infos]
             read_tags = DATE_TAGS_PRIORITY + CONDITIONAL_DATE_READ_TAGS + ['File:FileTypeExtension'] + (DESC_READ_TAGS if self.blocked_descriptions else ['IPTC:Caption-Abstract'])
+            if self.jpeg_compress_quality is not None:
+                read_tags.append('Composite:JPEGQualityEstimate')
 
             try:
                 tag_results = self._et.get_tags(file_paths, read_tags)
@@ -1004,6 +1230,20 @@ class PhotosExportMerger(AbstractMediaMerger):
                         stats.ext_mismatches += 1
                         self.logger.warning("Extension mismatch for orphan %s: content is %s",
                                          self._rel(info.source_path), actual_type_ext)
+
+                # Extract JPEG quality estimate (when compression is enabled).
+                if self.jpeg_compress_quality is not None:
+                    if info.source_path.suffix.lower() in JPEG_EXTENSIONS:
+                        stats.jpeg_quality_checked += 1
+                        raw_q = tags.get('Composite:JPEGQualityEstimate')
+                        if raw_q is not None:
+                            try:
+                                info.jpeg_quality = int(raw_q)
+                            except (ValueError, TypeError):
+                                info.jpeg_quality = None
+                                stats.jpeg_quality_unknown += 1
+                        else:
+                            stats.jpeg_quality_unknown += 1
 
                 # Check blocked descriptions on existing EXIF tags
                 if self.blocked_descriptions:
@@ -1095,6 +1335,7 @@ class PhotosExportMerger(AbstractMediaMerger):
                 info.json_data = None
             info.strip_metadata_params = self.metadata_strip_params
             info.fallback_tz = self.fallback_tz
+            info.jpeg_compress_quality = self.jpeg_compress_quality
 
     def _process_matched(self, info: MediaFileInfo, stats: MergeStats):
         if self.dry_run:
@@ -1158,6 +1399,9 @@ if __name__ == '__main__':
             '  # Use 4 workers and strip Google camera metadata\n'
             '  python PhotosExportMerger.py input/ output/ --workers 4 --strip-metadata google\n'
             '\n'
+            '  # Recompress JPEGs above 80% quality\n'
+            '  python PhotosExportMerger.py input/ output/ --jpeg-quality 80\n'
+            '\n'
             '  # Set fallback timezone and override for a trip\n'
             '  python PhotosExportMerger.py input/ output/ \\\n'
             '    --tz-fallback "+02:00" \\\n'
@@ -1192,6 +1436,13 @@ if __name__ == '__main__':
                              'UTC timestamp falls within the given range.  '
                              'Repeatable.  Format: '
                              '"YYYY-MM-DD HH:MM:SS,YYYY-MM-DD HH:MM:SS,+HH:MM".')
+    parser.add_argument('--jpeg-quality', type=int, default=None,
+                        metavar='PERCENT',
+                        help='Recompress JPEG images whose estimated quality '
+                             'exceeds this threshold (1-100).  JPEGs at or '
+                             'below this quality are copied as-is.  Requires '
+                             'Pillow.  Default: disabled (no recompression).  '
+                             'Use 80 for a good balance of size and quality.')
 
     args = parser.parse_args()
 
@@ -1218,6 +1469,13 @@ if __name__ == '__main__':
                 f"Invalid --tz-fallback value: {args.tz_fallback!r}\n"
                 "Expected format: +HH:MM or -HH:MM (e.g. +02:00, -05:30)")
 
+    # Validate JPEG quality
+    jpeg_compress_quality: Optional[int] = args.jpeg_quality
+    if jpeg_compress_quality is not None:
+        if not 1 <= jpeg_compress_quality <= 100:
+            parser.error(
+                f"--jpeg-quality must be between 1 and 100, got {jpeg_compress_quality}")
+
     blocked_descriptions = [
         # Add unwanted description strings here
         "SONY DSC",
@@ -1230,5 +1488,6 @@ if __name__ == '__main__':
                                 num_workers=args.workers,
                                 metadata_strip_params=metadata_strip_params,
                                 tz_overrides=tz_overrides or None,
-                                fallback_tz=fallback_tz)
+                                fallback_tz=fallback_tz,
+                                jpeg_compress_quality=jpeg_compress_quality)
     result = merger.run()
