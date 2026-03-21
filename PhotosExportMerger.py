@@ -465,6 +465,19 @@ def _do_process_matched(et, info: MediaFileInfo, stats: MergeStats,
             stats.errors += 1
             return
 
+        # Guard: if compression didn't reduce file size, use the original
+        # image bytes instead.  This prevents accidental size increases,
+        # especially when ExifTool couldn't determine the source quality.
+        original_size = info.source_path.stat().st_size
+        if len(jpeg_bytes) >= original_size:
+            logger.info("SKIP-COMPRESS  %s  (compressed %d bytes >= original %d bytes, using original)",
+                        info.source_path, len(jpeg_bytes), original_size)
+            jpeg_bytes = info.source_path.read_bytes()
+            stats.jpeg_compress_skipped_larger += 1
+            compressed = False
+        else:
+            compressed = True
+
         # Build tag params (same modifications as the standard path).
         tag_params = []
 
@@ -507,10 +520,11 @@ def _do_process_matched(et, info: MediaFileInfo, stats: MergeStats,
             stats.errors += 1
             return
 
-        q_str = f'{info.jpeg_quality}%' if info.jpeg_quality is not None else 'unknown'
-        logger.info("COMPRESS  %s  (was ~%s -> %d%%)",
-                    info.source_path.name, q_str, info.jpeg_compress_quality)
-        stats.jpeg_compressed += 1
+        if compressed:
+            q_str = f'{info.jpeg_quality}%' if info.jpeg_quality is not None else 'unknown'
+            logger.info("COMPRESS  %s  (was ~%s -> %d%%)",
+                        info.source_path.name, q_str, info.jpeg_compress_quality)
+            stats.jpeg_compressed += 1
     else:
         params = ['-charset', 'filename=utf8']
 
@@ -661,6 +675,18 @@ def _do_process_orphan(et, info: MediaFileInfo, stats: MergeStats,
             stats.errors += 1
             return
 
+        # Guard: if compression didn't reduce file size, use the original
+        # image bytes instead.
+        original_size = info.source_path.stat().st_size
+        if len(jpeg_bytes) >= original_size:
+            logger.info("SKIP-COMPRESS  %s  (orphan, compressed %d bytes >= original %d bytes, using original)",
+                        info.source_path, len(jpeg_bytes), original_size)
+            jpeg_bytes = info.source_path.read_bytes()
+            stats.jpeg_compress_skipped_larger += 1
+            compressed = False
+        else:
+            compressed = True
+
         tag_params = []
 
         if info.clear_descriptions:
@@ -691,10 +717,11 @@ def _do_process_orphan(et, info: MediaFileInfo, stats: MergeStats,
             stats.errors += 1
             return
 
-        q_str = f'{info.jpeg_quality}%' if info.jpeg_quality is not None else 'unknown'
-        logger.info("COMPRESS  %s  (orphan, was ~%s -> %d%%)",
-                    info.source_path.name, q_str, info.jpeg_compress_quality)
-        stats.jpeg_compressed += 1
+        if compressed:
+            q_str = f'{info.jpeg_quality}%' if info.jpeg_quality is not None else 'unknown'
+            logger.info("COMPRESS  %s  (orphan, was ~%s -> %d%%)",
+                        info.source_path.name, q_str, info.jpeg_compress_quality)
+            stats.jpeg_compressed += 1
         stats.written += 1
 
         _do_strip_metadata(et, info, stats, logger)

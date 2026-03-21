@@ -2435,6 +2435,11 @@ class TestPhotosExportMerger(unittest.TestCase):
         self.assertEqual(self.stats.jpeg_quality_unknown, 0,
                          f"Expected 0 jpeg_quality_unknown, got {self.stats.jpeg_quality_unknown}")
 
+    def test_stats_jpeg_compress_skipped_larger_disabled(self) -> None:
+        """jpeg_compress_skipped_larger = 0 when --jpeg-quality is not set."""
+        self.assertEqual(self.stats.jpeg_compress_skipped_larger, 0,
+                         f"Expected 0 jpeg_compress_skipped_larger, got {self.stats.jpeg_compress_skipped_larger}")
+
     # ------------------------------------------------------------------
     # Category 13 — Video UTC Time
     # ------------------------------------------------------------------
@@ -3890,6 +3895,17 @@ class TestJpegCompression(unittest.TestCase):
         """jpeg_quality_unknown = 0 (Pillow JPEGs have deterministic quality)."""
         self.assertEqual(self.stats.jpeg_quality_unknown, 0,
                          f"Expected 0 jpeg_quality_unknown, got {self.stats.jpeg_quality_unknown}")
+
+    def test_jpeg_compress_stats_skipped_larger(self) -> None:
+        """jpeg_compress_skipped_larger = 0 (test images all compress smaller).
+
+        The skip-larger guard is a safety net for edge cases (e.g. when
+        ExifTool cannot determine quality and the image is already well-
+        compressed).  Normal test images always compress successfully.
+        """
+        self.assertEqual(self.stats.jpeg_compress_skipped_larger, 0,
+                         f"Expected 0 jpeg_compress_skipped_larger, "
+                         f"got {self.stats.jpeg_compress_skipped_larger}")
 
 
 # ---------------------------------------------------------------------------

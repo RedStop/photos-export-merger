@@ -130,7 +130,7 @@ Use `--strip-metadata` (no args) for all profiles, or name specific ones: `--str
 
 `--jpeg-quality PERCENT` recompresses JPEG images whose estimated quality exceeds the given threshold (1–100). JPEGs at or below the threshold are copied as-is. The quality is estimated via ExifTool's `JPEGQualityEstimate` during the scan phase; files whose quality cannot be determined are conservatively recompressed.
 
-Compression uses Pillow in memory — the compressed bytes are piped directly into ExifTool via stdin, which copies all metadata from the original source (`-TagsFromFile`) and applies tag modifications in one pass, with no intermediate file written to disk. Metadata stripping (`--strip-metadata`) runs as a separate pass afterward. Applies to both matched and orphan files. Only files with JPEG extensions (`.jpg`, `.jpeg`, `.jpe`, `.jfif`) are eligible.
+Compression uses Pillow in memory — the compressed bytes are piped directly into ExifTool via stdin, which copies all metadata from the original source (`-TagsFromFile`) and applies tag modifications in one pass, with no intermediate file written to disk. As a safety net, if the compressed output is not smaller than the original file, the original image is used instead (logged as `SKIP-COMPRESS`). Metadata stripping (`--strip-metadata`) runs as a separate pass afterward. Applies to both matched and orphan files. Only files with JPEG extensions (`.jpg`, `.jpeg`, `.jpe`, `.jfif`) are eligible.
 
 ### Blocking unwanted descriptions
 

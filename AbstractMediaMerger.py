@@ -97,6 +97,7 @@ class MergeStats:
     jpeg_compressed: int = 0
     jpeg_quality_unknown: int = 0
     jpeg_quality_checked: int = 0
+    jpeg_compress_skipped_larger: int = 0
 
     def merge(self, other: 'MergeStats') -> None:
         """Add all counters from *other* into this instance.
@@ -116,6 +117,7 @@ class MergeStats:
         self.metadata_stripped += other.metadata_stripped
         self.jpeg_compressed += other.jpeg_compressed
         self.jpeg_quality_unknown += other.jpeg_quality_unknown
+        self.jpeg_compress_skipped_larger += other.jpeg_compress_skipped_larger
 
 
 def _resolve_gps(json_data: Dict[str, Any]) -> Optional[Dict[str, float]]:
@@ -392,6 +394,8 @@ class AbstractMediaMerger(ABC):
             self.logger.info("JPEG quality unknown:         %d", stats.jpeg_quality_unknown)
         if stats.jpeg_compressed > 0:
             self.logger.info("JPEG compressed:              %d", stats.jpeg_compressed)
+        if stats.jpeg_compress_skipped_larger > 0:
+            self.logger.info("JPEG compress skipped (larger):%d", stats.jpeg_compress_skipped_larger)
         if stats.date_from_exif > 0:
             self.logger.info("Orphan dates from EXIF:       %d", stats.date_from_exif)
         if stats.date_from_filesystem > 0:
