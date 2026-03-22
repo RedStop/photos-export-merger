@@ -1112,7 +1112,7 @@ class PhotosExportMerger(AbstractMediaMerger):
             tz_tags = ['EXIF:OffsetTimeOriginal', 'EXIF:OffsetTime']
             read_tags = tz_tags + CONDITIONAL_DATE_READ_TAGS + ['File:FileTypeExtension'] + (DESC_READ_TAGS if self.blocked_descriptions else ['IPTC:Caption-Abstract'])
             if self.jpeg_compress_quality is not None:
-                read_tags.append('Composite:JPEGQualityEstimate')
+                read_tags.append('File:JPEGQualityEstimate')
 
             try:
                 tag_results = self._et.get_tags(file_paths, read_tags)
@@ -1146,7 +1146,7 @@ class PhotosExportMerger(AbstractMediaMerger):
                 if self.jpeg_compress_quality is not None:
                     if info.source_path.suffix.lower() in JPEG_EXTENSIONS:
                         stats.jpeg_quality_checked += 1
-                        raw_q = tags.get('Composite:JPEGQualityEstimate')
+                        raw_q = tags.get('File:JPEGQualityEstimate')
                         if raw_q is not None:
                             try:
                                 info.jpeg_quality = int(raw_q)
@@ -1229,7 +1229,7 @@ class PhotosExportMerger(AbstractMediaMerger):
             file_paths = [str(info.source_path) for info in infos]
             read_tags = DATE_TAGS_PRIORITY + CONDITIONAL_DATE_READ_TAGS + ['File:FileTypeExtension'] + (DESC_READ_TAGS if self.blocked_descriptions else ['IPTC:Caption-Abstract'])
             if self.jpeg_compress_quality is not None:
-                read_tags.append('Composite:JPEGQualityEstimate')
+                read_tags.append('File:JPEGQualityEstimate')
 
             try:
                 tag_results = self._et.get_tags(file_paths, read_tags)
@@ -1262,7 +1262,7 @@ class PhotosExportMerger(AbstractMediaMerger):
                 if self.jpeg_compress_quality is not None:
                     if info.source_path.suffix.lower() in JPEG_EXTENSIONS:
                         stats.jpeg_quality_checked += 1
-                        raw_q = tags.get('Composite:JPEGQualityEstimate')
+                        raw_q = tags.get('File:JPEGQualityEstimate')
                         if raw_q is not None:
                             try:
                                 info.jpeg_quality = int(raw_q)
