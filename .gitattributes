@@ -1,0 +1,15 @@
+# Set default behavior to automatically normalize line endings
+* text=auto
+
+# Explicitly set LF line endings for the following file types
+*.bash text eol=lf
+*.md text eol=lf
+*.py text eol=lf
+*.sh text eol=lf
+*.txt text eol=lf
+.gitattributes text eol=lf
+.gitignore text eol=lf
+
+# Explicitly set CRLF line endings for Windows script files
+*.bat text eol=crlf
+*.ps1 text eol=crlf
