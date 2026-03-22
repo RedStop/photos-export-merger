@@ -522,8 +522,9 @@ def _do_process_matched(et, info: MediaFileInfo, stats: MergeStats,
 
         if compressed:
             q_str = f'{info.jpeg_quality}%' if info.jpeg_quality is not None else 'unknown'
-            logger.info("COMPRESS  %s  (was ~%s -> %d%%)",
-                        info.source_path.name, q_str, info.jpeg_compress_quality)
+            logger.info("COMPRESS  %s  (was ~%s -> %d%%, %d bytes -> %d bytes)",
+                        info.source_path.name, q_str, info.jpeg_compress_quality,
+                        original_size, len(jpeg_bytes))
             stats.jpeg_compressed += 1
     else:
         params = ['-charset', 'filename=utf8']
@@ -719,8 +720,9 @@ def _do_process_orphan(et, info: MediaFileInfo, stats: MergeStats,
 
         if compressed:
             q_str = f'{info.jpeg_quality}%' if info.jpeg_quality is not None else 'unknown'
-            logger.info("COMPRESS  %s  (orphan, was ~%s -> %d%%)",
-                        info.source_path.name, q_str, info.jpeg_compress_quality)
+            logger.info("COMPRESS  %s  (orphan, was ~%s -> %d%%, %d bytes -> %d bytes)",
+                        info.source_path.name, q_str, info.jpeg_compress_quality,
+                        original_size, len(jpeg_bytes))
             stats.jpeg_compressed += 1
         stats.written += 1
 
