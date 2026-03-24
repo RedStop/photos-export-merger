@@ -8,6 +8,7 @@ This file is built in stages:
 """
 
 import argparse
+import io
 import json
 import logging
 import os
@@ -22,6 +23,7 @@ from datetime import datetime, timezone, timedelta
 from typing import Any, Dict
 
 import exiftool
+from PIL import Image
 from PhotosExportMerger import PhotosExportMerger, MergeStats
 
 # Custom log level below DEBUG (10) — used by infrastructure-validation tests
@@ -114,16 +116,22 @@ def _jpeg_body() -> bytes:
 
 
 def _make_jpeg() -> bytes:
-    """Full 1×1 white grayscale JFIF JPEG accepted by ExifTool without warnings."""
-    app0 = bytes([
-        0xFF, 0xE0, 0x00, 0x10,              # APP0 marker, length=16
-        0x4A, 0x46, 0x49, 0x46, 0x00,        # 'JFIF\0'
-        0x01, 0x01,                          # version 1.1
-        0x00,                                # aspect ratio: no units
-        0x00, 0x01, 0x00, 0x01,              # 1×1 density
-        0x00, 0x00,                          # no embedded thumbnail
-    ])
-    return b'\xFF\xD8' + app0 + _jpeg_body() + b'\xFF\xD9'
+    """200×200 RGB JPEG saved at quality=100 using Pillow.
+
+    Pixel data is seeded random noise, which is high-entropy and therefore
+    not already compressed.  Saving at quality=100 produces a large file
+    (~120 KB) that Pillow can meaningfully shrink when re-encoded at a lower
+    quality (e.g. quality=80 → ~15–20 KB).  This guarantees that any JPEG
+    produced by the standard make_media_file factory will pass the
+    _needs_jpeg_compression check and actually be compressed — making
+    TestJpegCompressionWithFullTree a genuine test of the compression path.
+    """
+    rng = __import__('random').Random(42)
+    pixels = bytes(rng.randint(0, 255) for _ in range(200 * 200 * 3))
+    img = Image.frombytes('RGB', (200, 200), pixels)
+    buf = io.BytesIO()
+    img.save(buf, format='JPEG', quality=100, subsampling=0)
+    return buf.getvalue()
 
 
 def _make_png() -> bytes:
@@ -3980,9 +3988,16 @@ class TestJpegCompressionWithFullTree(unittest.TestCase):
                          f"Expected 0 errors, got {self.stats.errors}")
 
     def test_jpeg_full_tree_stats_quality_checked(self) -> None:
-        """jpeg_quality_checked > 0 (the tree contains JPEG files)."""
-        self.assertGreater(self.stats.jpeg_quality_checked, 0,
-                           "Expected jpeg_quality_checked > 0 on full tree")
+        """jpeg_quality_checked = 48 (all JPEG files processed by the merger are checked;
+        Deep/Level1/Level2/deep.jpg is intentionally skipped due to directory depth)."""
+        self.assertEqual(self.stats.jpeg_quality_checked, 48,
+                         f"Expected jpeg_quality_checked=48, got {self.stats.jpeg_quality_checked}")
+
+    def test_jpeg_full_tree_stats_compressed(self) -> None:
+        """jpeg_compressed = 48 — every JPEG processed by the merger is compressible and gets compressed.
+        (Deep/Level1/Level2/deep.jpg is excluded as it exceeds the depth limit.)"""
+        self.assertEqual(self.stats.jpeg_compressed, 48,
+                         f"Expected jpeg_compressed=48, got {self.stats.jpeg_compressed}")
 
     def test_jpeg_full_tree_stats_matched_count(self) -> None:
         """Matched files still = 177 (compression doesn't affect matching)."""
