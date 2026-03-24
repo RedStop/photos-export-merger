@@ -588,6 +588,7 @@ class TestPhotosExportMerger(unittest.TestCase):
 
     @classmethod
     def setUpClass(cls) -> None:
+        print(f'\n=== {cls.__name__} ===')
         logging.basicConfig(
             format='%(levelname)s %(name)s: %(message)s',
             level=logging.WARNING,
@@ -3096,6 +3097,7 @@ class TestSingleWorker(unittest.TestCase):
 
     @classmethod
     def setUpClass(cls) -> None:
+        print(f'\n=== {cls.__name__} ===')
         # Gate: only run if explicitly opted-in
         if os.environ.get('GPEM_SINGLE_WORKER') != '1':
             raise unittest.SkipTest(
@@ -3247,6 +3249,7 @@ class TestMetadataStripping(unittest.TestCase):
 
     @classmethod
     def setUpClass(cls) -> None:
+        print(f'\n=== {cls.__name__} ===')
         cls.tmp_dir    = Path(tempfile.mkdtemp(prefix='gpem_strip_test_'))
         cls.input_dir  = cls.tmp_dir / 'input'
         cls.output_dir = cls.tmp_dir / 'output'
@@ -3382,6 +3385,7 @@ class TestTimezoneOverride(unittest.TestCase):
 
     @classmethod
     def setUpClass(cls) -> None:
+        print(f'\n=== {cls.__name__} ===')
         from AbstractMediaMerger import TimezoneOverride
 
         cls.tmp_dir    = Path(tempfile.mkdtemp(prefix='gpem_tz_override_test_'))
@@ -3552,6 +3556,7 @@ class TestFallbackTimezone(unittest.TestCase):
 
     @classmethod
     def setUpClass(cls) -> None:
+        print(f'\n=== {cls.__name__} ===')
         cls.tmp_dir    = Path(tempfile.mkdtemp(prefix='gpem_tz_fallback_test_'))
         cls.input_dir  = cls.tmp_dir / 'input'
         cls.output_dir = cls.tmp_dir / 'output'
@@ -3741,6 +3746,7 @@ class TestJpegCompression(unittest.TestCase):
 
     @classmethod
     def setUpClass(cls) -> None:
+        print(f'\n=== {cls.__name__} ===')
         cls.tmp_dir    = Path(tempfile.mkdtemp(prefix='gpem_jpeg_test_'))
         cls.input_dir  = cls.tmp_dir / 'input'
         cls.output_dir = cls.tmp_dir / 'output'
@@ -3938,6 +3944,7 @@ class TestJpegCompressionWithFullTree(unittest.TestCase):
 
     @classmethod
     def setUpClass(cls) -> None:
+        print(f'\n=== {cls.__name__} ===')
         if os.environ.get('GPEM_SKIP_JPEG_FULL_TREE') == '1':
             raise unittest.SkipTest(
                 'JPEG full-tree tests skipped '
