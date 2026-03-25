@@ -17,6 +17,7 @@ import os
 import shutil
 import subprocess
 import sys
+import tempfile
 
 
 DIRECT_WRITE_EXTS = {'.jpg', '.jpeg', '.tiff', '.tif', '.dng', '.cr2', '.heic'}
@@ -378,33 +379,55 @@ def _write_compressed_jpeg_with_metadata(
     3. Applies tag modifications (dates, descriptions, GPS, etc.)
     4. Writes the result to *output_path*
 
+    Arguments are passed via a UTF-8 encoded argfile (``-@``) rather than
+    on the command line, because on Windows the command line is decoded
+    using the system code page (e.g. cp1252) which corrupts non-Latin
+    characters such as CJK ideographs in descriptions.
+
     This avoids writing the compressed image to disk as an intermediate
     step.  The piping approach (stdin) works on both Windows and Linux.
 
     Returns True on success, False on failure.
     """
-    cmd = [
-        'exiftool',
+    # Build the argument list — one argument per line in the argfile.
+    args = [
+        '-n',                             # numeric tag values (GPSAltitudeRef etc.)
+        '-charset', 'utf8',
         '-charset', 'filename=utf8',
         '-TagsFromFile', str(source_path),
         '-All:All',                       # copy every tag group
     ]
-    cmd.extend(tag_params)
-    cmd.extend(['-o', str(output_path), '-'])
+    args.extend(tag_params)
+    args.extend(['-o', str(output_path), '-'])
 
+    # Write arguments to a temporary UTF-8 argfile so ExifTool reads them
+    # with the correct encoding regardless of the Windows system code page.
+    argfile_fd, argfile_path = tempfile.mkstemp(suffix='.args', prefix='et_')
     try:
-        result = subprocess.run(
-            cmd,
-            input=jpeg_bytes,
-            capture_output=True,
-            timeout=120,
-        )
-    except subprocess.TimeoutExpired:
-        logger.error("ExifTool timed out for compressed %s", source_path)
-        return False
-    except Exception as e:
-        logger.error("ExifTool subprocess failed for %s: %s", source_path, e)
-        return False
+        with os.fdopen(argfile_fd, 'w', encoding='utf-8') as f:
+            for arg in args:
+                f.write(arg + '\n')
+
+        cmd = ['exiftool', '-@', argfile_path]
+
+        try:
+            result = subprocess.run(
+                cmd,
+                input=jpeg_bytes,
+                capture_output=True,
+                timeout=120,
+            )
+        except subprocess.TimeoutExpired:
+            logger.error("ExifTool timed out for compressed %s", source_path)
+            return False
+        except Exception as e:
+            logger.error("ExifTool subprocess failed for %s: %s", source_path, e)
+            return False
+    finally:
+        try:
+            os.unlink(argfile_path)
+        except OSError:
+            pass
 
     if not output_path.exists():
         stderr_msg = result.stderr.decode('utf-8', errors='replace').strip()
