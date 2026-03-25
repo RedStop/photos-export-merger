@@ -22,6 +22,19 @@ class TimezoneOverride:
     tz:        timezone   # the timezone to apply
 
 
+@dataclass
+class JpegSkipTimerange:
+    """Exclude JPEGs from recompression when their resolved datetime falls
+    within [start_utc, end_utc].
+
+    The start/end boundaries are stored as timezone-aware UTC datetimes.
+    The user-facing CLI accepts local times with a timezone offset; the
+    parsing layer converts them to UTC before constructing this dataclass.
+    """
+    start_utc: datetime   # inclusive, must be timezone-aware (UTC)
+    end_utc:   datetime   # inclusive, must be timezone-aware (UTC)
+
+
 class WriteStrategy(enum.Enum):
     DIRECT = 1                  # Write all tags to file, no sidecar
     PARTIAL_WITH_SIDECAR = 2    # Write what's possible + XMP sidecar
@@ -79,6 +92,10 @@ class MediaFileInfo:
     # active --jpeg-quality-skip-editor patterns.  Prevents JPEG recompression
     # for images exported from professional editing software.
     jpeg_skip_editor: bool = False
+    # True when the file's resolved_datetime falls within a
+    # --jpeg-quality-skip-timerange range.  Takes precedence over
+    # jpeg_skip_editor.
+    jpeg_skip_timerange: bool = False
 
 
 @dataclass
@@ -103,6 +120,7 @@ class MergeStats:
     jpeg_quality_checked: int = 0
     jpeg_compress_skipped_larger: int = 0
     jpeg_compress_skipped_editor: int = 0
+    jpeg_compress_skipped_timerange: int = 0
 
     def merge(self, other: 'MergeStats') -> None:
         """Add all counters from *other* into this instance.
@@ -124,6 +142,7 @@ class MergeStats:
         self.jpeg_quality_unknown += other.jpeg_quality_unknown
         self.jpeg_compress_skipped_larger += other.jpeg_compress_skipped_larger
         self.jpeg_compress_skipped_editor += other.jpeg_compress_skipped_editor
+        self.jpeg_compress_skipped_timerange += other.jpeg_compress_skipped_timerange
 
 
 def _resolve_gps(json_data: Dict[str, Any]) -> Optional[Dict[str, float]]:
@@ -149,7 +168,8 @@ class AbstractMediaMerger(ABC):
                  tz_overrides: Optional[List[TimezoneOverride]] = None,
                  fallback_tz: Optional[timezone] = None,
                  jpeg_compress_quality: Optional[int] = None,
-                 editor_skip_patterns: Optional[List[Dict[str, List[str]]]] = None):
+                 editor_skip_patterns: Optional[List[Dict[str, List[str]]]] = None,
+                 jpeg_compress_skip_timeranges: Optional[List[JpegSkipTimerange]] = None):
         self.input_path = Path(input_dir).resolve()
         self.output_path = Path(output_dir).resolve()
         self.dry_run = dry_run
@@ -159,6 +179,7 @@ class AbstractMediaMerger(ABC):
         self.tz_overrides: List[TimezoneOverride] = tz_overrides or []
         self.jpeg_compress_quality: Optional[int] = jpeg_compress_quality
         self.editor_skip_patterns: List[Dict[str, List[str]]] = editor_skip_patterns or []
+        self.jpeg_compress_skip_timeranges: List[JpegSkipTimerange] = jpeg_compress_skip_timeranges or []
         # Fallback timezone: use the provided value, or detect the host
         # machine's local UTC offset as a fixed-offset timezone.
         if fallback_tz is not None:
@@ -404,6 +425,8 @@ class AbstractMediaMerger(ABC):
             self.logger.info("JPEG compressed:                %d", stats.jpeg_compressed)
         if stats.jpeg_compress_skipped_larger > 0:
             self.logger.info("JPEG compress skipped (larger): %d", stats.jpeg_compress_skipped_larger)
+        if stats.jpeg_compress_skipped_timerange > 0:
+            self.logger.info("JPEG compress skipped (time):   %d", stats.jpeg_compress_skipped_timerange)
         if stats.jpeg_compress_skipped_editor > 0:
             self.logger.info("JPEG compress skipped (editor): %d", stats.jpeg_compress_skipped_editor)
         if stats.date_from_exif > 0:

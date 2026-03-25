@@ -1,6 +1,6 @@
 from AbstractMediaMerger import (AbstractMediaMerger, WriteStrategy,
                                   MediaFileInfo, MergeStats, _resolve_gps,
-                                  TimezoneOverride)
+                                  TimezoneOverride, JpegSkipTimerange)
 from collections import defaultdict
 from concurrent.futures import ProcessPoolExecutor, as_completed
 from datetime import datetime, timezone, timedelta
@@ -210,6 +210,18 @@ def _check_editor_skip(tags: dict, info: MediaFileInfo,
             return
 
 
+def _check_jpeg_skip_timerange(info: MediaFileInfo,
+                                timeranges: List[JpegSkipTimerange]) -> None:
+    """Set ``info.jpeg_skip_timerange`` if resolved datetime is within a range."""
+    if info.resolved_datetime is None:
+        return
+    utc_dt = info.resolved_datetime.astimezone(timezone.utc)
+    for tr in timeranges:
+        if tr.start_utc <= utc_dt <= tr.end_utc:
+            info.jpeg_skip_timerange = True
+            return
+
+
 def _get_write_strategy(ext: str) -> Optional[WriteStrategy]:
     ext_lower = ext.lower()
     if ext_lower in DIRECT_WRITE_EXTS:
@@ -285,6 +297,37 @@ def _parse_tz_override(value: str) -> TimezoneOverride:
         raise ValueError(
             f"Start UTC ({start_str}) is after end UTC ({end_str})")
     return TimezoneOverride(start_utc=start, end_utc=end, tz=tz)
+
+
+def _parse_jpeg_skip_timerange(value: str) -> JpegSkipTimerange:
+    """Parse a --jpeg-quality-skip-timerange CLI value.
+
+    Format: "YYYY-MM-DD HH:MM:SS,YYYY-MM-DD HH:MM:SS,+HH:MM"
+    The start/end datetimes are in the timezone given by the third field.
+    They are converted to UTC for storage/comparison.
+    """
+    parts = value.split(',')
+    if len(parts) != 3:
+        raise ValueError(
+            f"Expected 'START,END,OFFSET' but got: {value!r}")
+    start_str, end_str, tz_str = [p.strip() for p in parts]
+    tz = _parse_tz_offset(tz_str)
+    if tz is None:
+        raise ValueError(f"Invalid timezone offset: {tz_str!r}")
+    try:
+        start = datetime.strptime(start_str, '%Y-%m-%d %H:%M:%S').replace(tzinfo=tz)
+    except ValueError:
+        raise ValueError(f"Invalid start datetime: {start_str!r}")
+    try:
+        end = datetime.strptime(end_str, '%Y-%m-%d %H:%M:%S').replace(tzinfo=tz)
+    except ValueError:
+        raise ValueError(f"Invalid end datetime: {end_str!r}")
+    start_utc = start.astimezone(timezone.utc)
+    end_utc = end.astimezone(timezone.utc)
+    if start_utc > end_utc:
+        raise ValueError(
+            f"Start ({start_str}) is after end ({end_str}) in timezone {tz_str}")
+    return JpegSkipTimerange(start_utc=start_utc, end_utc=end_utc)
     total_seconds = int(offset.total_seconds())
     sign = '+' if total_seconds >= 0 else '-'
     total_seconds = abs(total_seconds)
@@ -420,12 +463,15 @@ def _needs_jpeg_compression(info: MediaFileInfo) -> bool:
 
     Compression is triggered when all of these are true:
     - JPEG compression is enabled (jpeg_compress_quality is set)
+    - The file is NOT excluded by a time-range skip
     - The source file was NOT exported from a skipped editor
     - The source file has a JPEG extension
     - The estimated quality exceeds the target threshold, OR the quality
       could not be determined (conservative — recompress to be safe)
     """
     if info.jpeg_compress_quality is None:
+        return False
+    if info.jpeg_skip_timerange:
         return False
     if info.jpeg_skip_editor:
         return False
@@ -536,10 +582,16 @@ def _do_process_matched(et, info: MediaFileInfo, stats: MergeStats,
 
     info.output_path.parent.mkdir(parents=True, exist_ok=True)
 
-    if (info.jpeg_skip_editor and info.jpeg_compress_quality is not None
-            and info.source_path.suffix.lower() in JPEG_EXTENSIONS
-            and (info.jpeg_quality is None
-                 or info.jpeg_quality > info.jpeg_compress_quality)):
+    # Check time-range and editor skip counters (timerange takes precedence).
+    _would_compress = (info.jpeg_compress_quality is not None
+                       and info.source_path.suffix.lower() in JPEG_EXTENSIONS
+                       and (info.jpeg_quality is None
+                            or info.jpeg_quality > info.jpeg_compress_quality))
+    if _would_compress and info.jpeg_skip_timerange:
+        stats.jpeg_compress_skipped_timerange += 1
+        logger.info("SKIP-TIME    %s  (within excluded time range, skipping compression)",
+                     info.source_path.name)
+    elif _would_compress and info.jpeg_skip_editor:
         stats.jpeg_compress_skipped_editor += 1
         logger.info("SKIP-EDITOR  %s  (exported from known editor, skipping compression)",
                      info.source_path.name)
@@ -777,10 +829,16 @@ def _do_process_orphan(et, info: MediaFileInfo, stats: MergeStats,
 
     info.output_path.parent.mkdir(parents=True, exist_ok=True)
 
-    if (info.jpeg_skip_editor and info.jpeg_compress_quality is not None
-            and info.source_path.suffix.lower() in JPEG_EXTENSIONS
-            and (info.jpeg_quality is None
-                 or info.jpeg_quality > info.jpeg_compress_quality)):
+    # Check time-range and editor skip counters (timerange takes precedence).
+    _would_compress = (info.jpeg_compress_quality is not None
+                       and info.source_path.suffix.lower() in JPEG_EXTENSIONS
+                       and (info.jpeg_quality is None
+                            or info.jpeg_quality > info.jpeg_compress_quality))
+    if _would_compress and info.jpeg_skip_timerange:
+        stats.jpeg_compress_skipped_timerange += 1
+        logger.info("SKIP-TIME    %s  (orphan, within excluded time range, skipping compression)",
+                     info.source_path.name)
+    elif _would_compress and info.jpeg_skip_editor:
         stats.jpeg_compress_skipped_editor += 1
         logger.info("SKIP-EDITOR  %s  (orphan, exported from known editor, skipping compression)",
                      info.source_path.name)
@@ -1080,14 +1138,16 @@ class PhotosExportMerger(AbstractMediaMerger):
                  tz_overrides: Optional[List[TimezoneOverride]] = None,
                  fallback_tz: Optional[timezone] = None,
                  jpeg_compress_quality: Optional[int] = None,
-                 editor_skip_patterns: Optional[List[Dict[str, List[str]]]] = None):
+                 editor_skip_patterns: Optional[List[Dict[str, List[str]]]] = None,
+                 jpeg_compress_skip_timeranges: Optional[List[JpegSkipTimerange]] = None):
         super().__init__(input_dir, output_dir, dry_run, blocked_descriptions,
                          num_workers=num_workers,
                          metadata_strip_params=metadata_strip_params,
                          tz_overrides=tz_overrides,
                          fallback_tz=fallback_tz,
                          jpeg_compress_quality=jpeg_compress_quality,
-                         editor_skip_patterns=editor_skip_patterns)
+                         editor_skip_patterns=editor_skip_patterns,
+                         jpeg_compress_skip_timeranges=jpeg_compress_skip_timeranges)
 
     def _open_writer(self) -> None:
         self._et_helper = exiftool.ExifToolHelper()
@@ -1341,6 +1401,10 @@ class PhotosExportMerger(AbstractMediaMerger):
                 info.year = local_dt.strftime('%Y')
                 info.month = local_dt.strftime('%m')
 
+                # Check if file falls within an excluded time range.
+                if self.jpeg_compress_skip_timeranges:
+                    _check_jpeg_skip_timerange(info, self.jpeg_compress_skip_timeranges)
+
             # Separate batch read for strip-metadata detection.
             # ExifTool normalises group names in returned keys (e.g.
             # XMP-GCamera:All → XMP:SpecialTypeID), so we cannot match
@@ -1458,6 +1522,10 @@ class PhotosExportMerger(AbstractMediaMerger):
                     info.date_source = date_source
                     info.year = resolved_dt.strftime('%Y')
                     info.month = resolved_dt.strftime('%m')
+
+                    # Check if file falls within an excluded time range.
+                    if self.jpeg_compress_skip_timeranges:
+                        _check_jpeg_skip_timerange(info, self.jpeg_compress_skip_timeranges)
 
             # Separate batch read for strip-metadata detection (see matched
             # files above for rationale).
@@ -1619,6 +1687,14 @@ if __name__ == '__main__':
                              'match against registry keys; repeatable).  '
                              'Use --list-editors to see available editors.  '
                              'Requires --jpeg-quality.')
+    parser.add_argument('--jpeg-quality-skip-timerange', action='append', default=[],
+                        dest='jpeg_quality_skip_timeranges',
+                        metavar='"START,END,OFFSET"',
+                        help='Skip JPEG compression for images whose resolved '
+                             'datetime falls within the given time range.  '
+                             'Repeatable.  Format: '
+                             '"YYYY-MM-DD HH:MM:SS,YYYY-MM-DD HH:MM:SS,+HH:MM".  '
+                             'Requires --jpeg-quality.')
     parser.add_argument('--list-editors', action='store_true',
                         help='Print available editor software names and exit.')
 
@@ -1675,6 +1751,16 @@ if __name__ == '__main__':
         except ValueError as e:
             parser.error(str(e))
 
+    # Resolve JPEG compression skip timeranges
+    jpeg_skip_timeranges: List[JpegSkipTimerange] = []
+    for val in args.jpeg_quality_skip_timeranges:
+        try:
+            jpeg_skip_timeranges.append(_parse_jpeg_skip_timerange(val))
+        except ValueError as e:
+            parser.error(f"Invalid --jpeg-quality-skip-timerange: {e}")
+    if jpeg_skip_timeranges and jpeg_compress_quality is None:
+        logging.warning("--jpeg-quality-skip-timerange has no effect without --jpeg-quality")
+
     blocked_descriptions = [
         # Add unwanted description strings here
         "SONY DSC",
@@ -1689,5 +1775,6 @@ if __name__ == '__main__':
                                 tz_overrides=tz_overrides or None,
                                 fallback_tz=fallback_tz,
                                 jpeg_compress_quality=jpeg_compress_quality,
-                                editor_skip_patterns=editor_skip_patterns)
+                                editor_skip_patterns=editor_skip_patterns,
+                                jpeg_compress_skip_timeranges=jpeg_skip_timeranges or None)
     result = merger.run()

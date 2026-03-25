@@ -72,6 +72,10 @@ python PhotosExportMerger.py input/ output/ --jpeg-quality 80
 python PhotosExportMerger.py input/ output/ --jpeg-quality 80 \
   --jpeg-quality-skip-editor lightroom --jpeg-quality-skip-editor darktable
 
+# Skip compression for photos taken during a Japan trip (March 10–20, JST)
+python PhotosExportMerger.py input/ output/ --jpeg-quality 80 \
+  --jpeg-quality-skip-timerange "2023-03-10 00:00:00,2023-03-20 23:59:59,+09:00"
+
 # List available editor software names
 python PhotosExportMerger.py --list-editors
 
@@ -174,6 +178,20 @@ Use `--list-editors` to see all available editors and their match patterns. Edit
 
 Add new editors to `EDITOR_SOFTWARE_PATTERNS` in `PhotosExportMerger.py` — they will automatically appear in `--list-editors`.
 
+#### Skipping images by time range
+
+`--jpeg-quality-skip-timerange "START,END,OFFSET"` excludes JPEGs whose resolved datetime falls within the given time range from recompression. The format is identical to `--tz-override`: the start and end datetimes are in the timezone specified by the third field, and are converted to UTC internally for comparison.
+
+The option is repeatable — specify multiple ranges to skip:
+
+```bash
+python PhotosExportMerger.py input/ output/ --jpeg-quality 80 \
+  --jpeg-quality-skip-timerange "2023-03-10 00:00:00,2023-03-20 23:59:59,+09:00" \
+  --jpeg-quality-skip-timerange "2023-06-01 00:00:00,2023-06-15 23:59:59,-04:00"
+```
+
+Time-range exclusion takes **precedence over** editor exclusion: if a file matches both a time range and an editor pattern, only the `jpeg_compress_skipped_timerange` counter is incremented (not `jpeg_compress_skipped_editor`). A warning is printed if used without `--jpeg-quality`.
+
 ### Blocking unwanted descriptions
 
 Edit the `blocked_descriptions` list in the `__main__` block of `PhotosExportMerger.py`:
@@ -236,6 +254,6 @@ The merger uses the following JSON fields (all other fields are ignored):
 | `PhotosExportMerger.py` | Concrete implementation, ExifTool integration, CLI, parallel processing |
 | `JsonFileIdentifier.py` | Matches JSON metadata files to media files |
 | `JsonKeyExtractor.py` | Analysis tool — scans exports and generates structural reports |
-| `TestMerger.py` | Integration test suite (185+ tests across multiple configurations) |
+| `TestMerger.py` | Integration test suite (420+ tests across multiple configurations) |
 
 **Data flow:** `JsonKeyExtractor` scans → `JsonFileIdentifier` matches JSON to media → `PhotosExportMerger` writes EXIF metadata.

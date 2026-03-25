@@ -25,7 +25,8 @@ from typing import Any, Dict
 import exiftool
 from PIL import Image
 from PhotosExportMerger import (PhotosExportMerger, MergeStats,
-                                _resolve_editor_skip_patterns)
+                                _resolve_editor_skip_patterns,
+                                _parse_jpeg_skip_timerange)
 
 # Custom log level below DEBUG (10) — used by infrastructure-validation tests
 # to document intent without cluttering normal output.
@@ -2497,6 +2498,11 @@ class TestPhotosExportMerger(BaseTestCase):
         self.assertEqual(self.stats.jpeg_compress_skipped_larger, 0,
                          f"Expected 0 jpeg_compress_skipped_larger, got {self.stats.jpeg_compress_skipped_larger}")
 
+    def test_stats_jpeg_compress_skipped_timerange_disabled(self) -> None:
+        """jpeg_compress_skipped_timerange = 0 when --jpeg-quality is not set."""
+        self.assertEqual(self.stats.jpeg_compress_skipped_timerange, 0,
+                         f"Expected 0 jpeg_compress_skipped_timerange, got {self.stats.jpeg_compress_skipped_timerange}")
+
     # ------------------------------------------------------------------
     # Category 13 — Video UTC Time
     # ------------------------------------------------------------------
@@ -3797,12 +3803,14 @@ class TestJpegCompression(BaseTestCase):
 # excluded editors' files are NOT compressed while non-excluded files ARE.
 
 
-class _EditorSkipBase(BaseTestCase):
-    """Base class for editor-skip compression tests.
+class _JpegSkipBase(BaseTestCase):
+    """Base class for editor-skip and time-range-skip compression tests.
 
     Creates high-quality (q=98) and low-quality (q=50) JPEGs tagged with
-    each editor's Software string, plus one untagged control JPEG.
-    Subclasses set ``_SKIP_EDITORS`` to control which editor is excluded.
+    each editor's Software string, plus one untagged control JPEG, plus
+    time-range test JPEGs with distinct timestamps.
+    Subclasses set ``_SKIP_EDITORS`` and ``_SKIP_TIMERANGES`` to control
+    which editor and/or time ranges are excluded.
     """
 
     # (high_q_filename, low_q_filename, EXIF:Software value, editor key)
@@ -3813,17 +3821,27 @@ class _EditorSkipBase(BaseTestCase):
          'darktable 4.6.1',                       'darktable'),
     ]
     _SKIP_EDITORS: list = []
+    _SKIP_TIMERANGES: list = []
     _COMPRESS_QUALITY = 80
+
+    # Timestamps for time-range test files (editor files use default 1723113846 = 2024-08-08 UTC)
+    # Inside range:  2024-07-03 10:26:40 UTC
+    _TR_INSIDE_TS = '1720000000'
+    # Outside range: 2024-08-30 14:40:00 UTC
+    _TR_OUTSIDE_TS = '1725000000'
+    # Skip range covers July 2024 in UTC:
+    # "2024-07-01 00:00:00,2024-07-31 23:59:59,+00:00"
+    _TR_RANGE = '2024-07-01 00:00:00,2024-07-31 23:59:59,+00:00'
 
     @classmethod
     def setUpClass(cls) -> None:
         print(f'\n=== {cls.__name__} ===')
-        cls.tmp_dir    = Path(tempfile.mkdtemp(prefix='gpem_edskip_test_'))
+        cls.tmp_dir    = Path(tempfile.mkdtemp(prefix='gpem_jpegskip_test_'))
         cls.input_dir  = cls.tmp_dir / 'input'
         cls.output_dir = cls.tmp_dir / 'output'
         cls.input_dir.mkdir()
 
-        d = cls.input_dir / 'EditorSkip'
+        d = cls.input_dir / 'JpegSkip'
         d.mkdir(parents=True)
 
         cls._source_sizes: Dict[str, int] = {}
@@ -3852,6 +3870,44 @@ class _EditorSkipBase(BaseTestCase):
                     params=['-overwrite_original'],
                 )
 
+            # -- Time-range test files --
+
+            # High-quality JPEG inside the skip range (July 2024)
+            tr_in_bytes = _make_pillow_jpeg(quality=98, seed=seed)
+            (d / 'tr_inside_high.jpg').write_bytes(tr_in_bytes)
+            cls._source_sizes['tr_inside_high.jpg'] = len(tr_in_bytes)
+            make_json_file(d / 'tr_inside_high.jpg.json',
+                           title='tr_inside_high.jpg',
+                           photoTakenTime={'timestamp': cls._TR_INSIDE_TS,
+                                           'formatted': ''})
+            seed += 1
+
+            # High-quality JPEG outside the skip range (Aug 30 2024)
+            tr_out_bytes = _make_pillow_jpeg(quality=98, seed=seed)
+            (d / 'tr_outside_high.jpg').write_bytes(tr_out_bytes)
+            cls._source_sizes['tr_outside_high.jpg'] = len(tr_out_bytes)
+            make_json_file(d / 'tr_outside_high.jpg.json',
+                           title='tr_outside_high.jpg',
+                           photoTakenTime={'timestamp': cls._TR_OUTSIDE_TS,
+                                           'formatted': ''})
+            seed += 1
+
+            # High-quality JPEG with editor tag AND inside the skip range
+            # (tests precedence: timerange > editor)
+            tr_ed_bytes = _make_pillow_jpeg(quality=98, seed=seed)
+            (d / 'tr_editor_inside_high.jpg').write_bytes(tr_ed_bytes)
+            cls._source_sizes['tr_editor_inside_high.jpg'] = len(tr_ed_bytes)
+            make_json_file(d / 'tr_editor_inside_high.jpg.json',
+                           title='tr_editor_inside_high.jpg',
+                           photoTakenTime={'timestamp': cls._TR_INSIDE_TS,
+                                           'formatted': ''})
+            et.set_tags(
+                [str(d / 'tr_editor_inside_high.jpg')],
+                {'EXIF:Software': 'Adobe Photoshop Lightroom Classic 12.0'},
+                params=['-overwrite_original'],
+            )
+            seed += 1
+
         # Untagged high-quality control JPEG (always compressed)
         plain_bytes = _make_pillow_jpeg(quality=98, seed=seed)
         (d / 'plain_high.jpg').write_bytes(plain_bytes)
@@ -3861,6 +3917,10 @@ class _EditorSkipBase(BaseTestCase):
         # Resolve editor skip patterns from subclass setting
         editor_skip_patterns = _resolve_editor_skip_patterns(cls._SKIP_EDITORS)
 
+        # Resolve time-range skip from subclass setting
+        jpeg_skip_timeranges = [_parse_jpeg_skip_timerange(v)
+                                for v in cls._SKIP_TIMERANGES]
+
         merger = PhotosExportMerger(
             str(cls.input_dir),
             str(cls.output_dir),
@@ -3868,6 +3928,7 @@ class _EditorSkipBase(BaseTestCase):
             fallback_tz=timezone(timedelta(hours=2)),
             jpeg_compress_quality=cls._COMPRESS_QUALITY,
             editor_skip_patterns=editor_skip_patterns,
+            jpeg_compress_skip_timeranges=jpeg_skip_timeranges or None,
         )
         cls.stats = merger.run()
 
@@ -3897,12 +3958,13 @@ class _EditorSkipBase(BaseTestCase):
                                 f"output={output_size} vs source={source_size}")
 
 
-class TestJpegEditorSkipLightroom(_EditorSkipBase):
-    """Exclude Lightroom: LR files NOT compressed, others ARE."""
+class TestJpegSkipLightroom(_JpegSkipBase):
+    """Exclude Lightroom + July 2024 time range: LR and in-range files NOT compressed."""
 
     _SKIP_EDITORS = ['lightroom']
+    _SKIP_TIMERANGES = [_JpegSkipBase._TR_RANGE]
 
-    # -- Lightroom files (excluded) --
+    # -- Lightroom files (excluded by editor) --
 
     def test_lr_high_not_compressed(self) -> None:
         """Lightroom high-q JPEG was NOT compressed (excluded editor)."""
@@ -3935,27 +3997,64 @@ class TestJpegEditorSkipLightroom(_EditorSkipBase):
         """Untagged high-q JPEG WAS compressed (no editor tag)."""
         self._assert_compressed('plain_high.jpg')
 
+    # -- Time-range files --
+
+    def test_tr_inside_not_compressed(self) -> None:
+        """High-q JPEG inside excluded time range was NOT compressed."""
+        self._assert_not_compressed('tr_inside_high.jpg')
+
+    def test_tr_outside_was_compressed(self) -> None:
+        """High-q JPEG outside excluded time range WAS compressed."""
+        self._assert_compressed('tr_outside_high.jpg')
+
+    def test_tr_editor_inside_not_compressed(self) -> None:
+        """High-q JPEG with editor tag AND inside time range was NOT compressed."""
+        self._assert_not_compressed('tr_editor_inside_high.jpg')
+
+    def test_tr_inside_timestamp_in_range(self) -> None:
+        """Assert tr_inside_high.jpg resolved datetime is within the skip range."""
+        tags = self._read_tags('tr_inside_high.jpg',
+                               ['EXIF:DateTimeOriginal'])
+        dt_str = tags.get('EXIF:DateTimeOriginal', '')
+        self.assertIn('2024:07', dt_str,
+                      f"Expected July 2024 timestamp, got {dt_str!r}")
+
+    def test_tr_outside_timestamp_out_of_range(self) -> None:
+        """Assert tr_outside_high.jpg resolved datetime is outside the skip range."""
+        tags = self._read_tags('tr_outside_high.jpg',
+                               ['EXIF:DateTimeOriginal'])
+        dt_str = tags.get('EXIF:DateTimeOriginal', '')
+        self.assertIn('2024:08', dt_str,
+                      f"Expected August 2024 timestamp, got {dt_str!r}")
+
     # -- Stats --
 
     def test_stats_skipped_editor(self) -> None:
-        """jpeg_compress_skipped_editor = 1 (lr_high only; lr_low is below threshold)."""
+        """jpeg_compress_skipped_editor = 1 (lr_high only; tr_editor_inside counted as timerange)."""
         self.assertEqual(self.stats.jpeg_compress_skipped_editor, 1,
                          f"Expected 1 jpeg_compress_skipped_editor, "
                          f"got {self.stats.jpeg_compress_skipped_editor}")
 
+    def test_stats_skipped_timerange(self) -> None:
+        """jpeg_compress_skipped_timerange = 2 (tr_inside_high + tr_editor_inside_high)."""
+        self.assertEqual(self.stats.jpeg_compress_skipped_timerange, 2,
+                         f"Expected 2 jpeg_compress_skipped_timerange, "
+                         f"got {self.stats.jpeg_compress_skipped_timerange}")
+
     def test_stats_compressed(self) -> None:
-        """jpeg_compressed = 2 (dt_high + plain_high)."""
-        self.assertEqual(self.stats.jpeg_compressed, 2,
-                         f"Expected 2 jpeg_compressed, "
+        """jpeg_compressed = 3 (dt_high + plain_high + tr_outside_high)."""
+        self.assertEqual(self.stats.jpeg_compressed, 3,
+                         f"Expected 3 jpeg_compressed, "
                          f"got {self.stats.jpeg_compressed}")
 
 
-class TestJpegEditorSkipDarktable(_EditorSkipBase):
-    """Exclude Darktable: DT files NOT compressed, others ARE."""
+class TestJpegSkipDarktable(_JpegSkipBase):
+    """Exclude Darktable + July 2024 time range: DT and in-range files NOT compressed."""
 
     _SKIP_EDITORS = ['darktable']
+    _SKIP_TIMERANGES = [_JpegSkipBase._TR_RANGE]
 
-    # -- Darktable files (excluded) --
+    # -- Darktable files (excluded by editor) --
 
     def test_dt_high_not_compressed(self) -> None:
         """Darktable high-q JPEG was NOT compressed (excluded editor)."""
@@ -3988,18 +4087,54 @@ class TestJpegEditorSkipDarktable(_EditorSkipBase):
         """Untagged high-q JPEG WAS compressed (no editor tag)."""
         self._assert_compressed('plain_high.jpg')
 
+    # -- Time-range files --
+
+    def test_tr_inside_not_compressed(self) -> None:
+        """High-q JPEG inside excluded time range was NOT compressed."""
+        self._assert_not_compressed('tr_inside_high.jpg')
+
+    def test_tr_outside_was_compressed(self) -> None:
+        """High-q JPEG outside excluded time range WAS compressed."""
+        self._assert_compressed('tr_outside_high.jpg')
+
+    def test_tr_editor_inside_not_compressed(self) -> None:
+        """High-q JPEG with editor tag AND inside time range was NOT compressed."""
+        self._assert_not_compressed('tr_editor_inside_high.jpg')
+
+    def test_tr_inside_timestamp_in_range(self) -> None:
+        """Assert tr_inside_high.jpg resolved datetime is within the skip range."""
+        tags = self._read_tags('tr_inside_high.jpg',
+                               ['EXIF:DateTimeOriginal'])
+        dt_str = tags.get('EXIF:DateTimeOriginal', '')
+        self.assertIn('2024:07', dt_str,
+                      f"Expected July 2024 timestamp, got {dt_str!r}")
+
+    def test_tr_outside_timestamp_out_of_range(self) -> None:
+        """Assert tr_outside_high.jpg resolved datetime is outside the skip range."""
+        tags = self._read_tags('tr_outside_high.jpg',
+                               ['EXIF:DateTimeOriginal'])
+        dt_str = tags.get('EXIF:DateTimeOriginal', '')
+        self.assertIn('2024:08', dt_str,
+                      f"Expected August 2024 timestamp, got {dt_str!r}")
+
     # -- Stats --
 
     def test_stats_skipped_editor(self) -> None:
-        """jpeg_compress_skipped_editor = 1 (dt_high only; dt_low is below threshold)."""
+        """jpeg_compress_skipped_editor = 1 (dt_high only; tr_editor_inside counted as timerange)."""
         self.assertEqual(self.stats.jpeg_compress_skipped_editor, 1,
                          f"Expected 1 jpeg_compress_skipped_editor, "
                          f"got {self.stats.jpeg_compress_skipped_editor}")
 
+    def test_stats_skipped_timerange(self) -> None:
+        """jpeg_compress_skipped_timerange = 2 (tr_inside_high + tr_editor_inside_high)."""
+        self.assertEqual(self.stats.jpeg_compress_skipped_timerange, 2,
+                         f"Expected 2 jpeg_compress_skipped_timerange, "
+                         f"got {self.stats.jpeg_compress_skipped_timerange}")
+
     def test_stats_compressed(self) -> None:
-        """jpeg_compressed = 2 (lr_high + plain_high)."""
-        self.assertEqual(self.stats.jpeg_compressed, 2,
-                         f"Expected 2 jpeg_compressed, "
+        """jpeg_compressed = 3 (lr_high + plain_high + tr_outside_high)."""
+        self.assertEqual(self.stats.jpeg_compressed, 3,
+                         f"Expected 3 jpeg_compressed, "
                          f"got {self.stats.jpeg_compressed}")
 
 
@@ -4170,8 +4305,8 @@ if __name__ == '__main__':
         'TestTimezoneOverride':            TestTimezoneOverride,
         'TestFallbackTimezone':            TestFallbackTimezone,
         'TestJpegCompression':             TestJpegCompression,
-        'TestJpegEditorSkipLightroom':     TestJpegEditorSkipLightroom,
-        'TestJpegEditorSkipDarktable':     TestJpegEditorSkipDarktable,
+        'TestJpegSkipLightroom':           TestJpegSkipLightroom,
+        'TestJpegSkipDarktable':           TestJpegSkipDarktable,
         'TestJpegCompressionWithFullTree': TestJpegCompressionWithFullTree,
     }
 
