@@ -3928,19 +3928,14 @@ class TestJpegCompression(unittest.TestCase):
 # Runs by default.  To skip (e.g. for faster iteration), set
 # GPEM_SKIP_JPEG_FULL_TREE=1 or pass --skip-jpeg-full-tree to the runner.
 
-class TestJpegCompressionWithFullTree(unittest.TestCase):
+class TestJpegCompressionWithFullTree(TestPhotosExportMerger):
     """Re-run the full input tree with --jpeg-quality to verify no regressions.
 
-    Uses the same _create_input_tree as the main test class and runs with
-    jpeg_compress_quality=80.  Verifies that all files are still written
-    successfully (same written count) and no errors occur — confirming the
-    JPEG compression code path doesn't break non-JPEG files or edge cases.
+    Inherits all tests from TestPhotosExportMerger and runs them against
+    output produced with jpeg_compress_quality=80.  Overrides the four
+    ``test_stats_jpeg_*_disabled`` assertions (which expect zero JPEG
+    activity) with the correct values for a compression-enabled run.
     """
-
-    tmp_dir:    Path
-    input_dir:  Path
-    output_dir: Path
-    stats:      MergeStats
 
     @classmethod
     def setUpClass(cls) -> None:
@@ -3960,12 +3955,10 @@ class TestJpegCompressionWithFullTree(unittest.TestCase):
         cls.output_dir = cls.tmp_dir / 'output'
         cls.input_dir.mkdir()
 
-        # Reuse the main test class's input-tree builder.
-        saved_input_dir = getattr(TestPhotosExportMerger, 'input_dir', None)
-        TestPhotosExportMerger.input_dir = cls.input_dir
-        TestPhotosExportMerger._create_input_tree()
-        if saved_input_dir is not None:
-            TestPhotosExportMerger.input_dir = saved_input_dir
+        cls._create_input_tree()
+
+        # Snapshot input BEFORE the merger touches anything
+        cls.input_snapshot = cls._snapshot(cls.input_dir)
 
         num_workers = os.cpu_count() or 1
         merger = PhotosExportMerger(
@@ -3983,6 +3976,30 @@ class TestJpegCompressionWithFullTree(unittest.TestCase):
         tmp = getattr(cls, 'tmp_dir', None)
         if tmp is not None:
             shutil.rmtree(str(tmp), ignore_errors=True)
+
+    # -- Override stats that differ when JPEG compression is enabled --------
+
+    def test_stats_jpeg_compressed_disabled(self) -> None:
+        """jpeg_compressed = 48 when --jpeg-quality is set."""
+        self.assertEqual(self.stats.jpeg_compressed, 48,
+                         f"Expected 48 jpeg_compressed, got {self.stats.jpeg_compressed}")
+
+    def test_stats_jpeg_quality_checked_disabled(self) -> None:
+        """jpeg_quality_checked = 48 when --jpeg-quality is set."""
+        self.assertEqual(self.stats.jpeg_quality_checked, 48,
+                         f"Expected 48 jpeg_quality_checked, got {self.stats.jpeg_quality_checked}")
+
+    def test_stats_jpeg_quality_unknown_disabled(self) -> None:
+        """jpeg_quality_unknown = 0 when --jpeg-quality is set (all test JPEGs have known quality)."""
+        self.assertEqual(self.stats.jpeg_quality_unknown, 0,
+                         f"Expected 0 jpeg_quality_unknown, got {self.stats.jpeg_quality_unknown}")
+
+    def test_stats_jpeg_compress_skipped_larger_disabled(self) -> None:
+        """jpeg_compress_skipped_larger = 0 when --jpeg-quality is set (all test JPEGs compress smaller)."""
+        self.assertEqual(self.stats.jpeg_compress_skipped_larger, 0,
+                         f"Expected 0 jpeg_compress_skipped_larger, got {self.stats.jpeg_compress_skipped_larger}")
+
+    # -- Additional JPEG-specific stats ------------------------------------
 
     def test_jpeg_full_tree_stats_written(self) -> None:
         """All 184 files written when JPEG compression is enabled."""
@@ -4279,8 +4296,11 @@ if __name__ == '__main__':
             print(f'  File types : {", ".join(args.file_types)}')
         suite = _filter_suite(suite, args.categories or [], args.file_types or [])
     # Sort tests by category then method name so the category banner fires once per group.
+    # Preserve the original class insertion order (don't sort by class name) to avoid
+    # unittest calling setUpClass/tearDownClass out of the intended sequence.
+    _class_order = {cls: i for i, cls in enumerate(dict.fromkeys(type(t) for t in suite))}
     suite = unittest.TestSuite(
-        sorted(suite, key=lambda t: (_cat(t._testMethodName), t._testMethodName))
+        sorted(suite, key=lambda t: (_class_order[type(t)], _cat(t._testMethodName), t._testMethodName))
     )
     # Count @expectedFailure tests so the summary can show "expected failures=N/M".
     _total_xfail = sum(
