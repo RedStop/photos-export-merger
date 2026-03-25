@@ -3101,7 +3101,7 @@ class TestPhotosExportMerger(BaseTestCase):
         print(f'\n  Input  : {cls.input_dir}')
         print(f'  Output : {cls.output_dir}')
 
-        mode = getattr(cls, '_cleanup_mode', 'prompt')
+        mode = getattr(cls, '_cleanup_mode', 'auto_delete')
         if mode == 'auto_delete':
             shutil.rmtree(str(cls.tmp_dir), ignore_errors=True)
             print(f'  Deleted: {cls.tmp_dir}')
@@ -4199,12 +4199,12 @@ if __name__ == '__main__':
         help='Run only tests whose method name contains EXT (case-insensitive; repeatable)',
     )
     parser.add_argument(
-        '--cleanup', action='store_true',
-        help='Delete temp files after run without prompting',
+        '--keep', action='store_true',
+        help='Keep temp files after run without prompting (default: auto-delete)',
     )
     parser.add_argument(
-        '--keep', action='store_true',
-        help='Keep temp files after run without prompting',
+        '--prompt-cleanup', action='store_true',
+        help='Prompt interactively whether to delete or keep temp files',
     )
     parser.add_argument(
         '--list-categories', action='store_true',
@@ -4252,12 +4252,12 @@ if __name__ == '__main__':
             print(f'  {i:>2}. {name}')
         sys.exit(0)
 
-    # ── Set cleanup mode ─────────────────────────────────────────────────────
-    if args.cleanup:
-        TestPhotosExportMerger._cleanup_mode = 'auto_delete'
-    elif args.keep:
+    # ── Set cleanup mode (default: auto-delete) ────────────────────────────
+    if args.keep:
         TestPhotosExportMerger._cleanup_mode = 'auto_keep'
-    # else leave default 'prompt'
+    elif args.prompt_cleanup:
+        TestPhotosExportMerger._cleanup_mode = 'prompt'
+    # else leave default 'auto_delete'
 
     # ── Enable single-worker tests if requested ──────────────────────────────
     # Also auto-enable when TestSingleWorker is explicitly selected via --class.
