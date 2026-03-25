@@ -574,24 +574,46 @@ class BaseTestCase(unittest.TestCase):
     output_dir: Path
     stats:      MergeStats
 
+    # -- ExifTool lifecycle (call from subclass setUpClass / tearDownClass) --
+
+    @classmethod
+    def _open_exiftool(cls) -> None:
+        """Open a long-lived ExifToolHelper for use by all test methods."""
+        cls._et = exiftool.ExifToolHelper(encoding='utf-8')
+        cls._et.__enter__()
+
+    @classmethod
+    def _close_exiftool(cls) -> None:
+        """Shut down the class-level ExifToolHelper if one is open."""
+        et = getattr(cls, '_et', None)
+        if et is not None:
+            et.__exit__(None, None, None)
+            cls._et = None
+
+    # -- Output-file index (call _build_output_index after merger.run()) ----
+
+    @classmethod
+    def _build_output_index(cls) -> None:
+        """Build a {filename: Path} lookup from the output tree."""
+        cls._output_index = {
+            f.name: f for f in cls.output_dir.rglob('*') if f.is_file()
+        }
+
     def _find_output_file(self, name: str) -> 'Path | None':
-        """Return the first output file whose name equals *name*, or None."""
-        for f in self.output_dir.rglob('*'):
-            if f.is_file() and f.name == name:
-                return f
-        return None
+        """Return the output file whose name equals *name*, or None."""
+        return self._output_index.get(name)
 
     def _read_tags(self, name: str, tags: list) -> dict:
         """Locate *name* in the output tree, read ExifTool tags, return tag dict."""
         f = self._find_output_file(name)
         if f is None:
             return {}
-        with exiftool.ExifToolHelper() as et:
-            result = et.get_tags([str(f)], tags)
-            return result[0] if result else {}
+        result = self._et.get_tags([str(f)], tags)
+        return result[0] if result else {}
 
     @classmethod
     def tearDownClass(cls) -> None:
+        cls._close_exiftool()
         tmp = getattr(cls, 'tmp_dir', None)
         if tmp is not None:
             shutil.rmtree(str(tmp), ignore_errors=True)
@@ -649,6 +671,9 @@ class TestPhotosExportMerger(BaseTestCase):
             fallback_tz=timezone(timedelta(hours=2)),
         )
         cls.stats = merger.run()
+
+        cls._open_exiftool()
+        cls._build_output_index()
 
     # ------------------------------------------------------------------
     # Input-tree builder
@@ -1209,9 +1234,7 @@ class TestPhotosExportMerger(BaseTestCase):
         """Locate *filename* in the output tree, read ExifTool tags, return tag dict."""
         path = self._find_output_file(filename)
         self.assertIsNotNone(path, f"Output file not found: {filename!r}")
-        # encoding='utf-8' prevents cp1252 decode errors on Windows for non-ASCII tags
-        with exiftool.ExifToolHelper(encoding='utf-8') as et:
-            results = et.get_tags([str(path)], tags)
+        results = self._et.get_tags([str(path)], tags)
         return results[0] if results else {}
 
     # ------------------------------------------------------------------
@@ -3057,6 +3080,7 @@ class TestPhotosExportMerger(BaseTestCase):
 
     @classmethod
     def tearDownClass(cls) -> None:
+        cls._close_exiftool()
         s = cls.stats
         print('\n' + '=' * 60)
         print('                   TEST SUMMARY')
@@ -3148,8 +3172,12 @@ class TestSingleWorker(TestPhotosExportMerger):
         )
         cls.stats = merger.run()
 
+        cls._open_exiftool()
+        cls._build_output_index()
+
     @classmethod
     def tearDownClass(cls) -> None:
+        cls._close_exiftool()
         tmp = getattr(cls, 'tmp_dir', None)
         if tmp is not None:
             shutil.rmtree(str(tmp), ignore_errors=True)
@@ -3208,6 +3236,9 @@ class TestMetadataStripping(BaseTestCase):
             fallback_tz=timezone(timedelta(hours=2)),
         )
         cls.stats = merger.run()
+
+        cls._open_exiftool()
+        cls._build_output_index()
 
     def test_strip_file_exists(self) -> None:
         """Output file is created when stripping is enabled."""
@@ -3331,6 +3362,9 @@ class TestTimezoneOverride(BaseTestCase):
             fallback_tz=timezone(timedelta(hours=2)),
         )
         cls.stats = merger.run()
+
+        cls._open_exiftool()
+        cls._build_output_index()
 
     def test_tz_override_zero_errors(self) -> None:
         """No errors during the override merger run."""
@@ -3468,6 +3502,9 @@ class TestFallbackTimezone(BaseTestCase):
             fallback_tz=timezone(timedelta(hours=-5)),
         )
         cls.stats = merger.run()
+
+        cls._open_exiftool()
+        cls._build_output_index()
 
     def test_fallback_tz_zero_errors(self) -> None:
         """No errors during the fallback timezone merger run."""
@@ -3631,6 +3668,9 @@ class TestJpegCompression(BaseTestCase):
             jpeg_compress_quality=cls._COMPRESS_QUALITY,
         )
         cls.stats = merger.run()
+
+        cls._open_exiftool()
+        cls._build_output_index()
 
     # -- File existence --
 
@@ -3797,8 +3837,12 @@ class TestJpegCompressionWithFullTree(TestPhotosExportMerger):
         )
         cls.stats = merger.run()
 
+        cls._open_exiftool()
+        cls._build_output_index()
+
     @classmethod
     def tearDownClass(cls) -> None:
+        cls._close_exiftool()
         tmp = getattr(cls, 'tmp_dir', None)
         if tmp is not None:
             shutil.rmtree(str(tmp), ignore_errors=True)
