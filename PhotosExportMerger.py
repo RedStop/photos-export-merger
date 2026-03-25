@@ -330,6 +330,185 @@ def _parse_jpeg_skip_timerange(value: str) -> JpegSkipTimerange:
     return JpegSkipTimerange(start_utc=start_utc, end_utc=end_utc)
 
 
+def _build_batch_read_tags(base_tags: List[str],
+                           blocked_descriptions,
+                           jpeg_compress_quality: Optional[int],
+                           editor_skip_patterns: List) -> List[str]:
+    """Build the tag list for a batch ExifTool get_tags() call.
+
+    Starts with *base_tags*, adds shared tags (CONDITIONAL_DATE_READ_TAGS,
+    File:FileTypeExtension, description/IPTC tags), and conditionally adds
+    JPEG quality and editor software tags.
+    """
+    tags = list(base_tags) + CONDITIONAL_DATE_READ_TAGS + ['File:FileTypeExtension']
+    tags += DESC_READ_TAGS if blocked_descriptions else ['IPTC:Caption-Abstract']
+    if jpeg_compress_quality is not None:
+        tags.append('File:JPEGQualityEstimate')
+    if editor_skip_patterns:
+        tags.extend(['EXIF:Software', 'XMP-xmp:CreatorTool'])
+    return tags
+
+
+def _extract_common_tags(info: MediaFileInfo, tags: dict,
+                         stats: MergeStats,
+                         jpeg_compress_quality: Optional[int],
+                         editor_skip_patterns: List,
+                         blocked_descriptions,
+                         logger: logging.Logger,
+                         rel_fn) -> None:
+    """Extract common tag info from batch EXIF read results into *info*.
+
+    Handles IPTC caption detection, existing XMP date tags, extension
+    mismatch detection, JPEG quality extraction, editor skip check, and
+    blocked descriptions.  For matched files (``info.json_data`` is not
+    None), blocked-description checks look at JSON first then EXIF; for
+    orphans (``info.json_data`` is None) only EXIF is checked.
+    """
+    if tags.get('IPTC:Caption-Abstract'):
+        info.has_iptc_caption = True
+
+    existing = {t for t in CONDITIONAL_DATE_READ_TAGS if tags.get(t)}
+    if existing:
+        info.existing_xmp_dates = existing
+
+    actual_type_ext = tags.get('File:FileTypeExtension')
+    if actual_type_ext:
+        actual = f'.{actual_type_ext.lower()}'
+        source = info.source_path.suffix.lower()
+        if actual != source and _is_real_ext_mismatch(source, actual):
+            info.actual_ext = actual
+            stats.ext_mismatches += 1
+            label = "orphan " if info.json_data is None else ""
+            logger.warning("Extension mismatch for %s%s: content is %s",
+                           label, rel_fn(info.source_path), actual_type_ext)
+
+    if jpeg_compress_quality is not None:
+        if info.source_path.suffix.lower() in JPEG_EXTENSIONS:
+            stats.jpeg_quality_checked += 1
+            raw_q = tags.get('File:JPEGQualityEstimate')
+            if raw_q is not None:
+                try:
+                    info.jpeg_quality = int(raw_q)
+                except (ValueError, TypeError):
+                    info.jpeg_quality = None
+                    stats.jpeg_quality_unknown += 1
+            else:
+                stats.jpeg_quality_unknown += 1
+
+    if editor_skip_patterns:
+        _check_editor_skip(tags, info, editor_skip_patterns)
+
+    if blocked_descriptions:
+        if info.json_data:
+            json_desc = info.json_data.get('description', '')
+            if json_desc and json_desc in blocked_descriptions:
+                info.clear_descriptions = True
+            elif not json_desc:
+                for desc_tag in DESC_READ_TAGS:
+                    exif_desc = tags.get(desc_tag, '')
+                    if exif_desc and str(exif_desc) in blocked_descriptions:
+                        info.clear_descriptions = True
+                        break
+        else:
+            for desc_tag in DESC_READ_TAGS:
+                exif_desc = tags.get(desc_tag, '')
+                if exif_desc and str(exif_desc) in blocked_descriptions:
+                    info.clear_descriptions = True
+                    break
+
+
+def _run_strip_metadata_batch(et, file_paths: List[str],
+                              infos: List[MediaFileInfo],
+                              strip_read_tags: List[str]) -> None:
+    """Batch-read strip metadata tags and flag files that have strippable metadata.
+
+    Sets ``info.has_strip_metadata = True`` for each file whose tag result
+    contains keys beyond the always-present SourceFile.
+    """
+    try:
+        strip_results = et.get_tags(file_paths, strip_read_tags)
+    except Exception:
+        strip_results = [{} for _ in infos]
+    for info, sr in zip(infos, strip_results):
+        if len(sr) > 1:
+            info.has_strip_metadata = True
+
+
+def _build_date_params(info: MediaFileInfo) -> List[str]:
+    """Build ExifTool date/timezone params based on ``info.write_strategy``.
+
+    Returns an empty list if ``info.resolved_datetime`` is None.
+    Dispatches on write strategy:
+    - DIRECT: ``-alldates`` + OffsetTime tags + conditional date params
+    - VIDEO_WITH_SIDECAR (QuickTime): UTC for QT tags, local+tz for
+      UserData/XMP tags
+    - PARTIAL_WITH_SIDECAR: XMP-only date tags with timezone
+    """
+    if not info.resolved_datetime:
+        return []
+
+    params: List[str] = []
+    dt_str = info.resolved_datetime.strftime('%Y:%m:%d %H:%M:%S')
+    tz_str = _format_tz_offset(info.resolved_datetime.tzinfo)
+
+    is_qt_video = (info.write_strategy == WriteStrategy.VIDEO_WITH_SIDECAR
+                   and info.source_path.suffix.lower() in QUICKTIME_VIDEO_EXTS)
+
+    if is_qt_video:
+        # QuickTime spec stores dates as UTC (no timezone field).
+        utc_dt = info.resolved_datetime.astimezone(timezone.utc)
+        utc_str = utc_dt.strftime('%Y:%m:%d %H:%M:%S')
+        params.append(f'-QuickTime:CreateDate={utc_str}')
+        params.append(f'-QuickTime:ModifyDate={utc_str}')
+        # UserData and XMP tags carry local time with timezone suffix.
+        local_with_tz = f'{dt_str}{tz_str}'
+        params.append(f'-UserData:DateTimeOriginal={local_with_tz}')
+        params.append(f'-XMP-exif:DateTimeOriginal={local_with_tz}')
+        params.append(f'-XMP-xmp:CreateDate={local_with_tz}')
+        params.append(f'-XMP-xmp:ModifyDate={local_with_tz}')
+    elif info.write_strategy == WriteStrategy.PARTIAL_WITH_SIDECAR:
+        # PNG/GIF lack EXIF; write XMP date tags explicitly so the
+        # timezone is preserved in both the file and its sidecar.
+        local_with_tz = f'{dt_str}{tz_str}'
+        params.append(f'-XMP-exif:DateTimeOriginal={local_with_tz}')
+        params.append(f'-XMP-xmp:CreateDate={local_with_tz}')
+        params.append(f'-XMP-xmp:ModifyDate={local_with_tz}')
+    else:
+        params.append(f'-alldates={dt_str}')
+        params.append(f'-EXIF:ExifIFD:OffsetTime={tz_str}')
+        params.append(f'-EXIF:ExifIFD:OffsetTimeOriginal={tz_str}')
+        params.append(f'-EXIF:ExifIFD:OffsetTimeDigitized={tz_str}')
+
+    params.extend(_build_conditional_date_params(info, dt_str, tz_str))
+    return params
+
+
+def _build_description_params(info: MediaFileInfo,
+                              stats: MergeStats) -> List[str]:
+    """Build ExifTool params for description clearing or writing.
+
+    Increments ``stats.descriptions_cleared`` when clearing.
+    Returns a list of ExifTool CLI parameters (may include ``-E`` flag).
+    """
+    params: List[str] = []
+    if info.clear_descriptions:
+        params.append('-EXIF:UserComment=')
+        params.append('-EXIF:ImageDescription=')
+        params.append('-XMP-dc:Description=')
+        if info.has_iptc_caption:
+            params.append('-IPTC:Caption-Abstract=')
+        stats.descriptions_cleared += 1
+    elif info.description and info.description.strip():
+        escaped, needs_E = _escape_description(info.description)
+        if needs_E:
+            params.append('-E')
+        params.append(f'-XMP-dc:Description={escaped}')
+        params.append(f'-EXIF:ImageDescription={escaped}')
+        if info.has_iptc_caption:
+            params.append(f'-IPTC:Caption-Abstract={escaped}')
+    return params
+
+
 def _build_gps_params(gps: Dict[str, float]) -> List[str]:
     """Build ExifTool GPS parameters from GPS dict."""
     lat = gps['latitude']
@@ -450,6 +629,74 @@ class _ext_mismatch_rename:
         if self.temp and self.temp.exists():
             self.temp.rename(self.original)
         return False
+
+
+def _log_jpeg_skip_counters(info: MediaFileInfo, stats: MergeStats,
+                            logger: logging.Logger, label: str = "") -> None:
+    """Check and log JPEG compression skips due to timerange or editor.
+
+    Increments ``stats.jpeg_compress_skipped_timerange`` or
+    ``stats.jpeg_compress_skipped_editor`` when the file would have been
+    compressed but is excluded.  *label* (e.g. ``"orphan, "``) is
+    inserted into log messages for context.
+    """
+    would_compress = (info.jpeg_compress_quality is not None
+                      and info.source_path.suffix.lower() in JPEG_EXTENSIONS
+                      and (info.jpeg_quality is None
+                           or info.jpeg_quality > info.jpeg_compress_quality))
+    if would_compress and info.jpeg_skip_timerange:
+        stats.jpeg_compress_skipped_timerange += 1
+        logger.info("SKIP-TIME    %s  (%swithin excluded time range, skipping compression)",
+                     info.source_path.name, label)
+    elif would_compress and info.jpeg_skip_editor:
+        stats.jpeg_compress_skipped_editor += 1
+        logger.info("SKIP-EDITOR  %s  (%sexported from known editor, skipping compression)",
+                     info.source_path.name, label)
+
+
+def _compress_and_write_jpeg(info: MediaFileInfo, tag_params: List[str],
+                             stats: MergeStats, logger: logging.Logger,
+                             label: str = "") -> bool:
+    """Compress a JPEG with Pillow and write it with metadata via exiftool.
+
+    Handles Pillow compression, size guard (falls back to original bytes
+    if compression doesn't reduce size), ``_write_compressed_jpeg_with_metadata``
+    call, logging, and stats counters.  *label* (e.g. ``"orphan "``) is
+    inserted into log messages.  Returns True on success, False on error.
+    """
+    try:
+        jpeg_bytes = _compress_jpeg_to_bytes(info.source_path,
+                                             info.jpeg_compress_quality)
+    except Exception as e:
+        logger.error("Pillow compression failed for %s%s: %s",
+                     label, info.source_path, e)
+        stats.errors += 1
+        return False
+
+    original_size = info.source_path.stat().st_size
+    if len(jpeg_bytes) >= original_size:
+        logger.info("SKIP-COMPRESS  %s  (%scompressed %d bytes >= original %d bytes, using original)",
+                    info.source_path, label, len(jpeg_bytes), original_size)
+        jpeg_bytes = info.source_path.read_bytes()
+        stats.jpeg_compress_skipped_larger += 1
+        compressed = False
+    else:
+        compressed = True
+
+    if not _write_compressed_jpeg_with_metadata(
+        jpeg_bytes, info.source_path, info.output_path, tag_params, logger
+    ):
+        stats.errors += 1
+        return False
+
+    if compressed:
+        q_str = f'{info.jpeg_quality}%' if info.jpeg_quality is not None else 'unknown'
+        logger.info("COMPRESS  %s  (%swas ~%s -> %d%%, %d bytes -> %d bytes)",
+                    info.source_path.name, label, q_str, info.jpeg_compress_quality,
+                    original_size, len(jpeg_bytes))
+        stats.jpeg_compressed += 1
+
+    return True
 
 
 def _needs_jpeg_compression(info: MediaFileInfo) -> bool:
@@ -576,19 +823,7 @@ def _do_process_matched(et, info: MediaFileInfo, stats: MergeStats,
 
     info.output_path.parent.mkdir(parents=True, exist_ok=True)
 
-    # Check time-range and editor skip counters (timerange takes precedence).
-    _would_compress = (info.jpeg_compress_quality is not None
-                       and info.source_path.suffix.lower() in JPEG_EXTENSIONS
-                       and (info.jpeg_quality is None
-                            or info.jpeg_quality > info.jpeg_compress_quality))
-    if _would_compress and info.jpeg_skip_timerange:
-        stats.jpeg_compress_skipped_timerange += 1
-        logger.info("SKIP-TIME    %s  (within excluded time range, skipping compression)",
-                     info.source_path.name)
-    elif _would_compress and info.jpeg_skip_editor:
-        stats.jpeg_compress_skipped_editor += 1
-        logger.info("SKIP-EDITOR  %s  (exported from known editor, skipping compression)",
-                     info.source_path.name)
+    _log_jpeg_skip_counters(info, stats, logger)
 
     # Non-QuickTime video containers (AVI, MKV, WebM) cannot have tags
     # written directly — ExifTool does not support writing to these formats.
@@ -609,61 +844,8 @@ def _do_process_matched(et, info: MediaFileInfo, stats: MergeStats,
         # so they are only counted when the sidecar is successfully written.
     elif _needs_jpeg_compression(info):
         # ----- Compressed JPEG path -----
-        # Compress with Pillow (in memory, no metadata), then pipe the
-        # compressed bytes into a standalone exiftool subprocess that
-        # copies ALL metadata from the original via -TagsFromFile and
-        # applies the tag modifications — zero intermediate disk writes.
-        try:
-            jpeg_bytes = _compress_jpeg_to_bytes(info.source_path,
-                                                 info.jpeg_compress_quality)
-        except Exception as e:
-            logger.error("Pillow compression failed for %s: %s",
-                         info.source_path, e)
-            stats.errors += 1
-            return
-
-        # Guard: if compression didn't reduce file size, use the original
-        # image bytes instead.  This prevents accidental size increases,
-        # especially when ExifTool couldn't determine the source quality.
-        original_size = info.source_path.stat().st_size
-        if len(jpeg_bytes) >= original_size:
-            logger.info("SKIP-COMPRESS  %s  (compressed %d bytes >= original %d bytes, using original)",
-                        info.source_path, len(jpeg_bytes), original_size)
-            jpeg_bytes = info.source_path.read_bytes()
-            stats.jpeg_compress_skipped_larger += 1
-            compressed = False
-        else:
-            compressed = True
-
-        # Build tag params (same modifications as the standard path).
-        tag_params = []
-
-        if info.resolved_datetime:
-            dt_str = info.resolved_datetime.strftime('%Y:%m:%d %H:%M:%S')
-            tz_str = _format_tz_offset(info.resolved_datetime.tzinfo)
-
-            tag_params.append(f'-alldates={dt_str}')
-            tag_params.append(f'-EXIF:ExifIFD:OffsetTime={tz_str}')
-            tag_params.append(f'-EXIF:ExifIFD:OffsetTimeOriginal={tz_str}')
-            tag_params.append(f'-EXIF:ExifIFD:OffsetTimeDigitized={tz_str}')
-
-            tag_params.extend(_build_conditional_date_params(info, dt_str, tz_str))
-
-        if info.clear_descriptions:
-            tag_params.append('-EXIF:UserComment=')
-            tag_params.append('-EXIF:ImageDescription=')
-            tag_params.append('-XMP-dc:Description=')
-            if info.has_iptc_caption:
-                tag_params.append('-IPTC:Caption-Abstract=')
-            stats.descriptions_cleared += 1
-        elif info.description and info.description.strip():
-            escaped, needs_E = _escape_description(info.description)
-            if needs_E:
-                tag_params.append('-E')
-            tag_params.append(f'-XMP-dc:Description={escaped}')
-            tag_params.append(f'-EXIF:ImageDescription={escaped}')
-            if info.has_iptc_caption:
-                tag_params.append(f'-IPTC:Caption-Abstract={escaped}')
+        tag_params = _build_date_params(info)
+        tag_params.extend(_build_description_params(info, stats))
 
         if info.gps:
             tag_params.extend(_build_gps_params(info.gps))
@@ -671,71 +853,12 @@ def _do_process_matched(et, info: MediaFileInfo, stats: MergeStats,
 
         tag_params.append('-IPTCDigest=new')
 
-        if not _write_compressed_jpeg_with_metadata(
-            jpeg_bytes, info.source_path, info.output_path, tag_params, logger
-        ):
-            stats.errors += 1
+        if not _compress_and_write_jpeg(info, tag_params, stats, logger):
             return
-
-        if compressed:
-            q_str = f'{info.jpeg_quality}%' if info.jpeg_quality is not None else 'unknown'
-            logger.info("COMPRESS  %s  (was ~%s -> %d%%, %d bytes -> %d bytes)",
-                        info.source_path.name, q_str, info.jpeg_compress_quality,
-                        original_size, len(jpeg_bytes))
-            stats.jpeg_compressed += 1
     else:
         params = ['-charset', 'filename=utf8']
-
-        if info.resolved_datetime:
-            dt_str = info.resolved_datetime.strftime('%Y:%m:%d %H:%M:%S')
-            tz_str = _format_tz_offset(info.resolved_datetime.tzinfo)
-
-            if is_qt_video:
-                # QuickTime spec stores dates as UTC (no timezone field).
-                # Convert local resolved_datetime back to UTC for QT tags.
-                utc_dt = info.resolved_datetime.astimezone(timezone.utc)
-                utc_str = utc_dt.strftime('%Y:%m:%d %H:%M:%S')
-                params.append(f'-QuickTime:CreateDate={utc_str}')
-                params.append(f'-QuickTime:ModifyDate={utc_str}')
-                # UserData and XMP tags carry local time with timezone suffix.
-                local_with_tz = f'{dt_str}{tz_str}'
-                params.append(f'-UserData:DateTimeOriginal={local_with_tz}')
-                params.append(f'-XMP-exif:DateTimeOriginal={local_with_tz}')
-                params.append(f'-XMP-xmp:CreateDate={local_with_tz}')
-                params.append(f'-XMP-xmp:ModifyDate={local_with_tz}')
-            elif info.write_strategy == WriteStrategy.PARTIAL_WITH_SIDECAR:
-                # PNG/GIF lack EXIF; -alldates writes to XMP but drops the
-                # timezone suffix.  Write XMP date tags explicitly so the
-                # timezone is preserved in both the file and its sidecar.
-                local_with_tz = f'{dt_str}{tz_str}'
-                params.append(f'-XMP-exif:DateTimeOriginal={local_with_tz}')
-                params.append(f'-XMP-xmp:CreateDate={local_with_tz}')
-                params.append(f'-XMP-xmp:ModifyDate={local_with_tz}')
-            else:
-                params.append(f'-alldates={dt_str}')
-                params.append(f'-EXIF:ExifIFD:OffsetTime={tz_str}')
-                params.append(f'-EXIF:ExifIFD:OffsetTimeOriginal={tz_str}')
-                params.append(f'-EXIF:ExifIFD:OffsetTimeDigitized={tz_str}')
-
-            # Update any pre-existing XMP date tags to the resolved datetime
-            # (e.g. XMP-photoshop:DateCreated, XMP-xmp:MetadataDate).
-            params.extend(_build_conditional_date_params(info, dt_str, tz_str))
-
-        if info.clear_descriptions:
-            params.append('-EXIF:UserComment=')
-            params.append('-EXIF:ImageDescription=')
-            params.append('-XMP-dc:Description=')
-            if info.has_iptc_caption:
-                params.append('-IPTC:Caption-Abstract=')
-            stats.descriptions_cleared += 1
-        elif info.description and info.description.strip():
-            escaped, needs_E = _escape_description(info.description)
-            if needs_E:
-                params.append('-E')
-            params.append(f'-XMP-dc:Description={escaped}')
-            params.append(f'-EXIF:ImageDescription={escaped}')
-            if info.has_iptc_caption:
-                params.append(f'-IPTC:Caption-Abstract={escaped}')
+        params.extend(_build_date_params(info))
+        params.extend(_build_description_params(info, stats))
 
         if info.gps:
             params.extend(_build_gps_params(info.gps))
@@ -828,81 +951,18 @@ def _do_process_orphan(et, info: MediaFileInfo, stats: MergeStats,
 
     info.output_path.parent.mkdir(parents=True, exist_ok=True)
 
-    # Check time-range and editor skip counters (timerange takes precedence).
-    _would_compress = (info.jpeg_compress_quality is not None
-                       and info.source_path.suffix.lower() in JPEG_EXTENSIONS
-                       and (info.jpeg_quality is None
-                            or info.jpeg_quality > info.jpeg_compress_quality))
-    if _would_compress and info.jpeg_skip_timerange:
-        stats.jpeg_compress_skipped_timerange += 1
-        logger.info("SKIP-TIME    %s  (orphan, within excluded time range, skipping compression)",
-                     info.source_path.name)
-    elif _would_compress and info.jpeg_skip_editor:
-        stats.jpeg_compress_skipped_editor += 1
-        logger.info("SKIP-EDITOR  %s  (orphan, exported from known editor, skipping compression)",
-                     info.source_path.name)
+    _log_jpeg_skip_counters(info, stats, logger, label="orphan, ")
 
     if _needs_jpeg_compression(info):
         # ----- Compressed JPEG orphan path -----
-        # Compress with Pillow, pipe through exiftool with -TagsFromFile to
-        # copy all original metadata + apply any modifications.
-        try:
-            jpeg_bytes = _compress_jpeg_to_bytes(info.source_path,
-                                                 info.jpeg_compress_quality)
-        except Exception as e:
-            logger.error("Pillow compression failed for orphan %s: %s",
-                         info.source_path, e)
-            stats.errors += 1
-            return
-
-        # Guard: if compression didn't reduce file size, use the original
-        # image bytes instead.
-        original_size = info.source_path.stat().st_size
-        if len(jpeg_bytes) >= original_size:
-            logger.info("SKIP-COMPRESS  %s  (orphan, compressed %d bytes >= original %d bytes, using original)",
-                        info.source_path, len(jpeg_bytes), original_size)
-            jpeg_bytes = info.source_path.read_bytes()
-            stats.jpeg_compress_skipped_larger += 1
-            compressed = False
-        else:
-            compressed = True
-
-        tag_params = []
-
-        if info.clear_descriptions:
-            tag_params.append('-EXIF:UserComment=')
-            tag_params.append('-EXIF:ImageDescription=')
-            tag_params.append('-XMP-dc:Description=')
-            if info.has_iptc_caption:
-                tag_params.append('-IPTC:Caption-Abstract=')
-            stats.descriptions_cleared += 1
-
-        if info.resolved_datetime:
-            dt_str = info.resolved_datetime.strftime('%Y:%m:%d %H:%M:%S')
-            tz_str = _format_tz_offset(info.resolved_datetime.tzinfo)
-
-            tag_params.append(f'-alldates={dt_str}')
-            tag_params.append(f'-EXIF:ExifIFD:OffsetTime={tz_str}')
-            tag_params.append(f'-EXIF:ExifIFD:OffsetTimeOriginal={tz_str}')
-            tag_params.append(f'-EXIF:ExifIFD:OffsetTimeDigitized={tz_str}')
-
-            tag_params.extend(_build_conditional_date_params(info, dt_str, tz_str))
+        tag_params = _build_date_params(info)
+        tag_params.extend(_build_description_params(info, stats))
 
         if tag_params:
             tag_params.append('-IPTCDigest=new')
 
-        if not _write_compressed_jpeg_with_metadata(
-            jpeg_bytes, info.source_path, info.output_path, tag_params, logger
-        ):
-            stats.errors += 1
+        if not _compress_and_write_jpeg(info, tag_params, stats, logger, label="orphan "):
             return
-
-        if compressed:
-            q_str = f'{info.jpeg_quality}%' if info.jpeg_quality is not None else 'unknown'
-            logger.info("COMPRESS  %s  (orphan, was ~%s -> %d%%, %d bytes -> %d bytes)",
-                        info.source_path.name, q_str, info.jpeg_compress_quality,
-                        original_size, len(jpeg_bytes))
-            stats.jpeg_compressed += 1
         stats.written += 1
 
         if info.sidecar_path:
@@ -921,47 +981,15 @@ def _do_process_orphan(et, info: MediaFileInfo, stats: MergeStats,
 
     # Build params for in-place updates (descriptions + dates).
     update_params = ['-charset', 'filename=utf8', '-overwrite_original']
-
-    if info.clear_descriptions:
-        update_params.append('-EXIF:UserComment=')
-        update_params.append('-EXIF:ImageDescription=')
-        update_params.append('-XMP-dc:Description=')
-        if info.has_iptc_caption:
-            update_params.append('-IPTC:Caption-Abstract=')
-        stats.descriptions_cleared += 1
+    update_params.extend(_build_description_params(info, stats))
 
     # Fill in any missing date tags and add timezone offsets.
     # Non-QuickTime video containers cannot have tags written in-place.
     is_non_qt_video = (info.write_strategy == WriteStrategy.VIDEO_WITH_SIDECAR
                        and info.source_path.suffix.lower() not in QUICKTIME_VIDEO_EXTS)
 
-    if info.resolved_datetime and not is_non_qt_video:
-        dt_str = info.resolved_datetime.strftime('%Y:%m:%d %H:%M:%S')
-        tz_str = _format_tz_offset(info.resolved_datetime.tzinfo)
-
-        if info.write_strategy == WriteStrategy.VIDEO_WITH_SIDECAR:
-            utc_dt = info.resolved_datetime.astimezone(timezone.utc)
-            utc_str = utc_dt.strftime('%Y:%m:%d %H:%M:%S')
-            update_params.append(f'-QuickTime:CreateDate={utc_str}')
-            update_params.append(f'-QuickTime:ModifyDate={utc_str}')
-            local_with_tz = f'{dt_str}{tz_str}'
-            update_params.append(f'-UserData:DateTimeOriginal={local_with_tz}')
-            update_params.append(f'-XMP-exif:DateTimeOriginal={local_with_tz}')
-            update_params.append(f'-XMP-xmp:CreateDate={local_with_tz}')
-            update_params.append(f'-XMP-xmp:ModifyDate={local_with_tz}')
-        elif info.write_strategy == WriteStrategy.PARTIAL_WITH_SIDECAR:
-            local_with_tz = f'{dt_str}{tz_str}'
-            update_params.append(f'-XMP-exif:DateTimeOriginal={local_with_tz}')
-            update_params.append(f'-XMP-xmp:CreateDate={local_with_tz}')
-            update_params.append(f'-XMP-xmp:ModifyDate={local_with_tz}')
-        else:
-            update_params.append(f'-alldates={dt_str}')
-            update_params.append(f'-EXIF:ExifIFD:OffsetTime={tz_str}')
-            update_params.append(f'-EXIF:ExifIFD:OffsetTimeOriginal={tz_str}')
-            update_params.append(f'-EXIF:ExifIFD:OffsetTimeDigitized={tz_str}')
-
-        # Update any pre-existing XMP date tags to the resolved datetime.
-        update_params.extend(_build_conditional_date_params(info, dt_str, tz_str))
+    if not is_non_qt_video:
+        update_params.extend(_build_date_params(info))
 
     # Only call ExifTool if there are tag params beyond the base three
     # (charset, filename, overwrite_original).
@@ -1300,11 +1328,9 @@ class PhotosExportMerger(AbstractMediaMerger):
         for dir_path, infos in matched_by_dir.items():
             file_paths = [str(info.source_path) for info in infos]
             tz_tags = ['EXIF:OffsetTimeOriginal', 'EXIF:OffsetTime']
-            read_tags = tz_tags + CONDITIONAL_DATE_READ_TAGS + ['File:FileTypeExtension'] + (DESC_READ_TAGS if self.blocked_descriptions else ['IPTC:Caption-Abstract'])
-            if self.jpeg_compress_quality is not None:
-                read_tags.append('File:JPEGQualityEstimate')
-            if self.editor_skip_patterns:
-                read_tags.extend(['EXIF:Software', 'XMP-xmp:CreatorTool'])
+            read_tags = _build_batch_read_tags(tz_tags, self.blocked_descriptions,
+                                               self.jpeg_compress_quality,
+                                               self.editor_skip_patterns)
 
             try:
                 tag_results = self._et.get_tags(file_paths, read_tags)
@@ -1313,56 +1339,11 @@ class PhotosExportMerger(AbstractMediaMerger):
                 tag_results = [{} for _ in infos]
 
             for info, tags in zip(infos, tag_results):
-                # Track whether source file has IPTC:Caption-Abstract
-                if tags.get('IPTC:Caption-Abstract'):
-                    info.has_iptc_caption = True
-
-                # Record which XMP date tags exist in the source file
-                # (used to conditionally update them during processing).
-                existing = {t for t in CONDITIONAL_DATE_READ_TAGS if tags.get(t)}
-                if existing:
-                    info.existing_xmp_dates = existing
-
-                # Detect extension/content mismatch (e.g. JPEG with .DNG extension).
-                actual_type_ext = tags.get('File:FileTypeExtension')
-                if actual_type_ext:
-                    actual = f'.{actual_type_ext.lower()}'
-                    source = info.source_path.suffix.lower()
-                    if actual != source and _is_real_ext_mismatch(source, actual):
-                        info.actual_ext = actual
-                        stats.ext_mismatches += 1
-                        self.logger.warning("Extension mismatch for %s: content is %s",
-                                         self._rel(info.source_path), actual_type_ext)
-
-                # Extract JPEG quality estimate (when compression is enabled).
-                if self.jpeg_compress_quality is not None:
-                    if info.source_path.suffix.lower() in JPEG_EXTENSIONS:
-                        stats.jpeg_quality_checked += 1
-                        raw_q = tags.get('File:JPEGQualityEstimate')
-                        if raw_q is not None:
-                            try:
-                                info.jpeg_quality = int(raw_q)
-                            except (ValueError, TypeError):
-                                info.jpeg_quality = None
-                                stats.jpeg_quality_unknown += 1
-                        else:
-                            stats.jpeg_quality_unknown += 1
-
-                # Check if file was exported from a skipped editor.
-                if self.editor_skip_patterns:
-                    _check_editor_skip(tags, info, self.editor_skip_patterns)
-
-                # Check blocked descriptions
-                if self.blocked_descriptions and info.json_data:
-                    json_desc = info.json_data.get('description', '')
-                    if json_desc and json_desc in self.blocked_descriptions:
-                        info.clear_descriptions = True
-                    elif not json_desc:
-                        for desc_tag in DESC_READ_TAGS:
-                            exif_desc = tags.get(desc_tag, '')
-                            if exif_desc and str(exif_desc) in self.blocked_descriptions:
-                                info.clear_descriptions = True
-                                break
+                _extract_common_tags(info, tags, stats,
+                                     self.jpeg_compress_quality,
+                                     self.editor_skip_patterns,
+                                     self.blocked_descriptions,
+                                     self.logger, self._rel)
 
                 epoch_str = None
                 if info.json_data:
@@ -1416,22 +1397,14 @@ class PhotosExportMerger(AbstractMediaMerger):
             # only the strip tags and flag any file whose result contains
             # keys beyond the always-present SourceFile.
             if strip_read_tags:
-                try:
-                    strip_results = self._et.get_tags(file_paths, strip_read_tags)
-                except Exception:
-                    strip_results = [{} for _ in infos]
-                for info, sr in zip(infos, strip_results):
-                    if len(sr) > 1:
-                        info.has_strip_metadata = True
+                _run_strip_metadata_batch(self._et, file_paths, infos, strip_read_tags)
 
         # Resolve dates for orphan files (batch read per directory)
         for dir_path, infos in orphans_by_dir.items():
             file_paths = [str(info.source_path) for info in infos]
-            read_tags = DATE_TAGS_PRIORITY + CONDITIONAL_DATE_READ_TAGS + ['File:FileTypeExtension'] + (DESC_READ_TAGS if self.blocked_descriptions else ['IPTC:Caption-Abstract'])
-            if self.jpeg_compress_quality is not None:
-                read_tags.append('File:JPEGQualityEstimate')
-            if self.editor_skip_patterns:
-                read_tags.extend(['EXIF:Software', 'XMP-xmp:CreatorTool'])
+            read_tags = _build_batch_read_tags(DATE_TAGS_PRIORITY, self.blocked_descriptions,
+                                               self.jpeg_compress_quality,
+                                               self.editor_skip_patterns)
 
             try:
                 tag_results = self._et.get_tags(file_paths, read_tags)
@@ -1440,51 +1413,11 @@ class PhotosExportMerger(AbstractMediaMerger):
                 tag_results = [{} for _ in infos]
 
             for info, tags in zip(infos, tag_results):
-                # Track whether source file has IPTC:Caption-Abstract
-                if tags.get('IPTC:Caption-Abstract'):
-                    info.has_iptc_caption = True
-
-                # Record which XMP date tags exist in the source file.
-                existing = {t for t in CONDITIONAL_DATE_READ_TAGS if tags.get(t)}
-                if existing:
-                    info.existing_xmp_dates = existing
-
-                # Detect extension/content mismatch.
-                actual_type_ext = tags.get('File:FileTypeExtension')
-                if actual_type_ext:
-                    actual = f'.{actual_type_ext.lower()}'
-                    source = info.source_path.suffix.lower()
-                    if actual != source and _is_real_ext_mismatch(source, actual):
-                        info.actual_ext = actual
-                        stats.ext_mismatches += 1
-                        self.logger.warning("Extension mismatch for orphan %s: content is %s",
-                                         self._rel(info.source_path), actual_type_ext)
-
-                # Extract JPEG quality estimate (when compression is enabled).
-                if self.jpeg_compress_quality is not None:
-                    if info.source_path.suffix.lower() in JPEG_EXTENSIONS:
-                        stats.jpeg_quality_checked += 1
-                        raw_q = tags.get('File:JPEGQualityEstimate')
-                        if raw_q is not None:
-                            try:
-                                info.jpeg_quality = int(raw_q)
-                            except (ValueError, TypeError):
-                                info.jpeg_quality = None
-                                stats.jpeg_quality_unknown += 1
-                        else:
-                            stats.jpeg_quality_unknown += 1
-
-                # Check if file was exported from a skipped editor.
-                if self.editor_skip_patterns:
-                    _check_editor_skip(tags, info, self.editor_skip_patterns)
-
-                # Check blocked descriptions on existing EXIF tags
-                if self.blocked_descriptions:
-                    for desc_tag in DESC_READ_TAGS:
-                        exif_desc = tags.get(desc_tag, '')
-                        if exif_desc and str(exif_desc) in self.blocked_descriptions:
-                            info.clear_descriptions = True
-                            break
+                _extract_common_tags(info, tags, stats,
+                                     self.jpeg_compress_quality,
+                                     self.editor_skip_patterns,
+                                     self.blocked_descriptions,
+                                     self.logger, self._rel)
 
                 resolved_dt = None
                 date_source = None
@@ -1534,13 +1467,7 @@ class PhotosExportMerger(AbstractMediaMerger):
             # Separate batch read for strip-metadata detection (see matched
             # files above for rationale).
             if strip_read_tags:
-                try:
-                    strip_results = self._et.get_tags(file_paths, strip_read_tags)
-                except Exception:
-                    strip_results = [{} for _ in infos]
-                for info, sr in zip(infos, strip_results):
-                    if len(sr) > 1:
-                        info.has_strip_metadata = True
+                _run_strip_metadata_batch(self._et, file_paths, infos, strip_read_tags)
 
         # Build output paths
         for info in media_files:
