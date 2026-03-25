@@ -3077,23 +3077,17 @@ class TestPhotosExportMerger(unittest.TestCase):
 # When running via pytest, either export the env var or use:
 #   GPEM_SINGLE_WORKER=1 python -m pytest TestMerger.py
 
-class TestSingleWorker(unittest.TestCase):
-    """Run the merger with num_workers=1 (serial mode) and verify stats match.
+class TestSingleWorker(TestPhotosExportMerger):
+    """Re-run the full input tree with num_workers=1 to verify no regressions.
 
-    This ensures the original serial code path still works correctly after
-    the parallel processing refactor.  It builds the same input tree as the
-    main test class, runs the merger with a single worker, and asserts that
-    all stats counters are identical.
+    Inherits all tests from TestPhotosExportMerger and runs them against
+    output produced with num_workers=1 (serial mode).  This ensures the
+    original serial code path still works correctly after the parallel
+    processing refactor.
 
     Opt-in only — these tests roughly double the total run time.
     Enable via --single-worker (direct runner) or GPEM_SINGLE_WORKER=1 (pytest).
     """
-
-    # Class-level state populated by setUpClass
-    tmp_dir:    Path
-    input_dir:  Path
-    output_dir: Path
-    stats:      MergeStats
 
     @classmethod
     def setUpClass(cls) -> None:
@@ -3114,14 +3108,10 @@ class TestSingleWorker(unittest.TestCase):
         cls.output_dir = cls.tmp_dir / 'output'
         cls.input_dir.mkdir()
 
-        # Reuse the same input-tree builder from the main test class.
-        # _create_input_tree is a classmethod that reads cls.input_dir, so we
-        # temporarily point it at our input directory, then restore it.
-        saved_input_dir = getattr(TestPhotosExportMerger, 'input_dir', None)
-        TestPhotosExportMerger.input_dir = cls.input_dir
-        TestPhotosExportMerger._create_input_tree()
-        if saved_input_dir is not None:
-            TestPhotosExportMerger.input_dir = saved_input_dir
+        cls._create_input_tree()
+
+        # Snapshot input BEFORE the merger touches anything
+        cls.input_snapshot = cls._snapshot(cls.input_dir)
 
         # Run with num_workers=1 (serial mode)
         # Explicit fallback_tz=+02:00 so tests are independent of host timezone.
@@ -3139,95 +3129,6 @@ class TestSingleWorker(unittest.TestCase):
         tmp = getattr(cls, 'tmp_dir', None)
         if tmp is not None:
             shutil.rmtree(str(tmp), ignore_errors=True)
-
-    # ------------------------------------------------------------------
-    # Stats verification — must match the expected values from the
-    # parallel run (same input tree, same merger logic).
-    # ------------------------------------------------------------------
-
-    def test_serial_stats_total_count(self) -> None:
-        """Serial: total media files = 184."""
-        self.assertEqual(self.stats.total_media_files, 184)
-
-    def test_serial_stats_matched_count(self) -> None:
-        """Serial: matched files = 177."""
-        self.assertEqual(self.stats.matched, 177)
-
-    def test_serial_stats_orphan_count(self) -> None:
-        """Serial: orphan files = 7."""
-        self.assertEqual(self.stats.orphans, 7)
-
-    def test_serial_stats_written_count(self) -> None:
-        """Serial: written files = 184."""
-        self.assertEqual(self.stats.written, 184)
-
-    def test_serial_stats_zero_errors(self) -> None:
-        """Serial: zero errors."""
-        self.assertEqual(self.stats.errors, 0)
-
-    def test_serial_stats_gps_written(self) -> None:
-        """Serial: GPS tags written = 101."""
-        self.assertEqual(self.stats.gps_written, 101)
-
-    def test_serial_stats_sidecars_created(self) -> None:
-        """Serial: XMP sidecars created = 84."""
-        self.assertEqual(self.stats.sidecars_created, 84)
-
-    def test_serial_stats_descriptions_cleared(self) -> None:
-        """Serial: descriptions cleared = 3."""
-        self.assertEqual(self.stats.descriptions_cleared, 3)
-
-    def test_serial_stats_duplicates_renamed(self) -> None:
-        """Serial: duplicates renamed = 3."""
-        self.assertEqual(self.stats.duplicates_renamed, 3)
-
-    def test_serial_stats_skipped_json(self) -> None:
-        """Serial: skipped JSON = 1."""
-        self.assertEqual(self.stats.skipped_json, 1)
-
-    def test_serial_stats_ext_mismatches(self) -> None:
-        """Serial: ext mismatches = 1."""
-        self.assertEqual(self.stats.ext_mismatches, 1)
-
-    def test_serial_stats_skipped_existing(self) -> None:
-        """Serial: skipped existing = 0."""
-        self.assertEqual(self.stats.skipped_existing, 0)
-
-    # ------------------------------------------------------------------
-    # Output structure — verify key files exist
-    # ------------------------------------------------------------------
-
-    def test_serial_output_files_exist(self) -> None:
-        """Serial: all expected output files are present."""
-        output_names = {f.name for f in self.output_dir.rglob('*') if f.is_file()}
-        expected_samples = [
-            'photo_basic.jpg', 'orphan_no_json.jpg',
-            'gps_ne.jpg', 'gps_sw.mp4',
-            'tz_utc.jpg', 'desc_utf8.jpg',
-            'same_name.jpg', 'same_name_2.jpg',
-            'photo.jpg', 'photo_2.jpg',
-        ]
-        for name in expected_samples:
-            self.assertIn(name, output_names,
-                          f"Expected {name} in serial output")
-
-    def test_serial_output_organized_by_year_month(self) -> None:
-        """Serial: every output file is in output/YYYY/MM/ structure."""
-        for f in self.output_dir.rglob('*'):
-            if not f.is_file():
-                continue
-            rel = f.relative_to(self.output_dir)
-            parts = rel.parts
-            self.assertEqual(len(parts), 3,
-                             f"Wrong depth for {rel}: expected 3 parts, got {len(parts)}")
-
-    def test_serial_xmp_sidecars_exist(self) -> None:
-        """Serial: XMP sidecar files are created for PNG, GIF, and video formats."""
-        sidecar_samples = ['sc_png.png.xmp', 'sc_gif.gif.xmp', 'sc_avi.avi.xmp']
-        output_names = {f.name for f in self.output_dir.rglob('*') if f.is_file()}
-        for name in sidecar_samples:
-            self.assertIn(name, output_names,
-                          f"Expected sidecar {name} in serial output")
 
 
 # ---------------------------------------------------------------------------
@@ -4075,7 +3976,6 @@ if __name__ == '__main__':
         ("Video XMP Dates",           ("test_video_xmp_",)),
         ("Metadata Stripping",        ("test_strip_",)),
         ("Infrastructure Validation", ("test_infra_",)),
-        ("Single Worker (serial)",    ("test_serial_",)),
         ("JPEG Compression",          ("test_jpeg_",)),
     ]
 
@@ -4174,7 +4074,10 @@ if __name__ == '__main__':
     # else leave default 'prompt'
 
     # ── Enable single-worker tests if requested ──────────────────────────────
-    if args.single_worker:
+    # Also auto-enable when TestSingleWorker is explicitly selected via --class.
+    if args.single_worker or (
+        args.classes and any('singleworker' in c.lower() for c in args.classes)
+    ):
         os.environ['GPEM_SINGLE_WORKER'] = '1'
 
     # ── Skip JPEG full-tree tests if requested ──────────────────────────────
