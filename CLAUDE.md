@@ -21,15 +21,21 @@ python JsonKeyExtractor.py <input_directory> [output_directory]
 # Merge metadata into media files (uses all CPU cores by default)
 python PhotosExportMerger.py <input_dir> <output_dir> [--dry-run] [--workers N] [--strip-metadata [PROFILE ...]] [--tz-fallback OFFSET] [--tz-override "START_UTC,END_UTC,OFFSET" ...] [--jpeg-quality PERCENT]
 
-# Run tests
+# Run tests (all classes via pytest)
 python -m pytest TestMerger.py
+
+# Run tests (custom runner with class selection)
+python TestMerger.py --class TestPhotosExportMerger --class TestJpegCompressionWithFullTree
+python TestMerger.py --list-classes
 ```
 
 ## Testing
 
 `TestMerger.py` is a comprehensive `unittest`-based test suite with 185+ test methods (including subtests). It runs as a single-pass integration test: `setUpClass` builds an input tree with programmatically generated binary test files (JPEG, PNG, GIF, TIFF, CR2, DNG, HEIC, MP4, MOV, AVI, MKV, WebM — including variants with embedded EXIF timezone offsets and Nikon maker-note dates), runs the merger once, then individual tests assert on the output. Test categories include: input integrity, output structure, GPS (8 compass directions × 12 formats), timezones (including sidecar timezone verification), descriptions (UTF-8, escaping, newlines, blocked, IPTC), file types, orphan files, XMP conditional dates, XMP sidecars, duplicates, bracket notation, file timestamps, stats verification, video UTC time, special filenames, EXIF preservation, extension mismatch, video XMP dates (including Nikon maker-note sidecar fixup), metadata stripping (profile building and default-off verification), infrastructure validation, and single-worker (serial) mode.
 
-Separate test classes exercise features that require different merger configurations: `TestMetadataStripping` (runs with strip params enabled), `TestTimezoneOverride` (runs with `--tz-override` ranges to verify override/fallback/EXIF-priority behaviour for matched files, orphans, and sidecars), `TestFallbackTimezone` (runs with a non-default `--tz-fallback` to verify the custom fallback timezone is applied to files without EXIF timezone), and `TestSingleWorker` (re-runs with `num_workers=1`).
+Separate test classes exercise features that require different merger configurations: `TestMetadataStripping` (runs with strip params enabled), `TestTimezoneOverride` (runs with `--tz-override` ranges to verify override/fallback/EXIF-priority behaviour for matched files, orphans, and sidecars), `TestFallbackTimezone` (runs with a non-default `--tz-fallback` to verify the custom fallback timezone is applied to files without EXIF timezone), `TestJpegCompression` (runs with `--jpeg-quality` to verify JPEG recompression), `TestJpegCompressionWithFullTree` (inherits `TestPhotosExportMerger` and re-runs the full test tree with JPEG compression enabled), and `TestSingleWorker` (re-runs with `num_workers=1`).
+
+The custom test runner (`python TestMerger.py`) runs all classes by default except `TestSingleWorker` (opt-in via `--single-worker`). Use `--class NAME` (repeatable, case-insensitive substring match) to run specific classes, or `--list-classes` to see all available classes. Category (`-c`) and file-type (`-t`) filters can be combined with `--class`.
 
 ## Architecture
 

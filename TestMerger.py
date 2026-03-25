@@ -4079,6 +4079,16 @@ if __name__ == '__main__':
         ("JPEG Compression",          ("test_jpeg_",)),
     ]
 
+    _TEST_CLASSES: dict[str, type] = {
+        'TestPhotosExportMerger':          TestPhotosExportMerger,
+        'TestSingleWorker':                TestSingleWorker,
+        'TestMetadataStripping':           TestMetadataStripping,
+        'TestTimezoneOverride':            TestTimezoneOverride,
+        'TestFallbackTimezone':            TestFallbackTimezone,
+        'TestJpegCompression':             TestJpegCompression,
+        'TestJpegCompressionWithFullTree': TestJpegCompressionWithFullTree,
+    }
+
     def _cat(name: str) -> str:
         """Return the display category for a test method name."""
         for label, prefixes in _CATEGORIES:
@@ -4126,6 +4136,15 @@ if __name__ == '__main__':
         '--skip-jpeg-full-tree', action='store_true',
         help='Skip JPEG compression full-tree regression tests',
     )
+    parser.add_argument(
+        '--class', dest='classes', action='append', metavar='NAME',
+        help='Run only the specified test class (case-insensitive substring match; repeatable). '
+             'Use --list-classes to see available classes.',
+    )
+    parser.add_argument(
+        '--list-classes', action='store_true',
+        help='Print available test classes and exit',
+    )
     args = parser.parse_args()
 
     # ── Early exit for --list-* ──────────────────────────────────────────────
@@ -4139,6 +4158,12 @@ if __name__ == '__main__':
         print('Supported file types:')
         for i, ext in enumerate(_SUPPORTED_TYPES, 1):
             print(f'  {i:>2}. {ext}')
+        sys.exit(0)
+
+    if args.list_classes:
+        print('Available test classes:')
+        for i, name in enumerate(_TEST_CLASSES, 1):
+            print(f'  {i:>2}. {name}')
         sys.exit(0)
 
     # ── Set cleanup mode ─────────────────────────────────────────────────────
@@ -4283,11 +4308,28 @@ if __name__ == '__main__':
     )
     loader = unittest.TestLoader()
     suite = unittest.TestSuite()
-    suite.addTests(loader.loadTestsFromTestCase(TestPhotosExportMerger))
-    suite.addTests(loader.loadTestsFromTestCase(TestJpegCompression))
-    suite.addTests(loader.loadTestsFromTestCase(TestJpegCompressionWithFullTree))
-    if args.single_worker:
-        suite.addTests(loader.loadTestsFromTestCase(TestSingleWorker))
+
+    if args.classes:
+        # Resolve user-supplied class names (case-insensitive substring match)
+        matched = []
+        for user_name in args.classes:
+            hits = [cls for key, cls in _TEST_CLASSES.items()
+                    if user_name.lower() in key.lower()]
+            if not hits:
+                print(f"Error: no test class matching '{user_name}'. "
+                      f"Use --list-classes to see options.")
+                sys.exit(1)
+            matched.extend(hits)
+        for cls in dict.fromkeys(matched):  # deduplicate, preserve order
+            suite.addTests(loader.loadTestsFromTestCase(cls))
+    else:
+        # Default: all classes except TestSingleWorker (opt-in via --single-worker)
+        for name, cls in _TEST_CLASSES.items():
+            if name == 'TestSingleWorker':
+                continue
+            suite.addTests(loader.loadTestsFromTestCase(cls))
+        if args.single_worker:
+            suite.addTests(loader.loadTestsFromTestCase(TestSingleWorker))
     if args.categories or args.file_types:
         print('Running with filters:')
         if args.categories:

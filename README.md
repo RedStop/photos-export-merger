@@ -88,6 +88,26 @@ python -m pytest TestMerger.py -k "TestTimezoneOverride"
 python -m pytest TestMerger.py -k "test_timezone_gmt_plus_2"
 ```
 
+The custom test runner (`python TestMerger.py`) supports additional options:
+
+```bash
+# List available test classes
+python TestMerger.py --list-classes
+
+# Run specific test classes (case-insensitive substring match; repeatable)
+python TestMerger.py --class TestPhotosExportMerger --class TestJpegCompressionWithFullTree
+
+# Combine with category and file-type filters
+python TestMerger.py --class TestPhotosExportMerger -c GPS -t jpg
+
+# Include single-worker regression tests
+python TestMerger.py --single-worker
+
+# List available categories and file types
+python TestMerger.py --list-categories
+python TestMerger.py --list-types
+```
+
 ---
 
 ## How the merger works
