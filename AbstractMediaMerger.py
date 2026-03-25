@@ -128,8 +128,9 @@ class MergeStats:
         Used to aggregate partial stats returned by parallel workers.
         Only processing counters are merged; pipeline-level counters
         (total_media_files, matched, orphans, skipped_json, duplicates_renamed,
-        ext_mismatches) are set before parallelisation and should not be
-        summed again.
+        ext_mismatches, date_from_exif, date_from_filesystem,
+        jpeg_quality_checked, jpeg_quality_unknown) are set before
+        parallelisation and should not be summed again.
         """
         self.written += other.written
         self.sidecars_created += other.sidecars_created
@@ -139,7 +140,6 @@ class MergeStats:
         self.skipped_existing += other.skipped_existing
         self.metadata_stripped += other.metadata_stripped
         self.jpeg_compressed += other.jpeg_compressed
-        self.jpeg_quality_unknown += other.jpeg_quality_unknown
         self.jpeg_compress_skipped_larger += other.jpeg_compress_skipped_larger
         self.jpeg_compress_skipped_editor += other.jpeg_compress_skipped_editor
         self.jpeg_compress_skipped_timerange += other.jpeg_compress_skipped_timerange

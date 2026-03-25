@@ -160,7 +160,8 @@ def JsonFileFinder(
         elif len(shortlisted_filenames_to_check) > 1:
             # Take the "(x)" into account
             for file in shortlisted_filenames_to_check:
-                file_no_ext = file[:-len(new_title_ext_lower)]
+                ext_len = len(new_title_ext_lower)
+                file_no_ext = file[:-ext_len] if ext_len else file
                 file_bracket_match = BRACKET_PATTERN.search(file_no_ext)
                 file_bracket_num = None if file_bracket_match is None else file_bracket_match.group(1)
                 if file_bracket_num == bracket_num:

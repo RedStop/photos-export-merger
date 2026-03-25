@@ -328,12 +328,6 @@ def _parse_jpeg_skip_timerange(value: str) -> JpegSkipTimerange:
         raise ValueError(
             f"Start ({start_str}) is after end ({end_str}) in timezone {tz_str}")
     return JpegSkipTimerange(start_utc=start_utc, end_utc=end_utc)
-    total_seconds = int(offset.total_seconds())
-    sign = '+' if total_seconds >= 0 else '-'
-    total_seconds = abs(total_seconds)
-    hours = total_seconds // 3600
-    minutes = (total_seconds % 3600) // 60
-    return f"{sign}{hours:02d}:{minutes:02d}"
 
 
 def _build_gps_params(gps: Dict[str, float]) -> List[str]:
@@ -611,11 +605,8 @@ def _do_process_matched(et, info: MediaFileInfo, stats: MergeStats,
             logger.error("Failed to copy %s: %s", info.source_path, e)
             stats.errors += 1
             return
-        # Stats for metadata that will be written to the XMP sidecar.
-        if info.gps:
-            stats.gps_written += 1
-        if info.clear_descriptions:
-            stats.descriptions_cleared += 1
+        # GPS and description stats are deferred to after sidecar creation
+        # so they are only counted when the sidecar is successfully written.
     elif _needs_jpeg_compression(info):
         # ----- Compressed JPEG path -----
         # Compress with Pillow (in memory, no metadata), then pipe the
@@ -813,7 +804,15 @@ def _do_process_matched(et, info: MediaFileInfo, stats: MergeStats,
     stats.written += 1
 
     if info.sidecar_path:
+        _sidecar_before = stats.sidecars_created
         _do_create_sidecar(et, info, stats, logger)
+        # For non-QT video, GPS and descriptions are sidecar-only;
+        # count them only when the sidecar was successfully created.
+        if is_non_qt_video and stats.sidecars_created > _sidecar_before:
+            if info.gps:
+                stats.gps_written += 1
+            if info.clear_descriptions:
+                stats.descriptions_cleared += 1
 
     _do_strip_metadata(et, info, stats, logger)
     _do_set_filesystem_timestamps(et, info, logger)
@@ -906,6 +905,8 @@ def _do_process_orphan(et, info: MediaFileInfo, stats: MergeStats,
             stats.jpeg_compressed += 1
         stats.written += 1
 
+        if info.sidecar_path:
+            _do_create_sidecar(et, info, stats, logger)
         _do_strip_metadata(et, info, stats, logger)
         _do_set_filesystem_timestamps(et, info, logger)
         return
@@ -978,6 +979,8 @@ def _do_process_orphan(et, info: MediaFileInfo, stats: MergeStats,
                 else:
                     logger.warning("Failed to update orphan %s: %s", info.source_path, e)
 
+    if info.sidecar_path:
+        _do_create_sidecar(et, info, stats, logger)
     _do_strip_metadata(et, info, stats, logger)
     _do_set_filesystem_timestamps(et, info, logger)
 
@@ -1154,7 +1157,8 @@ class PhotosExportMerger(AbstractMediaMerger):
         self._et = self._et_helper.__enter__()
 
     def _close_writer(self) -> None:
-        self._et_helper.__exit__(None, None, None)
+        if hasattr(self, '_et_helper'):
+            self._et_helper.__exit__(None, None, None)
 
     def _validate_directories(self):
         if not self.input_path.exists():

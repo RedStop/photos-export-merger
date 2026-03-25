@@ -2149,6 +2149,12 @@ class TestPhotosExportMerger(BaseTestCase):
         'desc_utf8.gif.xmp':    (False, True, 'GIF description test'),
         'desc_utf8.mp4.xmp':    (False, True, 'MP4 description test'),
         'desc_utf8.avi.xmp':    (False, True, 'AVI description test'),
+        # Orphan files — no GPS or description (no JSON), date from EXIF/filesystem
+        'orphan.png.xmp':       (False, True, None),
+        'orphan.gif.xmp':       (False, True, None),
+        'orphan.mp4.xmp':       (False, True, None),
+        'orphan.mov.xmp':       (False, True, None),
+        'orphan.avi.xmp':       (False, True, None),
     }
 
     def test_xmp_sidecar_for_png(self) -> None:
@@ -2413,6 +2419,7 @@ class TestPhotosExportMerger(BaseTestCase):
     #   gps=100     (98 GPS Tests [8 dirs × 12 fmts + 2 altitude] + sc_png + sc_avi)
     #   sidecars=80 (previous 14 + 56 GPS sidecar [7 fmts × 8 dirs]
     #               + 4 TZ fallback sidecar + 6 Desc sidecar)
+    #            +5 orphan sidecars (orphan.png/gif/mp4/mov/avi) = 89 total
     #   descriptions_cleared=3  (desc_blocked.jpg + desc_blocked.png + desc_iptc_blocked.jpg)
     #   duplicates_renamed=3    (unchanged)
     #   written=175
@@ -2439,9 +2446,9 @@ class TestPhotosExportMerger(BaseTestCase):
                          f"Expected 101 GPS writes, got {self.stats.gps_written}")
 
     def test_stats_sidecars_created(self) -> None:
-        """XMP sidecars created = 84."""
-        self.assertEqual(self.stats.sidecars_created, 84,
-                         f"Expected 84 sidecars, got {self.stats.sidecars_created}")
+        """XMP sidecars created = 89 (84 matched + 5 orphan)."""
+        self.assertEqual(self.stats.sidecars_created, 89,
+                         f"Expected 89 sidecars, got {self.stats.sidecars_created}")
 
     def test_stats_zero_errors(self) -> None:
         """Merger reports zero errors for well-formed test data."""
@@ -4259,9 +4266,9 @@ class TestJpegCompressionWithFullTree(TestPhotosExportMerger):
                          f"Expected 7 orphans, got {self.stats.orphans}")
 
     def test_jpeg_full_tree_stats_sidecars(self) -> None:
-        """Sidecar count still = 84 (JPEG compression doesn't affect sidecars)."""
-        self.assertEqual(self.stats.sidecars_created, 84,
-                         f"Expected 84 sidecars, got {self.stats.sidecars_created}")
+        """Sidecar count still = 89 (JPEG compression doesn't affect sidecars)."""
+        self.assertEqual(self.stats.sidecars_created, 89,
+                         f"Expected 89 sidecars, got {self.stats.sidecars_created}")
 
 
 # ---------------------------------------------------------------------------

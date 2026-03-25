@@ -138,6 +138,8 @@ The merger copies files to a date-organized output directory (`YYYY/MM/filename`
 | QuickTime video + sidecar | `.mov`, `.mp4`, `.m4v` | QT/XMP tags + `.xmp` sidecar |
 | Copy-only + sidecar | `.avi`, `.mkv`, `.webm` | File copied; all metadata in `.xmp` sidecar |
 
+**Input directory structure:** The merger scans up to **2 directory levels** inside `<input_dir>`. Files at greater depth are silently skipped. This matches the layout Google Photos Takeout produces — typically a single level of album subdirectories, each containing media files and their companion `.json` files.
+
 **Parallel processing:** Steps 1–6 (scanning, matching, date resolution) run serially. Steps 7–8 (file processing) run in parallel across `--workers` processes, each with its own ExifTool instance.
 
 ### Timezone fallback and overrides
