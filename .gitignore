@@ -3,13 +3,19 @@
 *.dng
 *.gif
 *.heic
+*.jfif
+*.jpe
 *.jpeg
 *.jpg
 *.json
+*.m4v
 *.mkv
 *.mov
 *.mp4
 *.png
+*.tif
+*.tiff
+*.webm
 *.xmp
 *.zip
 

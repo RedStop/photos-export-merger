@@ -107,6 +107,27 @@ METADATA_STRIP_PROFILES: Dict[str, List[str]] = {
     'photoshop': ['-Photoshop:All=', '-XMP-photoshop:DocumentAncestors='],
 }
 
+# ---------------------------------------------------------------------------
+# Each editor maps a name to a dict with 'match' substrings (any one must
+# appear) and optional 'exclude' substrings (none may appear).  Matching is
+# performed case-insensitively against EXIF:Software and XMP-xmp:CreatorTool.
+# Editors are selected via --jpeg-quality-skip-editor on the CLI.
+# To add a new editor, add an entry here — it will automatically appear in
+# the output of --list-editors.
+EDITOR_SOFTWARE_PATTERNS: Dict[str, Dict[str, List[str]]] = {
+    'lightroom':   {'match': ['Lightroom']},
+    'photoshop':   {'match': ['Photoshop'], 'exclude': ['Lightroom']},
+    'capture-one': {'match': ['Capture One']},
+    'dxo':         {'match': ['DxO PhotoLab', 'DxO OpticsPro']},
+    'on1':         {'match': ['ON1 Photo RAW']},
+    'luminar':     {'match': ['Luminar']},
+    'darktable':   {'match': ['darktable']},
+    'rawtherapee': {'match': ['RawTherapee']},
+    'gimp':        {'match': ['GIMP']},
+    'affinity':    {'match': ['Affinity Photo']},
+    'snapseed':    {'match': ['Snapseed']},
+}
+
 
 def _build_strip_params(profiles: Optional[List[str]] = None) -> Optional[List[str]]:
     """Build a combined ExifTool param list from the requested strip profiles.
@@ -128,6 +149,65 @@ def _build_strip_params(profiles: Optional[List[str]] = None) -> Optional[List[s
                 params.extend(profile_params)
 
     return params if params else None
+
+
+def _resolve_editor_skip_patterns(
+    editor_names: List[str],
+) -> List[Dict[str, List[str]]]:
+    """Resolve user-supplied editor names to a list of pattern dicts.
+
+    Each name is matched (case-insensitive substring) against
+    ``EDITOR_SOFTWARE_PATTERNS`` keys.  The special name ``'all'`` selects
+    every known editor.  Returns a deduplicated list of pattern dicts.
+    Raises ``ValueError`` if a name matches no key.
+    """
+    if 'all' in (n.lower() for n in editor_names):
+        return list(EDITOR_SOFTWARE_PATTERNS.values())
+
+    seen_keys: set = set()
+    result: List[Dict[str, List[str]]] = []
+    for user_name in editor_names:
+        hits = [(k, v) for k, v in EDITOR_SOFTWARE_PATTERNS.items()
+                if user_name.lower() in k.lower()]
+        if not hits:
+            raise ValueError(
+                f"No editor matching '{user_name}'. "
+                f"Use --list-editors to see options.")
+        for key, pattern in hits:
+            if key not in seen_keys:
+                seen_keys.add(key)
+                result.append(pattern)
+    return result
+
+
+def _matches_editor_pattern(tag_value: str,
+                            pattern: Dict[str, List[str]]) -> bool:
+    """Return True if *tag_value* matches *pattern* (match + exclude logic).
+
+    A match requires any ``match`` substring to be present **and** no
+    ``exclude`` substring to be present (all case-insensitive).
+    """
+    val_lower = tag_value.lower()
+    if not any(m.lower() in val_lower for m in pattern['match']):
+        return False
+    for excl in pattern.get('exclude', []):
+        if excl.lower() in val_lower:
+            return False
+    return True
+
+
+def _check_editor_skip(tags: dict, info: MediaFileInfo,
+                       patterns: List[Dict[str, List[str]]]) -> None:
+    """Set ``info.jpeg_skip_editor`` if Software/CreatorTool matches."""
+    if info.source_path.suffix.lower() not in JPEG_EXTENSIONS:
+        return
+    software = str(tags.get('EXIF:Software', ''))
+    creator = str(tags.get('XMP-xmp:CreatorTool', ''))
+    for pattern in patterns:
+        if ((software and _matches_editor_pattern(software, pattern)) or
+                (creator and _matches_editor_pattern(creator, pattern))):
+            info.jpeg_skip_editor = True
+            return
 
 
 def _get_write_strategy(ext: str) -> Optional[WriteStrategy]:
@@ -340,11 +420,14 @@ def _needs_jpeg_compression(info: MediaFileInfo) -> bool:
 
     Compression is triggered when all of these are true:
     - JPEG compression is enabled (jpeg_compress_quality is set)
+    - The source file was NOT exported from a skipped editor
     - The source file has a JPEG extension
     - The estimated quality exceeds the target threshold, OR the quality
       could not be determined (conservative — recompress to be safe)
     """
     if info.jpeg_compress_quality is None:
+        return False
+    if info.jpeg_skip_editor:
         return False
     if info.source_path.suffix.lower() not in JPEG_EXTENSIONS:
         return False
@@ -452,6 +535,14 @@ def _do_process_matched(et, info: MediaFileInfo, stats: MergeStats,
         return
 
     info.output_path.parent.mkdir(parents=True, exist_ok=True)
+
+    if (info.jpeg_skip_editor and info.jpeg_compress_quality is not None
+            and info.source_path.suffix.lower() in JPEG_EXTENSIONS
+            and (info.jpeg_quality is None
+                 or info.jpeg_quality > info.jpeg_compress_quality)):
+        stats.jpeg_compress_skipped_editor += 1
+        logger.info("SKIP-EDITOR  %s  (exported from known editor, skipping compression)",
+                     info.source_path.name)
 
     # Non-QuickTime video containers (AVI, MKV, WebM) cannot have tags
     # written directly — ExifTool does not support writing to these formats.
@@ -685,6 +776,14 @@ def _do_process_orphan(et, info: MediaFileInfo, stats: MergeStats,
         return
 
     info.output_path.parent.mkdir(parents=True, exist_ok=True)
+
+    if (info.jpeg_skip_editor and info.jpeg_compress_quality is not None
+            and info.source_path.suffix.lower() in JPEG_EXTENSIONS
+            and (info.jpeg_quality is None
+                 or info.jpeg_quality > info.jpeg_compress_quality)):
+        stats.jpeg_compress_skipped_editor += 1
+        logger.info("SKIP-EDITOR  %s  (orphan, exported from known editor, skipping compression)",
+                     info.source_path.name)
 
     if _needs_jpeg_compression(info):
         # ----- Compressed JPEG orphan path -----
@@ -980,13 +1079,15 @@ class PhotosExportMerger(AbstractMediaMerger):
                  metadata_strip_params: Optional[List[str]] = None,
                  tz_overrides: Optional[List[TimezoneOverride]] = None,
                  fallback_tz: Optional[timezone] = None,
-                 jpeg_compress_quality: Optional[int] = None):
+                 jpeg_compress_quality: Optional[int] = None,
+                 editor_skip_patterns: Optional[List[Dict[str, List[str]]]] = None):
         super().__init__(input_dir, output_dir, dry_run, blocked_descriptions,
                          num_workers=num_workers,
                          metadata_strip_params=metadata_strip_params,
                          tz_overrides=tz_overrides,
                          fallback_tz=fallback_tz,
-                         jpeg_compress_quality=jpeg_compress_quality)
+                         jpeg_compress_quality=jpeg_compress_quality,
+                         editor_skip_patterns=editor_skip_patterns)
 
     def _open_writer(self) -> None:
         self._et_helper = exiftool.ExifToolHelper()
@@ -1138,6 +1239,8 @@ class PhotosExportMerger(AbstractMediaMerger):
             read_tags = tz_tags + CONDITIONAL_DATE_READ_TAGS + ['File:FileTypeExtension'] + (DESC_READ_TAGS if self.blocked_descriptions else ['IPTC:Caption-Abstract'])
             if self.jpeg_compress_quality is not None:
                 read_tags.append('File:JPEGQualityEstimate')
+            if self.editor_skip_patterns:
+                read_tags.extend(['EXIF:Software', 'XMP-xmp:CreatorTool'])
 
             try:
                 tag_results = self._et.get_tags(file_paths, read_tags)
@@ -1180,6 +1283,10 @@ class PhotosExportMerger(AbstractMediaMerger):
                                 stats.jpeg_quality_unknown += 1
                         else:
                             stats.jpeg_quality_unknown += 1
+
+                # Check if file was exported from a skipped editor.
+                if self.editor_skip_patterns:
+                    _check_editor_skip(tags, info, self.editor_skip_patterns)
 
                 # Check blocked descriptions
                 if self.blocked_descriptions and info.json_data:
@@ -1255,6 +1362,8 @@ class PhotosExportMerger(AbstractMediaMerger):
             read_tags = DATE_TAGS_PRIORITY + CONDITIONAL_DATE_READ_TAGS + ['File:FileTypeExtension'] + (DESC_READ_TAGS if self.blocked_descriptions else ['IPTC:Caption-Abstract'])
             if self.jpeg_compress_quality is not None:
                 read_tags.append('File:JPEGQualityEstimate')
+            if self.editor_skip_patterns:
+                read_tags.extend(['EXIF:Software', 'XMP-xmp:CreatorTool'])
 
             try:
                 tag_results = self._et.get_tags(file_paths, read_tags)
@@ -1296,6 +1405,10 @@ class PhotosExportMerger(AbstractMediaMerger):
                                 stats.jpeg_quality_unknown += 1
                         else:
                             stats.jpeg_quality_unknown += 1
+
+                # Check if file was exported from a skipped editor.
+                if self.editor_skip_patterns:
+                    _check_editor_skip(tags, info, self.editor_skip_patterns)
 
                 # Check blocked descriptions on existing EXIF tags
                 if self.blocked_descriptions:
@@ -1454,6 +1567,10 @@ if __name__ == '__main__':
             '  # Recompress JPEGs above 80% quality\n'
             '  python PhotosExportMerger.py input/ output/ --jpeg-quality 80\n'
             '\n'
+            '  # Recompress JPEGs but skip Lightroom and Darktable exports\n'
+            '  python PhotosExportMerger.py input/ output/ --jpeg-quality 80 \\\n'
+            '    --jpeg-quality-skip-editor lightroom --jpeg-quality-skip-editor darktable\n'
+            '\n'
             '  # Set fallback timezone and override for a trip\n'
             '  python PhotosExportMerger.py input/ output/ \\\n'
             '    --tz-fallback "+02:00" \\\n'
@@ -1495,6 +1612,25 @@ if __name__ == '__main__':
                              'below this quality are copied as-is.  Requires '
                              'Pillow.  Default: disabled (no recompression).  '
                              'Use 80 for a good balance of size and quality.')
+    parser.add_argument('--jpeg-quality-skip-editor', action='append', default=[],
+                        dest='jpeg_quality_skip_editors', metavar='NAME',
+                        help='Skip JPEG compression for images exported from the '
+                             'named editing software (case-insensitive substring '
+                             'match against registry keys; repeatable).  '
+                             'Use --list-editors to see available editors.  '
+                             'Requires --jpeg-quality.')
+    parser.add_argument('--list-editors', action='store_true',
+                        help='Print available editor software names and exit.')
+
+    # Handle --list-editors before parse_args (avoids requiring positional args)
+    if '--list-editors' in sys.argv:
+        print('Available editor software patterns:')
+        for i, (key, pattern) in enumerate(EDITOR_SOFTWARE_PATTERNS.items(), 1):
+            match_str = ', '.join(pattern['match'])
+            excl = pattern.get('exclude')
+            suffix = f'  (excludes: {", ".join(excl)})' if excl else ''
+            print(f'  {i:>2}. {key:15s}  matches: {match_str}{suffix}')
+        sys.exit(0)
 
     args = parser.parse_args()
 
@@ -1528,6 +1664,17 @@ if __name__ == '__main__':
             parser.error(
                 f"--jpeg-quality must be between 1 and 100, got {jpeg_compress_quality}")
 
+    # Resolve editor skip patterns
+    editor_skip_patterns: Optional[List[Dict[str, List[str]]]] = None
+    if args.jpeg_quality_skip_editors:
+        if jpeg_compress_quality is None:
+            logging.warning("--jpeg-quality-skip-editor has no effect without --jpeg-quality")
+        try:
+            editor_skip_patterns = _resolve_editor_skip_patterns(
+                args.jpeg_quality_skip_editors)
+        except ValueError as e:
+            parser.error(str(e))
+
     blocked_descriptions = [
         # Add unwanted description strings here
         "SONY DSC",
@@ -1541,5 +1688,6 @@ if __name__ == '__main__':
                                 metadata_strip_params=metadata_strip_params,
                                 tz_overrides=tz_overrides or None,
                                 fallback_tz=fallback_tz,
-                                jpeg_compress_quality=jpeg_compress_quality)
+                                jpeg_compress_quality=jpeg_compress_quality,
+                                editor_skip_patterns=editor_skip_patterns)
     result = merger.run()

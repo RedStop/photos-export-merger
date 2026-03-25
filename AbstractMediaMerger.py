@@ -75,6 +75,10 @@ class MediaFileInfo:
     # recompresses the image.  None when JPEG compression is disabled.
     # Propagated to workers alongside fallback_tz / strip_metadata_params.
     jpeg_compress_quality: Optional[int] = None
+    # True when the source file's Software/CreatorTool tag matches one of the
+    # active --jpeg-quality-skip-editor patterns.  Prevents JPEG recompression
+    # for images exported from professional editing software.
+    jpeg_skip_editor: bool = False
 
 
 @dataclass
@@ -98,6 +102,7 @@ class MergeStats:
     jpeg_quality_unknown: int = 0
     jpeg_quality_checked: int = 0
     jpeg_compress_skipped_larger: int = 0
+    jpeg_compress_skipped_editor: int = 0
 
     def merge(self, other: 'MergeStats') -> None:
         """Add all counters from *other* into this instance.
@@ -118,6 +123,7 @@ class MergeStats:
         self.jpeg_compressed += other.jpeg_compressed
         self.jpeg_quality_unknown += other.jpeg_quality_unknown
         self.jpeg_compress_skipped_larger += other.jpeg_compress_skipped_larger
+        self.jpeg_compress_skipped_editor += other.jpeg_compress_skipped_editor
 
 
 def _resolve_gps(json_data: Dict[str, Any]) -> Optional[Dict[str, float]]:
@@ -142,7 +148,8 @@ class AbstractMediaMerger(ABC):
                  metadata_strip_params: Optional[List[str]] = None,
                  tz_overrides: Optional[List[TimezoneOverride]] = None,
                  fallback_tz: Optional[timezone] = None,
-                 jpeg_compress_quality: Optional[int] = None):
+                 jpeg_compress_quality: Optional[int] = None,
+                 editor_skip_patterns: Optional[List[Dict[str, List[str]]]] = None):
         self.input_path = Path(input_dir).resolve()
         self.output_path = Path(output_dir).resolve()
         self.dry_run = dry_run
@@ -151,6 +158,7 @@ class AbstractMediaMerger(ABC):
         self.metadata_strip_params: Optional[List[str]] = metadata_strip_params
         self.tz_overrides: List[TimezoneOverride] = tz_overrides or []
         self.jpeg_compress_quality: Optional[int] = jpeg_compress_quality
+        self.editor_skip_patterns: List[Dict[str, List[str]]] = editor_skip_patterns or []
         # Fallback timezone: use the provided value, or detect the host
         # machine's local UTC offset as a fixed-offset timezone.
         if fallback_tz is not None:
@@ -374,32 +382,34 @@ class AbstractMediaMerger(ABC):
         self.logger.info("=" * 60)
         self.logger.info("MERGE SUMMARY%s", " (DRY RUN)" if self.dry_run else "")
         self.logger.info("=" * 60)
-        self.logger.info("Total media files:            %d", stats.total_media_files)
-        self.logger.info("Matched (with JSON):          %d", stats.matched)
-        self.logger.info("Orphans (no JSON):            %d", stats.orphans)
-        self.logger.info("Files written:                %d", stats.written)
-        self.logger.info("XMP sidecars created:         %d", stats.sidecars_created)
-        self.logger.info("GPS tags written:             %d", stats.gps_written)
-        self.logger.info("Descriptions cleared:         %d", stats.descriptions_cleared)
-        self.logger.info("Duplicates renamed:           %d", stats.duplicates_renamed)
-        self.logger.info("Skipped JSON files:           %d", stats.skipped_json)
-        self.logger.info("Ext mismatches fixed:         %d", stats.ext_mismatches)
-        self.logger.info("Skipped (existing):           %d", stats.skipped_existing)
-        self.logger.info("Errors:                       %d", stats.errors)
+        self.logger.info("Total media files:              %d", stats.total_media_files)
+        self.logger.info("Matched (with JSON):            %d", stats.matched)
+        self.logger.info("Orphans (no JSON):              %d", stats.orphans)
+        self.logger.info("Files written:                  %d", stats.written)
+        self.logger.info("XMP sidecars created:           %d", stats.sidecars_created)
+        self.logger.info("GPS tags written:               %d", stats.gps_written)
+        self.logger.info("Descriptions cleared:           %d", stats.descriptions_cleared)
+        self.logger.info("Duplicates renamed:             %d", stats.duplicates_renamed)
+        self.logger.info("Skipped JSON files:             %d", stats.skipped_json)
+        self.logger.info("Ext mismatches fixed:           %d", stats.ext_mismatches)
+        self.logger.info("Skipped (existing):             %d", stats.skipped_existing)
+        self.logger.info("Errors:                         %d", stats.errors)
         if stats.metadata_stripped > 0:
-            self.logger.info("Metadata stripped:            %d", stats.metadata_stripped)
+            self.logger.info("Metadata stripped:              %d", stats.metadata_stripped)
         if stats.jpeg_quality_checked > 0:
-            self.logger.info("JPEG quality checked:         %d", stats.jpeg_quality_checked)
+            self.logger.info("JPEG quality checked:           %d", stats.jpeg_quality_checked)
         if stats.jpeg_quality_unknown > 0:
-            self.logger.info("JPEG quality unknown:         %d", stats.jpeg_quality_unknown)
+            self.logger.info("JPEG quality unknown:           %d", stats.jpeg_quality_unknown)
         if stats.jpeg_compressed > 0:
-            self.logger.info("JPEG compressed:              %d", stats.jpeg_compressed)
+            self.logger.info("JPEG compressed:                %d", stats.jpeg_compressed)
         if stats.jpeg_compress_skipped_larger > 0:
-            self.logger.info("JPEG compress skipped (larger):%d", stats.jpeg_compress_skipped_larger)
+            self.logger.info("JPEG compress skipped (larger): %d", stats.jpeg_compress_skipped_larger)
+        if stats.jpeg_compress_skipped_editor > 0:
+            self.logger.info("JPEG compress skipped (editor): %d", stats.jpeg_compress_skipped_editor)
         if stats.date_from_exif > 0:
-            self.logger.info("Orphan dates from EXIF:       %d", stats.date_from_exif)
+            self.logger.info("Orphan dates from EXIF:         %d", stats.date_from_exif)
         if stats.date_from_filesystem > 0:
-            self.logger.info("Orphan dates from filesystem: %d", stats.date_from_filesystem)
+            self.logger.info("Orphan dates from filesystem:   %d", stats.date_from_filesystem)
         self.logger.info("=" * 60)
 
     def _rel(self, path: Path) -> str:

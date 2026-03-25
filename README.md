@@ -68,6 +68,13 @@ python PhotosExportMerger.py input/ output/ \
 # Recompress JPEGs above 80% quality
 python PhotosExportMerger.py input/ output/ --jpeg-quality 80
 
+# Recompress JPEGs but skip Lightroom and Darktable exports
+python PhotosExportMerger.py input/ output/ --jpeg-quality 80 \
+  --jpeg-quality-skip-editor lightroom --jpeg-quality-skip-editor darktable
+
+# List available editor software names
+python PhotosExportMerger.py --list-editors
+
 # Recompress at 65% quality, strip Google metadata, 4 workers
 python PhotosExportMerger.py input/ output/ --jpeg-quality 65 --strip-metadata google --workers 4
 ```
@@ -151,6 +158,21 @@ Use `--strip-metadata` (no args) for all profiles, or name specific ones: `--str
 `--jpeg-quality PERCENT` recompresses JPEG images whose estimated quality exceeds the given threshold (1–100). JPEGs at or below the threshold are copied as-is. The quality is estimated via ExifTool's `File:JPEGQualityEstimate` during the scan phase; files whose quality cannot be determined are conservatively recompressed.
 
 Compression uses Pillow in memory — the compressed bytes are piped directly into ExifTool via stdin, which copies all metadata from the original source (`-TagsFromFile`) and applies tag modifications in one pass, with no intermediate file written to disk. As a safety net, if the compressed output is not smaller than the original file, the original image is used instead (logged as `SKIP-COMPRESS`). Metadata stripping (`--strip-metadata`) runs as a separate pass afterward. Applies to both matched and orphan files. Only files with JPEG extensions (`.jpg`, `.jpeg`, `.jpe`, `.jfif`) are eligible.
+
+#### Skipping editor-exported images
+
+`--jpeg-quality-skip-editor NAME` excludes JPEGs exported from named photo editing software from recompression. The rationale is that professional editors (Lightroom, Darktable, etc.) already export at an intentionally chosen quality. Detection uses the `EXIF:Software` and `XMP-xmp:CreatorTool` tags via case-insensitive substring matching.
+
+The option is repeatable — specify multiple editors to skip:
+
+```bash
+python PhotosExportMerger.py input/ output/ --jpeg-quality 80 \
+  --jpeg-quality-skip-editor lightroom --jpeg-quality-skip-editor darktable
+```
+
+Use `--list-editors` to see all available editors and their match patterns. Editor names support case-insensitive substring matching (e.g. `light` matches `lightroom`). The special name `all` skips all known editors. A warning is printed if `--jpeg-quality-skip-editor` is used without `--jpeg-quality`.
+
+Add new editors to `EDITOR_SOFTWARE_PATTERNS` in `PhotosExportMerger.py` — they will automatically appear in `--list-editors`.
 
 ### Blocking unwanted descriptions
 

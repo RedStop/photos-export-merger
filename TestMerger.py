@@ -24,7 +24,8 @@ from typing import Any, Dict
 
 import exiftool
 from PIL import Image
-from PhotosExportMerger import PhotosExportMerger, MergeStats
+from PhotosExportMerger import (PhotosExportMerger, MergeStats,
+                                _resolve_editor_skip_patterns)
 
 # Custom log level below DEBUG (10) — used by infrastructure-validation tests
 # to document intent without cluttering normal output.
@@ -3789,6 +3790,220 @@ class TestJpegCompression(BaseTestCase):
 
 
 # ---------------------------------------------------------------------------
+# JPEG editor-skip tests
+# ---------------------------------------------------------------------------
+# Shared base class creates tagged JPEGs for multiple editors.  Concrete
+# subclasses run the merger with a specific editor excluded, verifying that
+# excluded editors' files are NOT compressed while non-excluded files ARE.
+
+
+class _EditorSkipBase(BaseTestCase):
+    """Base class for editor-skip compression tests.
+
+    Creates high-quality (q=98) and low-quality (q=50) JPEGs tagged with
+    each editor's Software string, plus one untagged control JPEG.
+    Subclasses set ``_SKIP_EDITORS`` to control which editor is excluded.
+    """
+
+    # (high_q_filename, low_q_filename, EXIF:Software value, editor key)
+    _EDITOR_FILES = [
+        ('lr_high.jpg', 'lr_low.jpg',
+         'Adobe Photoshop Lightroom Classic 12.0', 'lightroom'),
+        ('dt_high.jpg', 'dt_low.jpg',
+         'darktable 4.6.1',                       'darktable'),
+    ]
+    _SKIP_EDITORS: list = []
+    _COMPRESS_QUALITY = 80
+
+    @classmethod
+    def setUpClass(cls) -> None:
+        print(f'\n=== {cls.__name__} ===')
+        cls.tmp_dir    = Path(tempfile.mkdtemp(prefix='gpem_edskip_test_'))
+        cls.input_dir  = cls.tmp_dir / 'input'
+        cls.output_dir = cls.tmp_dir / 'output'
+        cls.input_dir.mkdir()
+
+        d = cls.input_dir / 'EditorSkip'
+        d.mkdir(parents=True)
+
+        cls._source_sizes: Dict[str, int] = {}
+        seed = 100
+
+        with exiftool.ExifToolHelper() as et:
+            for high_name, low_name, software, _key in cls._EDITOR_FILES:
+                # High-quality JPEG (above threshold → should compress unless excluded)
+                high_bytes = _make_pillow_jpeg(quality=98, seed=seed)
+                (d / high_name).write_bytes(high_bytes)
+                cls._source_sizes[high_name] = len(high_bytes)
+                make_json_file(d / f'{high_name}.json', title=high_name)
+                seed += 1
+
+                # Low-quality JPEG (below threshold → should never compress)
+                low_bytes = _make_pillow_jpeg(quality=50, seed=seed)
+                (d / low_name).write_bytes(low_bytes)
+                cls._source_sizes[low_name] = len(low_bytes)
+                make_json_file(d / f'{low_name}.json', title=low_name)
+                seed += 1
+
+                # Stamp EXIF:Software on both files
+                et.set_tags(
+                    [str(d / high_name), str(d / low_name)],
+                    {'EXIF:Software': software},
+                    params=['-overwrite_original'],
+                )
+
+        # Untagged high-quality control JPEG (always compressed)
+        plain_bytes = _make_pillow_jpeg(quality=98, seed=seed)
+        (d / 'plain_high.jpg').write_bytes(plain_bytes)
+        cls._source_sizes['plain_high.jpg'] = len(plain_bytes)
+        make_json_file(d / 'plain_high.jpg.json', title='plain_high.jpg')
+
+        # Resolve editor skip patterns from subclass setting
+        editor_skip_patterns = _resolve_editor_skip_patterns(cls._SKIP_EDITORS)
+
+        merger = PhotosExportMerger(
+            str(cls.input_dir),
+            str(cls.output_dir),
+            num_workers=1,
+            fallback_tz=timezone(timedelta(hours=2)),
+            jpeg_compress_quality=cls._COMPRESS_QUALITY,
+            editor_skip_patterns=editor_skip_patterns,
+        )
+        cls.stats = merger.run()
+
+        cls._open_exiftool()
+        cls._build_output_index()
+
+    # -- Helpers --
+
+    def _assert_compressed(self, filename: str) -> None:
+        """Assert that output file is smaller than source (was compressed)."""
+        f = self._find_output_file(filename)
+        self.assertIsNotNone(f, f"{filename} should exist in output")
+        output_size = f.stat().st_size
+        source_size = self._source_sizes[filename]
+        self.assertLess(output_size, source_size,
+                        f"{filename} should be compressed: "
+                        f"output={output_size} vs source={source_size}")
+
+    def _assert_not_compressed(self, filename: str) -> None:
+        """Assert that output file is NOT smaller than source (not compressed)."""
+        f = self._find_output_file(filename)
+        self.assertIsNotNone(f, f"{filename} should exist in output")
+        output_size = f.stat().st_size
+        source_size = self._source_sizes[filename]
+        self.assertGreaterEqual(output_size, source_size,
+                                f"{filename} should NOT be compressed: "
+                                f"output={output_size} vs source={source_size}")
+
+
+class TestJpegEditorSkipLightroom(_EditorSkipBase):
+    """Exclude Lightroom: LR files NOT compressed, others ARE."""
+
+    _SKIP_EDITORS = ['lightroom']
+
+    # -- Lightroom files (excluded) --
+
+    def test_lr_high_not_compressed(self) -> None:
+        """Lightroom high-q JPEG was NOT compressed (excluded editor)."""
+        self._assert_not_compressed('lr_high.jpg')
+
+    def test_lr_low_not_compressed(self) -> None:
+        """Lightroom low-q JPEG was NOT compressed (below threshold)."""
+        self._assert_not_compressed('lr_low.jpg')
+
+    def test_lr_software_preserved(self) -> None:
+        """EXIF:Software tag preserved on excluded Lightroom file."""
+        tags = self._read_tags('lr_high.jpg', ['EXIF:Software'])
+        sw = tags.get('EXIF:Software', '')
+        self.assertIn('Lightroom', sw,
+                      f"Expected 'Lightroom' in Software tag, got {sw!r}")
+
+    # -- Darktable files (not excluded → should compress) --
+
+    def test_dt_high_was_compressed(self) -> None:
+        """Darktable high-q JPEG WAS compressed (not excluded)."""
+        self._assert_compressed('dt_high.jpg')
+
+    def test_dt_low_not_compressed(self) -> None:
+        """Darktable low-q JPEG was NOT compressed (below threshold)."""
+        self._assert_not_compressed('dt_low.jpg')
+
+    # -- Untagged control --
+
+    def test_plain_was_compressed(self) -> None:
+        """Untagged high-q JPEG WAS compressed (no editor tag)."""
+        self._assert_compressed('plain_high.jpg')
+
+    # -- Stats --
+
+    def test_stats_skipped_editor(self) -> None:
+        """jpeg_compress_skipped_editor = 1 (lr_high only; lr_low is below threshold)."""
+        self.assertEqual(self.stats.jpeg_compress_skipped_editor, 1,
+                         f"Expected 1 jpeg_compress_skipped_editor, "
+                         f"got {self.stats.jpeg_compress_skipped_editor}")
+
+    def test_stats_compressed(self) -> None:
+        """jpeg_compressed = 2 (dt_high + plain_high)."""
+        self.assertEqual(self.stats.jpeg_compressed, 2,
+                         f"Expected 2 jpeg_compressed, "
+                         f"got {self.stats.jpeg_compressed}")
+
+
+class TestJpegEditorSkipDarktable(_EditorSkipBase):
+    """Exclude Darktable: DT files NOT compressed, others ARE."""
+
+    _SKIP_EDITORS = ['darktable']
+
+    # -- Darktable files (excluded) --
+
+    def test_dt_high_not_compressed(self) -> None:
+        """Darktable high-q JPEG was NOT compressed (excluded editor)."""
+        self._assert_not_compressed('dt_high.jpg')
+
+    def test_dt_low_not_compressed(self) -> None:
+        """Darktable low-q JPEG was NOT compressed (below threshold)."""
+        self._assert_not_compressed('dt_low.jpg')
+
+    def test_dt_software_preserved(self) -> None:
+        """EXIF:Software tag preserved on excluded Darktable file."""
+        tags = self._read_tags('dt_high.jpg', ['EXIF:Software'])
+        sw = tags.get('EXIF:Software', '')
+        self.assertIn('darktable', sw,
+                      f"Expected 'darktable' in Software tag, got {sw!r}")
+
+    # -- Lightroom files (not excluded → should compress) --
+
+    def test_lr_high_was_compressed(self) -> None:
+        """Lightroom high-q JPEG WAS compressed (not excluded)."""
+        self._assert_compressed('lr_high.jpg')
+
+    def test_lr_low_not_compressed(self) -> None:
+        """Lightroom low-q JPEG was NOT compressed (below threshold)."""
+        self._assert_not_compressed('lr_low.jpg')
+
+    # -- Untagged control --
+
+    def test_plain_was_compressed(self) -> None:
+        """Untagged high-q JPEG WAS compressed (no editor tag)."""
+        self._assert_compressed('plain_high.jpg')
+
+    # -- Stats --
+
+    def test_stats_skipped_editor(self) -> None:
+        """jpeg_compress_skipped_editor = 1 (dt_high only; dt_low is below threshold)."""
+        self.assertEqual(self.stats.jpeg_compress_skipped_editor, 1,
+                         f"Expected 1 jpeg_compress_skipped_editor, "
+                         f"got {self.stats.jpeg_compress_skipped_editor}")
+
+    def test_stats_compressed(self) -> None:
+        """jpeg_compressed = 2 (lr_high + plain_high)."""
+        self.assertEqual(self.stats.jpeg_compressed, 2,
+                         f"Expected 2 jpeg_compressed, "
+                         f"got {self.stats.jpeg_compressed}")
+
+
+# ---------------------------------------------------------------------------
 # JPEG compression with full input tree (regression guard)
 # ---------------------------------------------------------------------------
 # Runs by default.  To skip (e.g. for faster iteration), set
@@ -3955,6 +4170,8 @@ if __name__ == '__main__':
         'TestTimezoneOverride':            TestTimezoneOverride,
         'TestFallbackTimezone':            TestFallbackTimezone,
         'TestJpegCompression':             TestJpegCompression,
+        'TestJpegEditorSkipLightroom':     TestJpegEditorSkipLightroom,
+        'TestJpegEditorSkipDarktable':     TestJpegEditorSkipDarktable,
         'TestJpegCompressionWithFullTree': TestJpegCompressionWithFullTree,
     }
 
