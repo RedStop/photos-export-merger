@@ -3232,10 +3232,11 @@ class TestMetadataStripping(BaseTestCase):
 
         # Run merger with all strip profiles enabled
         # Explicit fallback_tz=+02:00 so tests are independent of host timezone.
+        num_workers = os.cpu_count() or 1
         merger = PhotosExportMerger(
             str(cls.input_dir),
             str(cls.output_dir),
-            num_workers=1,
+            num_workers=num_workers,
             metadata_strip_params=[
                 '-XMP-GCamera:All=', '-Google:All=',
                 '-Photoshop:All=', '-XMP-photoshop:DocumentAncestors=',
@@ -3361,10 +3362,11 @@ class TestTimezoneOverride(BaseTestCase):
             tz=timezone(timedelta(hours=-5, minutes=-30)),
         )
 
+        num_workers = os.cpu_count() or 1
         merger = PhotosExportMerger(
             str(cls.input_dir),
             str(cls.output_dir),
-            num_workers=1,
+            num_workers=num_workers,
             tz_overrides=[override],
             fallback_tz=timezone(timedelta(hours=2)),
         )
@@ -3502,10 +3504,11 @@ class TestFallbackTimezone(BaseTestCase):
                        photoTakenTime={'timestamp': cls._EPOCH, 'formatted': ''})
 
         # Run merger with custom fallback timezone -05:00
+        num_workers = os.cpu_count() or 1
         merger = PhotosExportMerger(
             str(cls.input_dir),
             str(cls.output_dir),
-            num_workers=1,
+            num_workers=num_workers,
             fallback_tz=timezone(timedelta(hours=-5)),
         )
         cls.stats = merger.run()
@@ -3667,10 +3670,11 @@ class TestJpegCompression(BaseTestCase):
         make_json_file(d / 'not_a_jpeg.png.json', title='not_a_jpeg.png')
 
         # Run merger with JPEG compression enabled
+        num_workers = os.cpu_count() or 1
         merger = PhotosExportMerger(
             str(cls.input_dir),
             str(cls.output_dir),
-            num_workers=1,
+            num_workers=num_workers,
             fallback_tz=timezone(timedelta(hours=2)),
             jpeg_compress_quality=cls._COMPRESS_QUALITY,
         )
@@ -3921,10 +3925,11 @@ class _JpegSkipBase(BaseTestCase):
         jpeg_skip_timeranges = [_parse_jpeg_skip_timerange(v)
                                 for v in cls._SKIP_TIMERANGES]
 
+        num_workers = os.cpu_count() or 1
         merger = PhotosExportMerger(
             str(cls.input_dir),
             str(cls.output_dir),
-            num_workers=1,
+            num_workers=num_workers,
             fallback_tz=timezone(timedelta(hours=2)),
             jpeg_compress_quality=cls._COMPRESS_QUALITY,
             editor_skip_patterns=editor_skip_patterns,
