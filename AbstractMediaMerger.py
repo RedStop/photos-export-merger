@@ -125,6 +125,7 @@ class MergeStats:
     jpeg_compress_skipped_larger: int = 0
     jpeg_compress_skipped_editor: int = 0
     jpeg_compress_skipped_timerange: int = 0
+    jpeg_compress_skipped_quality: int = 0
 
     def merge(self, other: 'MergeStats') -> None:
         """Add all counters from *other* into this instance.
@@ -133,8 +134,8 @@ class MergeStats:
         Only processing counters are merged; pipeline-level counters
         (total_media_files, matched, orphans, skipped_json, duplicates_renamed,
         ext_mismatches, date_from_exif, date_from_filesystem,
-        jpeg_quality_checked, jpeg_quality_unknown) are set before
-        parallelisation and should not be summed again.
+        jpeg_quality_checked, jpeg_quality_unknown, jpeg_compress_skipped_quality)
+        are set before parallelisation and should not be summed again.
         """
         self.written += other.written
         self.sidecars_created += other.sidecars_created
@@ -409,36 +410,38 @@ class AbstractMediaMerger(ABC):
         self.logger.info("=" * 60)
         self.logger.info("MERGE SUMMARY%s", " (DRY RUN)" if self.dry_run else "")
         self.logger.info("=" * 60)
-        self.logger.info("Total media files:              %d", stats.total_media_files)
-        self.logger.info("Matched (with JSON):            %d", stats.matched)
-        self.logger.info("Orphans (no JSON):              %d", stats.orphans)
-        self.logger.info("Files written:                  %d", stats.written)
-        self.logger.info("XMP sidecars created:           %d", stats.sidecars_created)
-        self.logger.info("GPS tags written:               %d", stats.gps_written)
-        self.logger.info("Descriptions cleared:           %d", stats.descriptions_cleared)
-        self.logger.info("Duplicates renamed:             %d", stats.duplicates_renamed)
-        self.logger.info("Skipped JSON files:             %d", stats.skipped_json)
-        self.logger.info("Ext mismatches fixed:           %d", stats.ext_mismatches)
-        self.logger.info("Skipped (existing):             %d", stats.skipped_existing)
-        self.logger.info("Errors:                         %d", stats.errors)
+        self.logger.info("Total media files:               %d", stats.total_media_files)
+        self.logger.info("Matched (with JSON):             %d", stats.matched)
+        self.logger.info("Orphans (no JSON):               %d", stats.orphans)
+        self.logger.info("Files written:                   %d", stats.written)
+        self.logger.info("XMP sidecars created:            %d", stats.sidecars_created)
+        self.logger.info("GPS tags written:                %d", stats.gps_written)
+        self.logger.info("Descriptions cleared:            %d", stats.descriptions_cleared)
+        self.logger.info("Duplicates renamed:              %d", stats.duplicates_renamed)
+        self.logger.info("Skipped JSON files:              %d", stats.skipped_json)
+        self.logger.info("Ext mismatches fixed:            %d", stats.ext_mismatches)
+        self.logger.info("Skipped (existing):              %d", stats.skipped_existing)
+        self.logger.info("Errors:                          %d", stats.errors)
         if stats.metadata_stripped > 0:
-            self.logger.info("Metadata stripped:              %d", stats.metadata_stripped)
+            self.logger.info("Metadata stripped:               %d", stats.metadata_stripped)
         if stats.jpeg_quality_checked > 0:
-            self.logger.info("JPEG quality checked:           %d", stats.jpeg_quality_checked)
+            self.logger.info("JPEG quality checked:            %d", stats.jpeg_quality_checked)
         if stats.jpeg_quality_unknown > 0:
-            self.logger.info("JPEG quality unknown:           %d", stats.jpeg_quality_unknown)
+            self.logger.info("JPEG quality unknown:            %d", stats.jpeg_quality_unknown)
         if stats.jpeg_compressed > 0:
-            self.logger.info("JPEG compressed:                %d", stats.jpeg_compressed)
+            self.logger.info("JPEG compressed:                 %d", stats.jpeg_compressed)
+        if stats.jpeg_compress_skipped_quality > 0:
+            self.logger.info("JPEG compress skipped (quality): %d", stats.jpeg_compress_skipped_quality)
         if stats.jpeg_compress_skipped_larger > 0:
-            self.logger.info("JPEG compress skipped (larger): %d", stats.jpeg_compress_skipped_larger)
+            self.logger.info("JPEG compress skipped (larger):  %d", stats.jpeg_compress_skipped_larger)
         if stats.jpeg_compress_skipped_timerange > 0:
-            self.logger.info("JPEG compress skipped (time):   %d", stats.jpeg_compress_skipped_timerange)
+            self.logger.info("JPEG compress skipped (time):    %d", stats.jpeg_compress_skipped_timerange)
         if stats.jpeg_compress_skipped_editor > 0:
-            self.logger.info("JPEG compress skipped (editor): %d", stats.jpeg_compress_skipped_editor)
+            self.logger.info("JPEG compress skipped (editor):  %d", stats.jpeg_compress_skipped_editor)
         if stats.date_from_exif > 0:
-            self.logger.info("Orphan dates from EXIF:         %d", stats.date_from_exif)
+            self.logger.info("Orphan dates from EXIF:          %d", stats.date_from_exif)
         if stats.date_from_filesystem > 0:
-            self.logger.info("Orphan dates from filesystem:   %d", stats.date_from_filesystem)
+            self.logger.info("Orphan dates from filesystem:    %d", stats.date_from_filesystem)
         self.logger.info("=" * 60)
 
     def _rel(self, path: Path) -> str:

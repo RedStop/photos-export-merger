@@ -2510,6 +2510,11 @@ class TestPhotosExportMerger(BaseTestCase):
         self.assertEqual(self.stats.jpeg_compress_skipped_timerange, 0,
                          f"Expected 0 jpeg_compress_skipped_timerange, got {self.stats.jpeg_compress_skipped_timerange}")
 
+    def test_stats_jpeg_compress_skipped_quality_disabled(self) -> None:
+        """jpeg_compress_skipped_quality = 0 when --jpeg-quality-threshold is not set."""
+        self.assertEqual(self.stats.jpeg_compress_skipped_quality, 0,
+                         f"Expected 0 jpeg_compress_skipped_quality, got {self.stats.jpeg_compress_skipped_quality}")
+
     # ------------------------------------------------------------------
     # Category 13 — Video UTC Time
     # ------------------------------------------------------------------
@@ -3805,6 +3810,12 @@ class TestJpegCompression(BaseTestCase):
                          f"Expected 0 jpeg_compress_skipped_larger, "
                          f"got {self.stats.jpeg_compress_skipped_larger}")
 
+    def test_jpeg_compress_stats_skipped_quality(self) -> None:
+        """jpeg_compress_skipped_quality = 1 (low_quality.jpg is below the threshold)."""
+        self.assertEqual(self.stats.jpeg_compress_skipped_quality, 1,
+                         f"Expected 1 jpeg_compress_skipped_quality, "
+                         f"got {self.stats.jpeg_compress_skipped_quality}")
+
 
 class TestJpegTargetQuality(BaseTestCase):
     """Run the merger with separate --jpeg-quality-threshold and --jpeg-target-quality.
@@ -3900,6 +3911,12 @@ class TestJpegTargetQuality(BaseTestCase):
     def test_target_quality_stats_compressed(self) -> None:
         """At least 1 file was compressed."""
         self.assertGreaterEqual(self.stats.jpeg_compressed, 1)
+
+    def test_target_quality_stats_skipped_quality(self) -> None:
+        """jpeg_compress_skipped_quality = 0 (both test JPEGs are above the threshold)."""
+        self.assertEqual(self.stats.jpeg_compress_skipped_quality, 0,
+                         f"Expected 0 jpeg_compress_skipped_quality, "
+                         f"got {self.stats.jpeg_compress_skipped_quality}")
 
     def test_target_quality_stats_zero_errors(self) -> None:
         """No errors during the run."""
@@ -4159,6 +4176,12 @@ class TestJpegSkipLightroom(_JpegSkipBase):
                          f"Expected 3 jpeg_compressed, "
                          f"got {self.stats.jpeg_compressed}")
 
+    def test_stats_skipped_quality(self) -> None:
+        """jpeg_compress_skipped_quality = 2 (lr_low + dt_low are below threshold)."""
+        self.assertEqual(self.stats.jpeg_compress_skipped_quality, 2,
+                         f"Expected 2 jpeg_compress_skipped_quality, "
+                         f"got {self.stats.jpeg_compress_skipped_quality}")
+
 
 class TestJpegSkipDarktable(_JpegSkipBase):
     """Exclude Darktable + July 2024 time range: DT and in-range files NOT compressed."""
@@ -4249,6 +4272,12 @@ class TestJpegSkipDarktable(_JpegSkipBase):
                          f"Expected 3 jpeg_compressed, "
                          f"got {self.stats.jpeg_compressed}")
 
+    def test_stats_skipped_quality(self) -> None:
+        """jpeg_compress_skipped_quality = 2 (lr_low + dt_low are below threshold)."""
+        self.assertEqual(self.stats.jpeg_compress_skipped_quality, 2,
+                         f"Expected 2 jpeg_compress_skipped_quality, "
+                         f"got {self.stats.jpeg_compress_skipped_quality}")
+
 
 # ---------------------------------------------------------------------------
 # JPEG compression with full input tree (regression guard)
@@ -4330,6 +4359,11 @@ class TestJpegCompressionWithFullTree(TestPhotosExportMerger):
         """jpeg_compress_skipped_larger = 0 when --jpeg-quality-threshold is set (all test JPEGs compress smaller)."""
         self.assertEqual(self.stats.jpeg_compress_skipped_larger, 0,
                          f"Expected 0 jpeg_compress_skipped_larger, got {self.stats.jpeg_compress_skipped_larger}")
+
+    def test_stats_jpeg_compress_skipped_quality_disabled(self) -> None:
+        """jpeg_compress_skipped_quality = 0 (all 48 test JPEGs are above the threshold)."""
+        self.assertEqual(self.stats.jpeg_compress_skipped_quality, 0,
+                         f"Expected 0 jpeg_compress_skipped_quality, got {self.stats.jpeg_compress_skipped_quality}")
 
     # -- Additional JPEG-specific stats ------------------------------------
 

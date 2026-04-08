@@ -394,6 +394,8 @@ def _extract_common_tags(info: MediaFileInfo, tags: dict,
                     stats.jpeg_quality_unknown += 1
             else:
                 stats.jpeg_quality_unknown += 1
+            if info.jpeg_quality is not None and info.jpeg_quality <= jpeg_compress_quality:
+                stats.jpeg_compress_skipped_quality += 1
 
     if editor_skip_patterns:
         _check_editor_skip(tags, info, editor_skip_patterns)
