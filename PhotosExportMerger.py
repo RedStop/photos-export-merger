@@ -666,7 +666,7 @@ def _compress_and_write_jpeg(info: MediaFileInfo, tag_params: List[str],
     """
     try:
         jpeg_bytes = _compress_jpeg_to_bytes(info.source_path,
-                                             info.jpeg_compress_quality)
+                                             info.jpeg_target_quality or info.jpeg_compress_quality)
     except Exception as e:
         logger.error("Pillow compression failed for %s%s: %s",
                      label, info.source_path, e)
@@ -692,7 +692,7 @@ def _compress_and_write_jpeg(info: MediaFileInfo, tag_params: List[str],
     if compressed:
         q_str = f'{info.jpeg_quality}%' if info.jpeg_quality is not None else 'unknown'
         logger.info("COMPRESS  %s  (%swas ~%s -> %d%%, %d bytes -> %d bytes)",
-                    info.source_path.name, label, q_str, info.jpeg_compress_quality,
+                    info.source_path.name, label, q_str, info.jpeg_target_quality or info.jpeg_compress_quality,
                     original_size, len(jpeg_bytes))
         stats.jpeg_compressed += 1
 
@@ -1169,6 +1169,7 @@ class PhotosExportMerger(AbstractMediaMerger):
                  tz_overrides: Optional[List[TimezoneOverride]] = None,
                  fallback_tz: Optional[timezone] = None,
                  jpeg_compress_quality: Optional[int] = None,
+                 jpeg_target_quality: Optional[int] = None,
                  editor_skip_patterns: Optional[List[Dict[str, List[str]]]] = None,
                  jpeg_compress_skip_timeranges: Optional[List[JpegSkipTimerange]] = None):
         super().__init__(input_dir, output_dir, dry_run, blocked_descriptions,
@@ -1177,6 +1178,7 @@ class PhotosExportMerger(AbstractMediaMerger):
                          tz_overrides=tz_overrides,
                          fallback_tz=fallback_tz,
                          jpeg_compress_quality=jpeg_compress_quality,
+                         jpeg_target_quality=jpeg_target_quality,
                          editor_skip_patterns=editor_skip_patterns,
                          jpeg_compress_skip_timeranges=jpeg_compress_skip_timeranges)
 
@@ -1500,6 +1502,7 @@ class PhotosExportMerger(AbstractMediaMerger):
             info.strip_metadata_params = self.metadata_strip_params
             info.fallback_tz = self.fallback_tz
             info.jpeg_compress_quality = self.jpeg_compress_quality
+            info.jpeg_target_quality = self.jpeg_target_quality
 
     def _process_matched(self, info: MediaFileInfo, stats: MergeStats):
         if self.dry_run:
@@ -1611,6 +1614,12 @@ if __name__ == '__main__':
                              'below this quality are copied as-is.  Requires '
                              'Pillow.  Default: disabled (no recompression).  '
                              'Use 80 for a good balance of size and quality.')
+    parser.add_argument('--jpeg-target-quality', type=int, default=None,
+                        metavar='PERCENT',
+                        help='Target JPEG output quality (1-100) when '
+                             'recompressing.  If omitted, images are compressed '
+                             'to the --jpeg-quality-threshold value.  '
+                             'Requires --jpeg-quality-threshold.')
     parser.add_argument('--jpeg-quality-skip-editor', action='append', default=[],
                         dest='jpeg_quality_skip_editors', metavar='NAME',
                         help='Skip JPEG compression for images exported from the '
@@ -1671,6 +1680,15 @@ if __name__ == '__main__':
             parser.error(
                 f"--jpeg-quality-threshold must be between 1 and 100, got {jpeg_compress_quality}")
 
+    # Validate JPEG target quality
+    jpeg_target_quality: Optional[int] = args.jpeg_target_quality
+    if jpeg_target_quality is not None:
+        if not 1 <= jpeg_target_quality <= 100:
+            parser.error(
+                f"--jpeg-target-quality must be between 1 and 100, got {jpeg_target_quality}")
+        if jpeg_compress_quality is None:
+            logging.warning("--jpeg-target-quality has no effect without --jpeg-quality-threshold")
+
     # Resolve editor skip patterns
     editor_skip_patterns: Optional[List[Dict[str, List[str]]]] = None
     if args.jpeg_quality_skip_editors:
@@ -1706,6 +1724,7 @@ if __name__ == '__main__':
                                 tz_overrides=tz_overrides or None,
                                 fallback_tz=fallback_tz,
                                 jpeg_compress_quality=jpeg_compress_quality,
+                                jpeg_target_quality=jpeg_target_quality,
                                 editor_skip_patterns=editor_skip_patterns,
                                 jpeg_compress_skip_timeranges=jpeg_skip_timeranges or None)
     result = merger.run()

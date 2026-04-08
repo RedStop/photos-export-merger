@@ -3806,6 +3806,106 @@ class TestJpegCompression(BaseTestCase):
                          f"got {self.stats.jpeg_compress_skipped_larger}")
 
 
+class TestJpegTargetQuality(BaseTestCase):
+    """Run the merger with separate --jpeg-quality-threshold and --jpeg-target-quality.
+
+    Builds a minimal input tree with a high-quality JPEG (q=95, above the
+    threshold of 80), runs the merger with jpeg_target_quality=60, and asserts
+    that the output file's estimated quality is closer to 60 than to 80.
+    """
+
+    _COMPRESS_QUALITY = 80
+    _TARGET_QUALITY = 60
+
+    @classmethod
+    def setUpClass(cls) -> None:
+        print(f'\n=== {cls.__name__} ===')
+        cls.tmp_dir    = Path(tempfile.mkdtemp(prefix='gpem_target_q_test_'))
+        cls.input_dir  = cls.tmp_dir / 'input'
+        cls.output_dir = cls.tmp_dir / 'output'
+        cls.input_dir.mkdir()
+
+        d = cls.input_dir / 'TargetQ'
+        d.mkdir(parents=True)
+
+        # High-quality matched JPEG (q=95, above threshold 80 → should compress)
+        high_q_bytes = _make_pillow_jpeg(quality=95, seed=77)
+        (d / 'target_test.jpg').write_bytes(high_q_bytes)
+        cls.high_q_source_size = len(high_q_bytes)
+        make_json_file(d / 'target_test.jpg.json', title='target_test.jpg')
+
+        # Orphan high-quality JPEG (no JSON → orphan, should also compress at target quality)
+        orphan_bytes = _make_pillow_jpeg(quality=95, seed=88)
+        (d / 'orphan_target.jpg').write_bytes(orphan_bytes)
+        cls.orphan_source_size = len(orphan_bytes)
+
+        # Run merger with JPEG compression + separate target quality
+        num_workers = os.cpu_count() or 1
+        merger = PhotosExportMerger(
+            str(cls.input_dir),
+            str(cls.output_dir),
+            num_workers=num_workers,
+            fallback_tz=timezone(timedelta(hours=2)),
+            jpeg_compress_quality=cls._COMPRESS_QUALITY,
+            jpeg_target_quality=cls._TARGET_QUALITY,
+        )
+        cls.stats = merger.run()
+
+        cls._open_exiftool()
+        cls._build_output_index()
+
+    def test_target_quality_file_exists(self) -> None:
+        """Output file exists."""
+        self.assertIsNotNone(self._find_output_file('target_test.jpg'))
+
+    def test_target_quality_was_compressed(self) -> None:
+        """Output is smaller than source (compression happened)."""
+        f = self._find_output_file('target_test.jpg')
+        self.assertIsNotNone(f)
+        self.assertLess(f.stat().st_size, self.high_q_source_size)
+
+    def test_target_quality_estimate_closer_to_target(self) -> None:
+        """Output JPEG quality estimate is closer to 60 (target) than to 80 (threshold)."""
+        tags = self._read_tags('target_test.jpg', ['File:JPEGQualityEstimate'])
+        estimate = tags.get('File:JPEGQualityEstimate')
+        self.assertIsNotNone(estimate,
+                             "JPEGQualityEstimate should be present")
+        estimate = int(estimate)
+        dist_to_target = abs(estimate - self._TARGET_QUALITY)
+        dist_to_threshold = abs(estimate - self._COMPRESS_QUALITY)
+        self.assertLess(dist_to_target, dist_to_threshold,
+                        f"Quality estimate {estimate} should be closer to "
+                        f"target {self._TARGET_QUALITY} than threshold "
+                        f"{self._COMPRESS_QUALITY}")
+
+    def test_target_quality_orphan_was_compressed(self) -> None:
+        """Orphan output is smaller than source (compression happened)."""
+        f = self._find_output_file('orphan_target.jpg')
+        self.assertIsNotNone(f)
+        self.assertLess(f.stat().st_size, self.orphan_source_size)
+
+    def test_target_quality_orphan_estimate_closer_to_target(self) -> None:
+        """Orphan output JPEG quality is closer to 60 (target) than to 80 (threshold)."""
+        tags = self._read_tags('orphan_target.jpg', ['File:JPEGQualityEstimate'])
+        estimate = tags.get('File:JPEGQualityEstimate')
+        self.assertIsNotNone(estimate)
+        estimate = int(estimate)
+        dist_to_target = abs(estimate - self._TARGET_QUALITY)
+        dist_to_threshold = abs(estimate - self._COMPRESS_QUALITY)
+        self.assertLess(dist_to_target, dist_to_threshold,
+                        f"Orphan quality estimate {estimate} should be closer to "
+                        f"target {self._TARGET_QUALITY} than threshold "
+                        f"{self._COMPRESS_QUALITY}")
+
+    def test_target_quality_stats_compressed(self) -> None:
+        """At least 1 file was compressed."""
+        self.assertGreaterEqual(self.stats.jpeg_compressed, 1)
+
+    def test_target_quality_stats_zero_errors(self) -> None:
+        """No errors during the run."""
+        self.assertEqual(self.stats.errors, 0)
+
+
 # ---------------------------------------------------------------------------
 # JPEG editor-skip tests
 # ---------------------------------------------------------------------------
@@ -4317,6 +4417,7 @@ if __name__ == '__main__':
         'TestTimezoneOverride':            TestTimezoneOverride,
         'TestFallbackTimezone':            TestFallbackTimezone,
         'TestJpegCompression':             TestJpegCompression,
+        'TestJpegTargetQuality':           TestJpegTargetQuality,
         'TestJpegSkipLightroom':           TestJpegSkipLightroom,
         'TestJpegSkipDarktable':           TestJpegSkipDarktable,
         'TestJpegCompressionWithFullTree': TestJpegCompressionWithFullTree,

@@ -88,6 +88,10 @@ class MediaFileInfo:
     # recompresses the image.  None when JPEG compression is disabled.
     # Propagated to workers alongside fallback_tz / strip_metadata_params.
     jpeg_compress_quality: Optional[int] = None
+    # Target JPEG output quality for Pillow compression.  When set, Pillow
+    # saves at this quality instead of jpeg_compress_quality.  None means
+    # fall back to jpeg_compress_quality (current behaviour).
+    jpeg_target_quality: Optional[int] = None
     # True when the source file's Software/CreatorTool tag matches one of the
     # active --jpeg-quality-skip-editor patterns.  Prevents JPEG recompression
     # for images exported from professional editing software.
@@ -168,6 +172,7 @@ class AbstractMediaMerger(ABC):
                  tz_overrides: Optional[List[TimezoneOverride]] = None,
                  fallback_tz: Optional[timezone] = None,
                  jpeg_compress_quality: Optional[int] = None,
+                 jpeg_target_quality: Optional[int] = None,
                  editor_skip_patterns: Optional[List[Dict[str, List[str]]]] = None,
                  jpeg_compress_skip_timeranges: Optional[List[JpegSkipTimerange]] = None):
         self.input_path = Path(input_dir).resolve()
@@ -178,6 +183,7 @@ class AbstractMediaMerger(ABC):
         self.metadata_strip_params: Optional[List[str]] = metadata_strip_params
         self.tz_overrides: List[TimezoneOverride] = tz_overrides or []
         self.jpeg_compress_quality: Optional[int] = jpeg_compress_quality
+        self.jpeg_target_quality: Optional[int] = jpeg_target_quality
         self.editor_skip_patterns: List[Dict[str, List[str]]] = editor_skip_patterns or []
         self.jpeg_compress_skip_timeranges: List[JpegSkipTimerange] = jpeg_compress_skip_timeranges or []
         # Fallback timezone: use the provided value, or detect the host

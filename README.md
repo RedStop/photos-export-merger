@@ -79,6 +79,9 @@ python PhotosExportMerger.py input/ output/ --jpeg-quality-threshold 80 \
 # List available editor software names
 python PhotosExportMerger.py --list-editors
 
+# Recompress JPEGs above 85% quality down to 75% quality
+python PhotosExportMerger.py input/ output/ --jpeg-quality-threshold 85 --jpeg-target-quality 75
+
 # Recompress at 65% quality, strip Google metadata, 4 workers
 python PhotosExportMerger.py input/ output/ --jpeg-quality-threshold 65 --strip-metadata google --workers 4
 ```
@@ -162,6 +165,8 @@ Use `--strip-metadata` (no args) for all profiles, or name specific ones: `--str
 ### JPEG compression
 
 `--jpeg-quality-threshold PERCENT` recompresses JPEG images whose estimated quality exceeds the given threshold (1–100). JPEGs at or below the threshold are copied as-is. The quality is estimated via ExifTool's `File:JPEGQualityEstimate` during the scan phase; files whose quality cannot be determined are conservatively recompressed.
+
+`--jpeg-target-quality PERCENT` sets the target output quality (1–100) for recompressed JPEGs. When omitted, images are compressed to the `--jpeg-quality-threshold` value. This allows separate control over the decision threshold and the output quality — for example, `--jpeg-quality-threshold 85 --jpeg-target-quality 75` recompresses any JPEG above 85% quality down to 75%. A warning is printed if used without `--jpeg-quality-threshold`.
 
 Compression uses Pillow in memory — the compressed bytes are piped directly into ExifTool via stdin, which copies all metadata from the original source (`-TagsFromFile`) and applies tag modifications in one pass, with no intermediate file written to disk. As a safety net, if the compressed output is not smaller than the original file, the original image is used instead (logged as `SKIP-COMPRESS`). Metadata stripping (`--strip-metadata`) runs as a separate pass afterward. Applies to both matched and orphan files. Only files with JPEG extensions (`.jpg`, `.jpeg`, `.jpe`, `.jfif`) are eligible.
 
