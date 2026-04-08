@@ -2486,27 +2486,27 @@ class TestPhotosExportMerger(BaseTestCase):
                          f"Expected 0 skipped_existing, got {self.stats.skipped_existing}")
 
     def test_stats_jpeg_compressed_disabled(self) -> None:
-        """jpeg_compressed = 0 when --jpeg-quality is not set."""
+        """jpeg_compressed = 0 when --jpeg-quality-threshold is not set."""
         self.assertEqual(self.stats.jpeg_compressed, 0,
                          f"Expected 0 jpeg_compressed, got {self.stats.jpeg_compressed}")
 
     def test_stats_jpeg_quality_checked_disabled(self) -> None:
-        """jpeg_quality_checked = 0 when --jpeg-quality is not set."""
+        """jpeg_quality_checked = 0 when --jpeg-quality-threshold is not set."""
         self.assertEqual(self.stats.jpeg_quality_checked, 0,
                          f"Expected 0 jpeg_quality_checked, got {self.stats.jpeg_quality_checked}")
 
     def test_stats_jpeg_quality_unknown_disabled(self) -> None:
-        """jpeg_quality_unknown = 0 when --jpeg-quality is not set."""
+        """jpeg_quality_unknown = 0 when --jpeg-quality-threshold is not set."""
         self.assertEqual(self.stats.jpeg_quality_unknown, 0,
                          f"Expected 0 jpeg_quality_unknown, got {self.stats.jpeg_quality_unknown}")
 
     def test_stats_jpeg_compress_skipped_larger_disabled(self) -> None:
-        """jpeg_compress_skipped_larger = 0 when --jpeg-quality is not set."""
+        """jpeg_compress_skipped_larger = 0 when --jpeg-quality-threshold is not set."""
         self.assertEqual(self.stats.jpeg_compress_skipped_larger, 0,
                          f"Expected 0 jpeg_compress_skipped_larger, got {self.stats.jpeg_compress_skipped_larger}")
 
     def test_stats_jpeg_compress_skipped_timerange_disabled(self) -> None:
-        """jpeg_compress_skipped_timerange = 0 when --jpeg-quality is not set."""
+        """jpeg_compress_skipped_timerange = 0 when --jpeg-quality-threshold is not set."""
         self.assertEqual(self.stats.jpeg_compress_skipped_timerange, 0,
                          f"Expected 0 jpeg_compress_skipped_timerange, got {self.stats.jpeg_compress_skipped_timerange}")
 
@@ -3625,7 +3625,7 @@ def _make_pillow_jpeg(quality: int, seed: int = 42) -> bytes:
 
 
 class TestJpegCompression(BaseTestCase):
-    """Run the merger with --jpeg-quality and verify compression behaviour.
+    """Run the merger with --jpeg-quality-threshold and verify compression behaviour.
 
     Builds a minimal input tree with Pillow-generated JPEGs at different
     quality levels, runs the merger with jpeg_compress_quality=80, and
@@ -4157,7 +4157,7 @@ class TestJpegSkipDarktable(_JpegSkipBase):
 # GPEM_SKIP_JPEG_FULL_TREE=1 or pass --skip-jpeg-full-tree to the runner.
 
 class TestJpegCompressionWithFullTree(TestPhotosExportMerger):
-    """Re-run the full input tree with --jpeg-quality to verify no regressions.
+    """Re-run the full input tree with --jpeg-quality-threshold to verify no regressions.
 
     Inherits all tests from TestPhotosExportMerger and runs them against
     output produced with jpeg_compress_quality=80.  Overrides the four
@@ -4212,22 +4212,22 @@ class TestJpegCompressionWithFullTree(TestPhotosExportMerger):
     # -- Override stats that differ when JPEG compression is enabled --------
 
     def test_stats_jpeg_compressed_disabled(self) -> None:
-        """jpeg_compressed = 48 when --jpeg-quality is set."""
+        """jpeg_compressed = 48 when --jpeg-quality-threshold is set."""
         self.assertEqual(self.stats.jpeg_compressed, 48,
                          f"Expected 48 jpeg_compressed, got {self.stats.jpeg_compressed}")
 
     def test_stats_jpeg_quality_checked_disabled(self) -> None:
-        """jpeg_quality_checked = 48 when --jpeg-quality is set."""
+        """jpeg_quality_checked = 48 when --jpeg-quality-threshold is set."""
         self.assertEqual(self.stats.jpeg_quality_checked, 48,
                          f"Expected 48 jpeg_quality_checked, got {self.stats.jpeg_quality_checked}")
 
     def test_stats_jpeg_quality_unknown_disabled(self) -> None:
-        """jpeg_quality_unknown = 0 when --jpeg-quality is set (all test JPEGs have known quality)."""
+        """jpeg_quality_unknown = 0 when --jpeg-quality-threshold is set (all test JPEGs have known quality)."""
         self.assertEqual(self.stats.jpeg_quality_unknown, 0,
                          f"Expected 0 jpeg_quality_unknown, got {self.stats.jpeg_quality_unknown}")
 
     def test_stats_jpeg_compress_skipped_larger_disabled(self) -> None:
-        """jpeg_compress_skipped_larger = 0 when --jpeg-quality is set (all test JPEGs compress smaller)."""
+        """jpeg_compress_skipped_larger = 0 when --jpeg-quality-threshold is set (all test JPEGs compress smaller)."""
         self.assertEqual(self.stats.jpeg_compress_skipped_larger, 0,
                          f"Expected 0 jpeg_compress_skipped_larger, got {self.stats.jpeg_compress_skipped_larger}")
 

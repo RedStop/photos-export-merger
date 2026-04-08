@@ -1564,10 +1564,10 @@ if __name__ == '__main__':
             '  python PhotosExportMerger.py input/ output/ --workers 4 --strip-metadata google\n'
             '\n'
             '  # Recompress JPEGs above 80% quality\n'
-            '  python PhotosExportMerger.py input/ output/ --jpeg-quality 80\n'
+            '  python PhotosExportMerger.py input/ output/ --jpeg-quality-threshold 80\n'
             '\n'
             '  # Recompress JPEGs but skip Lightroom and Darktable exports\n'
-            '  python PhotosExportMerger.py input/ output/ --jpeg-quality 80 \\\n'
+            '  python PhotosExportMerger.py input/ output/ --jpeg-quality-threshold 80 \\\n'
             '    --jpeg-quality-skip-editor lightroom --jpeg-quality-skip-editor darktable\n'
             '\n'
             '  # Set fallback timezone and override for a trip\n'
@@ -1604,7 +1604,7 @@ if __name__ == '__main__':
                              'UTC timestamp falls within the given range.  '
                              'Repeatable.  Format: '
                              '"YYYY-MM-DD HH:MM:SS,YYYY-MM-DD HH:MM:SS,+HH:MM".')
-    parser.add_argument('--jpeg-quality', type=int, default=None,
+    parser.add_argument('--jpeg-quality-threshold', type=int, default=None,
                         metavar='PERCENT',
                         help='Recompress JPEG images whose estimated quality '
                              'exceeds this threshold (1-100).  JPEGs at or '
@@ -1617,7 +1617,7 @@ if __name__ == '__main__':
                              'named editing software (case-insensitive substring '
                              'match against registry keys; repeatable).  '
                              'Use --list-editors to see available editors.  '
-                             'Requires --jpeg-quality.')
+                             'Requires --jpeg-quality-threshold.')
     parser.add_argument('--jpeg-quality-skip-timerange', action='append', default=[],
                         dest='jpeg_quality_skip_timeranges',
                         metavar='"START,END,OFFSET"',
@@ -1625,7 +1625,7 @@ if __name__ == '__main__':
                              'datetime falls within the given time range.  '
                              'Repeatable.  Format: '
                              '"YYYY-MM-DD HH:MM:SS,YYYY-MM-DD HH:MM:SS,+HH:MM".  '
-                             'Requires --jpeg-quality.')
+                             'Requires --jpeg-quality-threshold.')
     parser.add_argument('--list-editors', action='store_true',
                         help='Print available editor software names and exit.')
 
@@ -1665,17 +1665,17 @@ if __name__ == '__main__':
                 "Expected format: +HH:MM or -HH:MM (e.g. +02:00, -05:30)")
 
     # Validate JPEG quality
-    jpeg_compress_quality: Optional[int] = args.jpeg_quality
+    jpeg_compress_quality: Optional[int] = args.jpeg_quality_threshold
     if jpeg_compress_quality is not None:
         if not 1 <= jpeg_compress_quality <= 100:
             parser.error(
-                f"--jpeg-quality must be between 1 and 100, got {jpeg_compress_quality}")
+                f"--jpeg-quality-threshold must be between 1 and 100, got {jpeg_compress_quality}")
 
     # Resolve editor skip patterns
     editor_skip_patterns: Optional[List[Dict[str, List[str]]]] = None
     if args.jpeg_quality_skip_editors:
         if jpeg_compress_quality is None:
-            logging.warning("--jpeg-quality-skip-editor has no effect without --jpeg-quality")
+            logging.warning("--jpeg-quality-skip-editor has no effect without --jpeg-quality-threshold")
         try:
             editor_skip_patterns = _resolve_editor_skip_patterns(
                 args.jpeg_quality_skip_editors)
@@ -1690,7 +1690,7 @@ if __name__ == '__main__':
         except ValueError as e:
             parser.error(f"Invalid --jpeg-quality-skip-timerange: {e}")
     if jpeg_skip_timeranges and jpeg_compress_quality is None:
-        logging.warning("--jpeg-quality-skip-timerange has no effect without --jpeg-quality")
+        logging.warning("--jpeg-quality-skip-timerange has no effect without --jpeg-quality-threshold")
 
     blocked_descriptions = [
         # Add unwanted description strings here

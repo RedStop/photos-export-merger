@@ -66,21 +66,21 @@ python PhotosExportMerger.py input/ output/ \
   --tz-override "2023-06-01 00:00:00,2023-06-15 23:59:59,-04:00"
 
 # Recompress JPEGs above 80% quality
-python PhotosExportMerger.py input/ output/ --jpeg-quality 80
+python PhotosExportMerger.py input/ output/ --jpeg-quality-threshold 80
 
 # Recompress JPEGs but skip Lightroom and Darktable exports
-python PhotosExportMerger.py input/ output/ --jpeg-quality 80 \
+python PhotosExportMerger.py input/ output/ --jpeg-quality-threshold 80 \
   --jpeg-quality-skip-editor lightroom --jpeg-quality-skip-editor darktable
 
 # Skip compression for photos taken during a Japan trip (March 10–20, JST)
-python PhotosExportMerger.py input/ output/ --jpeg-quality 80 \
+python PhotosExportMerger.py input/ output/ --jpeg-quality-threshold 80 \
   --jpeg-quality-skip-timerange "2023-03-10 00:00:00,2023-03-20 23:59:59,+09:00"
 
 # List available editor software names
 python PhotosExportMerger.py --list-editors
 
 # Recompress at 65% quality, strip Google metadata, 4 workers
-python PhotosExportMerger.py input/ output/ --jpeg-quality 65 --strip-metadata google --workers 4
+python PhotosExportMerger.py input/ output/ --jpeg-quality-threshold 65 --strip-metadata google --workers 4
 ```
 
 ### Testing
@@ -161,7 +161,7 @@ Use `--strip-metadata` (no args) for all profiles, or name specific ones: `--str
 
 ### JPEG compression
 
-`--jpeg-quality PERCENT` recompresses JPEG images whose estimated quality exceeds the given threshold (1–100). JPEGs at or below the threshold are copied as-is. The quality is estimated via ExifTool's `File:JPEGQualityEstimate` during the scan phase; files whose quality cannot be determined are conservatively recompressed.
+`--jpeg-quality-threshold PERCENT` recompresses JPEG images whose estimated quality exceeds the given threshold (1–100). JPEGs at or below the threshold are copied as-is. The quality is estimated via ExifTool's `File:JPEGQualityEstimate` during the scan phase; files whose quality cannot be determined are conservatively recompressed.
 
 Compression uses Pillow in memory — the compressed bytes are piped directly into ExifTool via stdin, which copies all metadata from the original source (`-TagsFromFile`) and applies tag modifications in one pass, with no intermediate file written to disk. As a safety net, if the compressed output is not smaller than the original file, the original image is used instead (logged as `SKIP-COMPRESS`). Metadata stripping (`--strip-metadata`) runs as a separate pass afterward. Applies to both matched and orphan files. Only files with JPEG extensions (`.jpg`, `.jpeg`, `.jpe`, `.jfif`) are eligible.
 
@@ -172,11 +172,11 @@ Compression uses Pillow in memory — the compressed bytes are piped directly in
 The option is repeatable — specify multiple editors to skip:
 
 ```bash
-python PhotosExportMerger.py input/ output/ --jpeg-quality 80 \
+python PhotosExportMerger.py input/ output/ --jpeg-quality-threshold 80 \
   --jpeg-quality-skip-editor lightroom --jpeg-quality-skip-editor darktable
 ```
 
-Use `--list-editors` to see all available editors and their match patterns. Editor names support case-insensitive substring matching (e.g. `light` matches `lightroom`). The special name `all` skips all known editors. A warning is printed if `--jpeg-quality-skip-editor` is used without `--jpeg-quality`.
+Use `--list-editors` to see all available editors and their match patterns. Editor names support case-insensitive substring matching (e.g. `light` matches `lightroom`). The special name `all` skips all known editors. A warning is printed if `--jpeg-quality-skip-editor` is used without `--jpeg-quality-threshold`.
 
 Add new editors to `EDITOR_SOFTWARE_PATTERNS` in `PhotosExportMerger.py` — they will automatically appear in `--list-editors`.
 
@@ -187,12 +187,12 @@ Add new editors to `EDITOR_SOFTWARE_PATTERNS` in `PhotosExportMerger.py` — the
 The option is repeatable — specify multiple ranges to skip:
 
 ```bash
-python PhotosExportMerger.py input/ output/ --jpeg-quality 80 \
+python PhotosExportMerger.py input/ output/ --jpeg-quality-threshold 80 \
   --jpeg-quality-skip-timerange "2023-03-10 00:00:00,2023-03-20 23:59:59,+09:00" \
   --jpeg-quality-skip-timerange "2023-06-01 00:00:00,2023-06-15 23:59:59,-04:00"
 ```
 
-Time-range exclusion takes **precedence over** editor exclusion: if a file matches both a time range and an editor pattern, only the `jpeg_compress_skipped_timerange` counter is incremented (not `jpeg_compress_skipped_editor`). A warning is printed if used without `--jpeg-quality`.
+Time-range exclusion takes **precedence over** editor exclusion: if a file matches both a time range and an editor pattern, only the `jpeg_compress_skipped_timerange` counter is incremented (not `jpeg_compress_skipped_editor`). A warning is printed if used without `--jpeg-quality-threshold`.
 
 ### Blocking unwanted descriptions
 
