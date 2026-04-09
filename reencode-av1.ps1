@@ -286,29 +286,51 @@ function Get-SampleBitrate {
         [string[]]$ExtraArgs,
         [string]$Duration = "10",
         [string]$AudioBitrate = "128k",
-        [switch]$KeepTempFile
+        [switch]$KeepTempFile,
+        [switch]$SkipDurationLimit
     )
 
     $tempFile = Join-Path ([System.IO.Path]::GetTempPath()) "av1_sample_$([guid]::NewGuid().ToString('N')).mkv"
     $deleteTempFile = -not $KeepTempFile
 
     try {
-        $ffArgs = @(
-            '-y', '-hide_banner', '-loglevel', 'error',
-            '-t', $Duration,
-            '-i', $InputFile
-        ) + $ExtraArgs + @(
-            '-c:v', 'libsvtav1',
-            '-preset', '3',
-            '-crf', $Crf.ToString(),
-            '-pix_fmt', 'yuv420p10le',
-            '-c:a', 'libopus', '-b:a', $AudioBitrate, '-vbr', 'on', '-compression_level', '10',
-            $tempFile
-        )
+        if ($SkipDurationLimit) {
+            $ffArgs = @(
+                '-y', '-hide_banner', '-loglevel', 'error',
+                '-i', $InputFile
+            ) + $ExtraArgs + @(
+                '-c:v', 'libsvtav1',
+                '-preset', '3',
+                '-crf', $Crf.ToString(),
+                '-pix_fmt', 'yuv420p10le',
+                '-c:a', 'libopus', '-b:a', $AudioBitrate, '-vbr', 'on', '-compression_level', '10',
+                $tempFile
+            )
+        } else {
+            $ffArgs = @(
+                '-y', '-hide_banner', '-loglevel', 'error',
+                '-t', $Duration,
+                '-i', $InputFile
+            ) + $ExtraArgs + @(
+                '-c:v', 'libsvtav1',
+                '-preset', '3',
+                '-crf', $Crf.ToString(),
+                '-pix_fmt', 'yuv420p10le',
+                '-c:a', 'libopus', '-b:a', $AudioBitrate, '-vbr', 'on', '-compression_level', '10',
+                $tempFile
+            )
+        }
 
-        & ffmpeg @ffArgs 2>&1 | Out-Null
+        $ffStderr = & ffmpeg @ffArgs 2>&1
+        $ffExitCode = $LASTEXITCODE
 
         if (-not (Test-Path $tempFile)) {
+            $errMsg = ($ffStderr | Out-String).Trim()
+            if ($errMsg) {
+                Write-Log "    ffmpeg error (CRF=$Crf): $errMsg" "WARN"
+            } else {
+                Write-Log "    ffmpeg produced no output file (CRF=$Crf, exit=$ffExitCode)" "WARN"
+            }
             if ($KeepTempFile) { return @{ Bitrate = -1; TempFile = $null } }
             return -1
         }
@@ -337,7 +359,11 @@ function Get-SampleBitrate {
             $deleteTempFile = $false
             return @{ Bitrate = $bitrate; TempFile = $tempFile }
         } elseif ($KeepTempFile) {
-            return @{ Bitrate = -1; TempFile = $null }
+            # Temp file exists but bitrate couldn't be determined — still return it
+            # so the caller can decide what to do rather than orphaning the file
+            $deleteTempFile = $false
+            Write-Log "    WARNING: Could not determine bitrate for CRF=$Crf temp file, returning file anyway" "WARN"
+            return @{ Bitrate = -1; TempFile = $tempFile }
         }
         return $bitrate
     } finally {
@@ -392,7 +418,7 @@ function Find-OptimalCrf {
             $mid = [math]::Floor(($lo + $hi) / 2)
 
             if ($IsFullEncode) {
-                $sampleResult = Get-SampleBitrate -InputFile $InputFile -Crf $mid -ExtraArgs $ExtraArgs -Duration $Duration -AudioBitrate $AudioBitrate -KeepTempFile
+                $sampleResult = Get-SampleBitrate -InputFile $InputFile -Crf $mid -ExtraArgs $ExtraArgs -AudioBitrate $AudioBitrate -KeepTempFile -SkipDurationLimit
                 $bitrate = $sampleResult.Bitrate
                 $tempFile = $sampleResult.TempFile
             } else {
@@ -403,7 +429,13 @@ function Find-OptimalCrf {
             if ($bitrate -lt 0) {
                 Write-Log "  Iteration ${iteration}: CRF=$mid -> encode failed" "WARN"
                 if ($tempFile -and (Test-Path $tempFile)) { Remove-Item $tempFile -Force -ErrorAction SilentlyContinue }
-                $lo = $mid + 1
+                # Can't determine direction — try the other half next iteration
+                # by shrinking the range from the side with more room
+                if (($mid - $lo) -ge ($hi - $mid)) {
+                    $hi = $mid - 1
+                } else {
+                    $lo = $mid + 1
+                }
                 continue
             }
 
