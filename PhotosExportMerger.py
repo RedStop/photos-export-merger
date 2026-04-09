@@ -693,9 +693,10 @@ def _compress_and_write_jpeg(info: MediaFileInfo, tag_params: List[str],
 
     if compressed:
         q_str = f'{info.jpeg_quality}%' if info.jpeg_quality is not None else 'unknown'
-        logger.info("COMPRESS  %s  (%swas ~%s -> %d%%, %d bytes -> %d bytes)",
+        new_size = len(jpeg_bytes)
+        logger.info("COMPRESS  %s  (%swas ~%s -> %d%%, %d bytes -> %d bytes, %.2f%% smaller)",
                     info.source_path.name, label, q_str, info.jpeg_target_quality or info.jpeg_compress_quality,
-                    original_size, len(jpeg_bytes))
+                    original_size, new_size, ((original_size-new_size)/original_size)*100)
         stats.jpeg_compressed += 1
 
     return True
