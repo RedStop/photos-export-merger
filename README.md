@@ -124,6 +124,37 @@ python TestMerger.py --list-types
 
 ---
 
+## Video re-encoding (standalone)
+
+`reencode-av1.ps1` is a standalone PowerShell script for batch re-encoding videos to AV1 (libsvtav1) with automatic CRF tuning. It is independent of the merger pipeline — run it separately on any directory of videos.
+
+**Requires:** ffmpeg and ffprobe on PATH.
+
+```powershell
+# Default settings — target ≤2500 kbit/s video bitrate
+.\reencode-av1.ps1
+
+# Lower target bitrate
+.\reencode-av1.ps1 -TargetBitrateKbps 2000
+
+# Preview what would be done
+.\reencode-av1.ps1 -DryRun
+
+# Show full help
+.\reencode-av1.ps1 -Help
+```
+
+**How it works:**
+- Recursively finds video files in the current directory
+- Skips videos already encoded as AV1 or VP9
+- Binary-searches CRF values by encoding a short sample (default 10s) to find one that produces a bitrate just below the target
+- If the original bitrate is already below the target, targets the original bitrate instead (never increases bitrate)
+- Downscales videos above 1080p but never upscales
+- Outputs `.mkv` files with Opus audio at 128 kbit/s
+- Logs everything to `reencode-av1.log` and shows real-time encoding progress
+
+---
+
 ## How the merger works
 
 The merger copies files to a date-organized output directory (`YYYY/MM/filename`) and writes metadata from the JSON sidecar files into the media files' EXIF tags.
@@ -262,5 +293,6 @@ The merger uses the following JSON fields (all other fields are ignored):
 | `JsonFileIdentifier.py` | Matches JSON metadata files to media files |
 | `JsonKeyExtractor.py` | Analysis tool — scans exports and generates structural reports |
 | `TestMerger.py` | Integration test suite (420+ tests across multiple configurations) |
+| `reencode-av1.ps1` | Standalone AV1 video re-encoder with automatic CRF tuning |
 
 **Data flow:** `JsonKeyExtractor` scans → `JsonFileIdentifier` matches JSON to media → `PhotosExportMerger` writes EXIF metadata.

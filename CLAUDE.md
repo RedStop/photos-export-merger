@@ -37,6 +37,10 @@ Separate test classes exercise features that require different merger configurat
 
 The custom test runner (`python TestMerger.py`) runs all classes by default except `TestSingleWorker` (opt-in via `--single-worker`). Use `--class NAME` (repeatable, case-insensitive substring match) to run specific classes, or `--list-classes` to see all available classes. Category (`-c`) and file-type (`-t`) filters can be combined with `--class`.
 
+## Standalone Scripts
+
+- **reencode-av1.ps1** — PowerShell script for batch re-encoding videos to AV1 (libsvtav1) with automatic CRF tuning. Recursively finds videos in the current directory, binary-searches CRF values by encoding a 10-second sample to find one that produces a bitrate in the acceptable range (default: 2000–2500 kbit/s), then encodes the full video. Skips videos already encoded as AV1 or VP9. Downscales videos above 1080p (never upscales). Outputs .mkv files with Opus audio. Requires ffmpeg and ffprobe on PATH. Run `.\reencode-av1.ps1 -Help` for full usage.
+
 ## Architecture
 
 Five modules with clear separation of concerns:
