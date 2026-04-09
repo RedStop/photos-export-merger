@@ -19,6 +19,7 @@ param(
     [int]$CrfMax = 63,
     [int]$MaxIterations = 15,
     [string]$SampleDuration = "10",   # seconds of sample to encode
+    [int]$AudioBitrateKbps = 0,        # opus bitrate; 0 = auto (64 kbps/channel)
     [switch]$DryRun,                   # if set, only log what would be done
     [switch]$Help                      # show usage help
 )
@@ -40,6 +41,8 @@ if ($Help) {
     -CrfMax <int>              Maximum CRF to try (default: 63)
     -MaxIterations <int>       Max binary search iterations (default: 15)
     -SampleDuration <string>   Seconds of video to sample for CRF search (default: 10)
+    -AudioBitrateKbps <int>    Opus audio bitrate in kbit/s (default: auto)
+                               Auto = 64 kbps per channel (e.g. 128 for stereo, 384 for 5.1)
     -DryRun                    Show what would be done without encoding
     -Help                      Show this help message
 
@@ -55,6 +58,8 @@ if ($Help) {
     - Adjusts GOP/keyint to ~8s/~4s based on actual FPS
     - Logs VFR and non-30fps videos
     - Output is .mkv; original .mkv files get a "-reencoded" suffix
+    - Auto-selects Opus audio bitrate at 64 kbps per channel (128k stereo,
+      384k for 5.1) unless overridden with -AudioBitrateKbps
     - Logs everything to reencode-av1.log in the script directory
     - Shows real-time encoding progress (speed, time, fps, bitrate, file size)
 
@@ -63,6 +68,7 @@ if ($Help) {
     .\reencode-av1.ps1 -TargetBitrateKbps 2000      # Lower target
     .\reencode-av1.ps1 -DryRun                      # Preview only
     .\reencode-av1.ps1 -SampleDuration 20           # Longer sample for accuracy
+    .\reencode-av1.ps1 -AudioBitrateKbps 192        # Fixed 192k Opus audio
 
 "@
     exit 0
@@ -264,7 +270,8 @@ function Get-SampleBitrate {
         [string]$InputFile,
         [int]$Crf,
         [string[]]$ExtraArgs,
-        [string]$Duration = "10"
+        [string]$Duration = "10",
+        [string]$AudioBitrate = "128k"
     )
 
     $tempFile = Join-Path ([System.IO.Path]::GetTempPath()) "av1_sample_$([guid]::NewGuid().ToString('N')).mkv"
@@ -279,7 +286,7 @@ function Get-SampleBitrate {
             '-preset', '3',
             '-crf', $Crf.ToString(),
             '-pix_fmt', 'yuv420p10le',
-            '-c:a', 'libopus', '-b:a', '128k', '-vbr', 'on', '-compression_level', '10',
+            '-c:a', 'libopus', '-b:a', $AudioBitrate, '-vbr', 'on', '-compression_level', '10',
             $tempFile
         )
 
@@ -300,7 +307,8 @@ function Get-SampleBitrate {
         $fileSize = (Get-Item $tempFile).Length  # bytes
         $dur = [double]$probe.format.duration
         if ($dur -gt 0) {
-            $audioBits = 128 * 1000 * $dur  # approximate audio bits
+            $abKbps = [int]($AudioBitrate -replace '[^0-9]','')
+            $audioBits = $abKbps * 1000 * $dur  # approximate audio bits
             $videoBits = ($fileSize * 8) - $audioBits
             return [math]::Round($videoBits / $dur / 1000, 0)
         }
@@ -320,7 +328,8 @@ function Find-OptimalCrf {
         [string]$InputFile,
         [int]$EffectiveTargetKbps,
         [string[]]$ExtraArgs,
-        [string]$Duration = "10"
+        [string]$Duration = "10",
+        [string]$AudioBitrate = "128k"
     )
 
     $lo = $CrfMin
@@ -336,7 +345,7 @@ function Find-OptimalCrf {
         $iteration++
         $mid = [math]::Floor(($lo + $hi) / 2)
 
-        $bitrate = Get-SampleBitrate -InputFile $InputFile -Crf $mid -ExtraArgs $ExtraArgs -Duration $Duration
+        $bitrate = Get-SampleBitrate -InputFile $InputFile -Crf $mid -ExtraArgs $ExtraArgs -Duration $Duration -AudioBitrate $AudioBitrate
 
         if ($bitrate -lt 0) {
             Write-Log "  Iteration ${iteration}: CRF=$mid -> encode failed" "WARN"
@@ -502,6 +511,15 @@ foreach ($file in $videoFiles) {
         Write-Log "  NOTE: Video is $($info.Fps) fps (not 30 fps)" "INFO"
     }
 
+    # ── Determine effective audio bitrate ────────────────────────────
+    if ($AudioBitrateKbps -gt 0) {
+        $effectiveAudioBitrate = "${AudioBitrateKbps}k"
+    } else {
+        $autoAudioKbps = $info.AudioChannels * 64
+        $effectiveAudioBitrate = "${autoAudioKbps}k"
+    }
+    Write-Log "  Audio: $($info.AudioChannels) channel(s) -> Opus ${effectiveAudioBitrate}bps"
+
     # ── Determine effective target bitrate ────────────────────────────
     $effectiveTarget = $TargetBitrateKbps
     if ($info.BitrateKbps -gt 0 -and $info.BitrateKbps -lt $TargetBitrateKbps) {
@@ -524,7 +542,8 @@ foreach ($file in $videoFiles) {
     $result = Find-OptimalCrf -InputFile $inputPath `
         -EffectiveTargetKbps $effectiveTarget `
         -ExtraArgs $extraArgs `
-        -Duration $SampleDuration
+        -Duration $SampleDuration `
+        -AudioBitrate $effectiveAudioBitrate
 
     $optimalCrf = $result.Crf
 
@@ -540,7 +559,7 @@ foreach ($file in $videoFiles) {
         '-preset', '3',
         '-crf', $optimalCrf.ToString(),
         '-pix_fmt', 'yuv420p10le',
-        '-c:a', 'libopus', '-b:a', '128k', '-vbr', 'on', '-compression_level', '10',
+        '-c:a', 'libopus', '-b:a', $effectiveAudioBitrate, '-vbr', 'on', '-compression_level', '10',
         $outputPath
     )
 
