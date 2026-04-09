@@ -4,9 +4,11 @@
     Batch re-encode videos to AV1 (libsvtav1) with automatic CRF tuning.
 .DESCRIPTION
     Recursively finds videos in the current directory and subdirectories,
-    determines the optimal CRF value via binary search on a 10-second sample
+    determines the optimal CRF value via binary search on a short sample
     to achieve a bitrate just below 2500 kbit/s (or below the original bitrate
-    if that is already under 2500), then encodes the full video.
+    if that is already under 2500), then encodes the full video. Videos shorter
+    than the sample duration are handled efficiently by reusing the best
+    binary-search encode as the final output.
 .NOTES
     Requires ffmpeg and ffprobe on PATH.
 #>
@@ -51,6 +53,9 @@ if ($Help) {
     - Skips videos already encoded as AV1 or VP9
     - Binary-searches CRF values by encoding a short sample to find one
       that produces a bitrate in [target-margin, target] kbit/s
+    - Videos shorter than SampleDuration are handled efficiently: the
+      binary search encodes the full video and the best result is reused
+      as the final output (no redundant re-encode)
     - If the original bitrate is already below the target, targets the
       original bitrate instead (never increases bitrate)
     - Downscales videos above 1080p (landscape: 1920:-2, portrait: -2:1080)
@@ -265,16 +270,19 @@ function Get-SampleBitrate {
     <#
     .SYNOPSIS
         Encodes the first N seconds at the given CRF and returns the video bitrate in kbit/s.
+        When KeepTempFile is set, the temp file path is returned as a second value instead of being deleted.
     #>
     param(
         [string]$InputFile,
         [int]$Crf,
         [string[]]$ExtraArgs,
         [string]$Duration = "10",
-        [string]$AudioBitrate = "128k"
+        [string]$AudioBitrate = "128k",
+        [switch]$KeepTempFile
     )
 
     $tempFile = Join-Path ([System.IO.Path]::GetTempPath()) "av1_sample_$([guid]::NewGuid().ToString('N')).mkv"
+    $deleteTempFile = -not $KeepTempFile
 
     try {
         $ffArgs = @(
@@ -292,30 +300,42 @@ function Get-SampleBitrate {
 
         & ffmpeg @ffArgs 2>&1 | Out-Null
 
-        if (-not (Test-Path $tempFile)) { return -1 }
+        if (-not (Test-Path $tempFile)) {
+            if ($KeepTempFile) { return @{ Bitrate = -1; TempFile = $null } }
+            return -1
+        }
 
         # Get the resulting video bitrate
         $probeJson = & ffprobe -v quiet -print_format json -show_streams -show_format "$tempFile" 2>&1
         $probe = $probeJson | Out-String | ConvertFrom-Json
 
         $vidStream = $probe.streams | Where-Object { $_.codec_type -eq 'video' } | Select-Object -First 1
+        $bitrate = -1
         if ($vidStream -and $vidStream.bit_rate) {
-            return [math]::Round([double]$vidStream.bit_rate / 1000, 0)
+            $bitrate = [math]::Round([double]$vidStream.bit_rate / 1000, 0)
+        } else {
+            # Fallback: compute from file size and duration
+            $fileSize = (Get-Item $tempFile).Length  # bytes
+            $dur = [double]$probe.format.duration
+            if ($dur -gt 0) {
+                $abKbps = [int]($AudioBitrate -replace '[^0-9]','')
+                $audioBits = $abKbps * 1000 * $dur  # approximate audio bits
+                $videoBits = ($fileSize * 8) - $audioBits
+                $bitrate = [math]::Round($videoBits / $dur / 1000, 0)
+            }
         }
 
-        # Fallback: compute from file size and duration
-        $fileSize = (Get-Item $tempFile).Length  # bytes
-        $dur = [double]$probe.format.duration
-        if ($dur -gt 0) {
-            $abKbps = [int]($AudioBitrate -replace '[^0-9]','')
-            $audioBits = $abKbps * 1000 * $dur  # approximate audio bits
-            $videoBits = ($fileSize * 8) - $audioBits
-            return [math]::Round($videoBits / $dur / 1000, 0)
+        if ($KeepTempFile -and $bitrate -ge 0) {
+            $deleteTempFile = $false
+            return @{ Bitrate = $bitrate; TempFile = $tempFile }
+        } elseif ($KeepTempFile) {
+            return @{ Bitrate = -1; TempFile = $null }
         }
-
-        return -1
+        return $bitrate
     } finally {
-        if (Test-Path $tempFile) { Remove-Item $tempFile -Force -ErrorAction SilentlyContinue }
+        if ($deleteTempFile -and (Test-Path $tempFile)) {
+            Remove-Item $tempFile -Force -ErrorAction SilentlyContinue
+        }
     }
 }
 
@@ -323,19 +343,22 @@ function Find-OptimalCrf {
     <#
     .SYNOPSIS
         Binary-search for a CRF that yields a bitrate in [targetBitrate - margin, targetBitrate].
+        When IsFullEncode is set, the best sample file is kept and returned for reuse as the final output.
     #>
     param(
         [string]$InputFile,
         [int]$EffectiveTargetKbps,
         [string[]]$ExtraArgs,
         [string]$Duration = "10",
-        [string]$AudioBitrate = "128k"
+        [string]$AudioBitrate = "128k",
+        [switch]$IsFullEncode
     )
 
     $lo = $CrfMin
     $hi = $CrfMax
     $bestCrf = -1
     $bestBitrate = 0
+    $bestTempFile = $null
     $iteration = 0
     $lowerBound = $EffectiveTargetKbps - $MarginKbps
 
@@ -345,18 +368,28 @@ function Find-OptimalCrf {
         $iteration++
         $mid = [math]::Floor(($lo + $hi) / 2)
 
-        $bitrate = Get-SampleBitrate -InputFile $InputFile -Crf $mid -ExtraArgs $ExtraArgs -Duration $Duration -AudioBitrate $AudioBitrate
+        if ($IsFullEncode) {
+            $sampleResult = Get-SampleBitrate -InputFile $InputFile -Crf $mid -ExtraArgs $ExtraArgs -Duration $Duration -AudioBitrate $AudioBitrate -KeepTempFile
+            $bitrate = $sampleResult.Bitrate
+            $tempFile = $sampleResult.TempFile
+        } else {
+            $bitrate = Get-SampleBitrate -InputFile $InputFile -Crf $mid -ExtraArgs $ExtraArgs -Duration $Duration -AudioBitrate $AudioBitrate
+            $tempFile = $null
+        }
 
         if ($bitrate -lt 0) {
             Write-Log "  Iteration ${iteration}: CRF=$mid -> encode failed" "WARN"
+            if ($tempFile -and (Test-Path $tempFile)) { Remove-Item $tempFile -Force -ErrorAction SilentlyContinue }
             $lo = $mid + 1
             continue
         }
 
         Write-Log "  Iteration ${iteration}: CRF=$mid -> ${bitrate} kbps"
 
+        $isNewBest = $false
         if ($bitrate -le $EffectiveTargetKbps -and $bitrate -ge $lowerBound) {
             # In the sweet spot
+            $isNewBest = $true
             $bestCrf = $mid
             $bestBitrate = $bitrate
             # Try to get a slightly lower CRF (better quality) that's still in range
@@ -368,10 +401,25 @@ function Find-OptimalCrf {
             # Bitrate too low (below acceptable range), decrease CRF for more quality
             if ($bestCrf -lt 0 -or $mid -lt $bestCrf) {
                 # Keep this as a fallback - it's below target which is fine, just not optimal
+                $isNewBest = $true
                 $bestCrf = $mid
                 $bestBitrate = $bitrate
             }
             $hi = $mid - 1
+        }
+
+        # Manage temp files when encoding the full video during search
+        if ($IsFullEncode -and $tempFile) {
+            if ($isNewBest) {
+                # Clean up previous best temp file
+                if ($bestTempFile -and (Test-Path $bestTempFile)) {
+                    Remove-Item $bestTempFile -Force -ErrorAction SilentlyContinue
+                }
+                $bestTempFile = $tempFile
+            } else {
+                # Not the best, clean up
+                Remove-Item $tempFile -Force -ErrorAction SilentlyContinue
+            }
         }
     }
 
@@ -381,10 +429,14 @@ function Find-OptimalCrf {
         Write-Log "  Binary search did not converge, falling back to CRF 37" "WARN"
         $bestCrf = 37
         $bestBitrate = 0
+        if ($bestTempFile -and (Test-Path $bestTempFile)) {
+            Remove-Item $bestTempFile -Force -ErrorAction SilentlyContinue
+            $bestTempFile = $null
+        }
     }
 
     Write-Log "  Selected CRF=$bestCrf (estimated ${bestBitrate} kbps)"
-    return @{ Crf = $bestCrf; EstimatedBitrate = $bestBitrate }
+    return @{ Crf = $bestCrf; EstimatedBitrate = $bestBitrate; TempFile = $bestTempFile }
 }
 
 function Get-OutputPath {
@@ -536,39 +588,63 @@ foreach ($file in $videoFiles) {
         continue
     }
 
+    # ── Determine effective sample duration ─────────────────────────
+    $effectiveSampleDuration = $SampleDuration
+    $isShortVideo = $false
+    if ($info.DurationSec -gt 0 -and $info.DurationSec -le [double]$SampleDuration) {
+        $isShortVideo = $true
+        $effectiveSampleDuration = $info.DurationSec.ToString("F2")
+        Write-Log "  Video duration ($([math]::Round($info.DurationSec, 1))s) is at or below sample duration (${SampleDuration}s), encoding full video during CRF search"
+    }
+
     # ── Binary search for optimal CRF ────────────────────────────────
-    Write-Log "  Starting CRF binary search (sampling first ${SampleDuration}s)..."
+    Write-Log "  Starting CRF binary search (sampling ${effectiveSampleDuration}s)..."
 
     $result = Find-OptimalCrf -InputFile $inputPath `
         -EffectiveTargetKbps $effectiveTarget `
         -ExtraArgs $extraArgs `
-        -Duration $SampleDuration `
-        -AudioBitrate $effectiveAudioBitrate
+        -Duration $effectiveSampleDuration `
+        -AudioBitrate $effectiveAudioBitrate `
+        -IsFullEncode:$isShortVideo
 
     $optimalCrf = $result.Crf
 
     # ── Full encode ──────────────────────────────────────────────────
-    Write-Log "  Full encode starting with CRF=$optimalCrf -> $outputPath"
-    $stopwatch = [System.Diagnostics.Stopwatch]::StartNew()
+    if ($isShortVideo -and $result.TempFile -and (Test-Path $result.TempFile)) {
+        # Short video: reuse the best encode from the binary search
+        Write-Log "  Reusing best search encode (CRF=$optimalCrf) as final output -> $outputPath"
+        $stopwatch = [System.Diagnostics.Stopwatch]::StartNew()
+        Move-Item -Path $result.TempFile -Destination $outputPath -Force
+        $exitCode = 0
+        $stopwatch.Stop()
+    } else {
+        # Clean up temp file if it exists but we're doing a full encode anyway (fallback CRF case)
+        if ($result.TempFile -and (Test-Path $result.TempFile)) {
+            Remove-Item $result.TempFile -Force -ErrorAction SilentlyContinue
+        }
 
-    $ffArgs = @(
-        '-y', '-hide_banner', '-stats',
-        '-i', $inputPath
-    ) + $extraArgs + @(
-        '-c:v', 'libsvtav1',
-        '-preset', '3',
-        '-crf', $optimalCrf.ToString(),
-        '-pix_fmt', 'yuv420p10le',
-        '-c:a', 'libopus', '-b:a', $effectiveAudioBitrate, '-vbr', 'on', '-compression_level', '10',
-        $outputPath
-    )
+        Write-Log "  Full encode starting with CRF=$optimalCrf -> $outputPath"
+        $stopwatch = [System.Diagnostics.Stopwatch]::StartNew()
 
-    $cmdString = Format-FfmpegCommand -Arguments $ffArgs
-    Write-Log "  Command: $cmdString"
+        $ffArgs = @(
+            '-y', '-hide_banner', '-stats',
+            '-i', $inputPath
+        ) + $extraArgs + @(
+            '-c:v', 'libsvtav1',
+            '-preset', '3',
+            '-crf', $optimalCrf.ToString(),
+            '-pix_fmt', 'yuv420p10le',
+            '-c:a', 'libopus', '-b:a', $effectiveAudioBitrate, '-vbr', 'on', '-compression_level', '10',
+            $outputPath
+        )
 
-    $exitCode = Invoke-FfmpegWithProgress -FfArgs $ffArgs -TotalDurationSec $info.DurationSec
+        $cmdString = Format-FfmpegCommand -Arguments $ffArgs
+        Write-Log "  Command: $cmdString"
 
-    $stopwatch.Stop()
+        $exitCode = Invoke-FfmpegWithProgress -FfArgs $ffArgs -TotalDurationSec $info.DurationSec
+
+        $stopwatch.Stop()
+    }
 
     if ($exitCode -ne 0) {
         Write-Log "  FAILED: ffmpeg exited with code $exitCode" "ERROR"
