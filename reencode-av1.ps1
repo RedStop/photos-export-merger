@@ -23,6 +23,7 @@ param(
     [string]$SampleDuration = "10",   # seconds of sample to encode
     [int]$AudioBitrateKbps = 0,        # opus bitrate; 0 = auto (64 kbps/channel)
     [switch]$DryRun,                   # if set, only log what would be done
+    [switch]$PreciseBitrate,           # if final bitrate is out of range, binary-search with full video
     [switch]$Help                      # show usage help
 )
 
@@ -46,6 +47,9 @@ if ($Help) {
     -AudioBitrateKbps <int>    Opus audio bitrate in kbit/s (default: auto)
                                Auto = 64 kbps per channel (e.g. 128 for stereo, 384 for 5.1)
     -DryRun                    Show what would be done without encoding
+    -PreciseBitrate            If the final encode bitrate is outside the
+                               acceptable range, redo the binary search using the
+                               full video instead of a sample
     -Help                      Show this help message
 
   BEHAVIOR
@@ -65,6 +69,9 @@ if ($Help) {
     - Output is .mkv; original .mkv files get a "-reencoded" suffix
     - Auto-selects Opus audio bitrate at 64 kbps per channel (128k stereo,
       384k for 5.1) unless overridden with -AudioBitrateKbps
+    - With -PreciseBitrate, if the final encode bitrate is outside the
+      acceptable range, deletes it and redoes the binary search encoding
+      the full video each iteration (slow but accurate)
     - Logs everything to reencode-av1.log in the script directory
     - Shows real-time encoding progress (speed, time, fps, bitrate, file size)
 
@@ -74,6 +81,7 @@ if ($Help) {
     .\reencode-av1.ps1 -DryRun                      # Preview only
     .\reencode-av1.ps1 -SampleDuration 20           # Longer sample for accuracy
     .\reencode-av1.ps1 -AudioBitrateKbps 192        # Fixed 192k Opus audio
+    .\reencode-av1.ps1 -PreciseBitrate              # Redo with full video if out of range
 
 "@
     exit 0
@@ -670,8 +678,45 @@ foreach ($file in $videoFiles) {
         if ($outInfo) {
             Write-Log "  Done in $($stopwatch.Elapsed.ToString('hh\:mm\:ss')). ${inSizeMB} MB -> ${outSizeMB} MB, output bitrate=$($outInfo.BitrateKbps) kbps"
 
+            $lowerBound = $effectiveTarget - $MarginKbps
+            $outOfRange = $outInfo.BitrateKbps -gt $effectiveTarget -or $outInfo.BitrateKbps -lt $lowerBound
+
             if ($outInfo.BitrateKbps -gt $effectiveTarget) {
                 Write-Log "  WARNING: Final bitrate ($($outInfo.BitrateKbps) kbps) exceeds target (${effectiveTarget} kbps)" "WARN"
+            } elseif ($outInfo.BitrateKbps -lt $lowerBound) {
+                Write-Log "  WARNING: Final bitrate ($($outInfo.BitrateKbps) kbps) is below acceptable range ([${lowerBound}, ${effectiveTarget}] kbps)" "WARN"
+            }
+
+            # ── Precise bitrate: full-video binary search if out of range ──
+            if ($PreciseBitrate -and $outOfRange -and -not $isShortVideo) {
+                Write-Log "  -PreciseBitrate: final bitrate out of range, starting full-video binary search..."
+                Remove-Item $outputPath -Force -ErrorAction SilentlyContinue
+
+                $fullDuration = $info.DurationSec.ToString("F2")
+                $preciseResult = Find-OptimalCrf -InputFile $inputPath `
+                    -EffectiveTargetKbps $effectiveTarget `
+                    -ExtraArgs $extraArgs `
+                    -Duration $fullDuration `
+                    -AudioBitrate $effectiveAudioBitrate `
+                    -IsFullEncode
+
+                if ($preciseResult.TempFile -and (Test-Path $preciseResult.TempFile)) {
+                    Move-Item -Path $preciseResult.TempFile -Destination $outputPath -Force
+                    $finalInfo = Get-VideoInfo -FilePath $outputPath
+                    $finalSizeMB = [math]::Round((Get-Item $outputPath).Length / 1MB, 1)
+                    if ($finalInfo) {
+                        Write-Log "  Precise encode complete (CRF=$($preciseResult.Crf)). ${inSizeMB} MB -> ${finalSizeMB} MB, output bitrate=$($finalInfo.BitrateKbps) kbps"
+                        if ($finalInfo.BitrateKbps -gt $effectiveTarget) {
+                            Write-Log "  WARNING: Precise bitrate ($($finalInfo.BitrateKbps) kbps) still exceeds target (${effectiveTarget} kbps)" "WARN"
+                        }
+                    } else {
+                        Write-Log "  Precise encode complete (CRF=$($preciseResult.Crf)). ${inSizeMB} MB -> ${finalSizeMB} MB"
+                    }
+                } else {
+                    Write-Log "  FAILED: Full-video binary search did not produce a usable file" "ERROR"
+                    $failed++
+                    continue
+                }
             }
         } else {
             Write-Log "  Done in $($stopwatch.Elapsed.ToString('hh\:mm\:ss')). ${inSizeMB} MB -> ${outSizeMB} MB"
