@@ -387,13 +387,21 @@ function Find-OptimalCrf {
         Write-Log "  Iteration ${iteration}: CRF=$mid -> ${bitrate} kbps"
 
         $isNewBest = $false
+        $earlyExit = $false
         if ($bitrate -le $EffectiveTargetKbps -and $bitrate -ge $lowerBound) {
             # In the sweet spot
             $isNewBest = $true
             $bestCrf = $mid
             $bestBitrate = $bitrate
-            # Try to get a slightly lower CRF (better quality) that's still in range
-            $hi = $mid - 1
+
+            if ($bitrate -ge ($EffectiveTargetKbps - 100)) {
+                # Close enough to the target — no need to keep searching
+                Write-Log "  Early exit: ${bitrate} kbps is within 100 kbps of target ${EffectiveTargetKbps}"
+                $earlyExit = $true
+            } else {
+                # Try to get a slightly lower CRF (better quality) that's still in range
+                $hi = $mid - 1
+            }
         } elseif ($bitrate -gt $EffectiveTargetKbps) {
             # Bitrate too high, increase CRF
             $lo = $mid + 1
@@ -421,6 +429,8 @@ function Find-OptimalCrf {
                 Remove-Item $tempFile -Force -ErrorAction SilentlyContinue
             }
         }
+
+        if ($earlyExit) { break }
     }
 
     # If we never found anything in range, but we have a best that's below target, use it
