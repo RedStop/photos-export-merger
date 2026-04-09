@@ -379,7 +379,8 @@ function Find-OptimalCrf {
         Binary-search for a CRF that yields a bitrate in [targetBitrate - margin, targetBitrate].
         When IsFullEncode is set, the best sample file is kept and returned for reuse as the final output.
         When SeedCrf is provided, the search starts with a narrow window around the seed value
-        and falls back to the full CRF range if no sweet-spot result is found.
+        and falls back to a tightened range if no sweet-spot result is found, carrying forward
+        all knowledge from previous iterations to avoid redundant encodes.
     #>
     param(
         [string]$InputFile,
@@ -393,28 +394,73 @@ function Find-OptimalCrf {
 
     $lowerBound = $EffectiveTargetKbps - $MarginKbps
 
-    # Build search phases: narrow seeded range first (if provided), then full range as fallback
+    # Absolute limits for the CRF scale (AV1 range)
+    $absoluteMin = 1
+    $absoluteMax = 63
+
+    # Track proven bounds across all phases:
+    # provenTooHigh = lowest CRF known to produce bitrate > target (need higher CRF)
+    # provenTooLow  = highest CRF known to produce bitrate < lowerBound (need lower CRF)
+    # These let us tighten the search range as we learn from each iteration.
+    $provenTooHigh = -1   # bitrate was above target at this CRF -> answer is at CRF > this
+    $provenTooLow  = -1   # bitrate was below lower bound at this CRF -> answer is at CRF < this
+
+    # Build search phases: narrow seeded range first (if provided), then expanded range as fallback
     $phases = @()
     if ($SeedCrf -ge 0) {
         $seedLo = [math]::Max($CrfMin, $SeedCrf - 5)
         $seedHi = [math]::Min($CrfMax, $SeedCrf + 5)
         $phases += @{ Lo = $seedLo; Hi = $seedHi; Label = "seeded CRF=${SeedCrf}, range=[${seedLo}, ${seedHi}]" }
     }
-    $phases += @{ Lo = $CrfMin; Hi = $CrfMax; Label = "full range=[${CrfMin}, ${CrfMax}]" }
+    # The fallback phase will be built dynamically using proven bounds (see below)
+    $phases += @{ Lo = -1; Hi = -1; Label = "DYNAMIC" }
 
     $bestCrf = -1
     $bestBitrate = 0
     $bestTempFile = $null
+    $totalIterations = 0
 
     foreach ($phase in $phases) {
-        $lo = $phase.Lo
-        $hi = $phase.Hi
+        # For the dynamic fallback phase, compute the range using proven bounds
+        if ($phase.Label -eq "DYNAMIC") {
+            # Determine lo: if we proved some CRF produced too-high bitrate, start just above it;
+            # otherwise use -CrfMin (user param), unless proven bounds push us outside it
+            if ($provenTooHigh -ge 0) {
+                $lo = $provenTooHigh + 1
+            } else {
+                $lo = $CrfMin
+            }
+
+            # Determine hi: if we proved some CRF produced too-low bitrate, stop just below it;
+            # otherwise use -CrfMax (user param), unless proven bounds push us outside it
+            if ($provenTooLow -ge 0) {
+                $hi = $provenTooLow - 1
+            } else {
+                $hi = $CrfMax
+            }
+
+            # Clamp to absolute limits
+            $lo = [math]::Max($absoluteMin, $lo)
+            $hi = [math]::Min($absoluteMax, $hi)
+
+            if ($lo -gt $hi) {
+                Write-Log "  Expanded search range is empty ([${lo}, ${hi}]), skipping"
+                continue
+            }
+
+            $phase.Label = "expanded range=[${lo}, ${hi}] (proven bounds: tooHigh@CRF=${provenTooHigh}, tooLow@CRF=${provenTooLow})"
+        } else {
+            $lo = $phase.Lo
+            $hi = $phase.Hi
+        }
+
         $iteration = 0
 
         Write-Log "  Binary search ($($phase.Label)): target=${EffectiveTargetKbps} kbps, acceptable range=[${lowerBound}, ${EffectiveTargetKbps}]"
 
-        while ($lo -le $hi -and $iteration -lt $MaxIterations) {
+        while ($lo -le $hi -and $totalIterations -lt $MaxIterations) {
             $iteration++
+            $totalIterations++
             $mid = [math]::Floor(($lo + $hi) / 2)
 
             if ($IsFullEncode) {
@@ -427,10 +473,8 @@ function Find-OptimalCrf {
             }
 
             if ($bitrate -lt 0) {
-                Write-Log "  Iteration ${iteration}: CRF=$mid -> encode failed" "WARN"
+                Write-Log "  Iteration ${totalIterations}: CRF=$mid -> encode failed" "WARN"
                 if ($tempFile -and (Test-Path $tempFile)) { Remove-Item $tempFile -Force -ErrorAction SilentlyContinue }
-                # Can't determine direction — try the other half next iteration
-                # by shrinking the range from the side with more room
                 if (($mid - $lo) -ge ($hi - $mid)) {
                     $hi = $mid - 1
                 } else {
@@ -439,7 +483,7 @@ function Find-OptimalCrf {
                 continue
             }
 
-            Write-Log "  Iteration ${iteration}: CRF=$mid -> ${bitrate} kbps"
+            Write-Log "  Iteration ${totalIterations}: CRF=$mid -> ${bitrate} kbps"
 
             $isNewBest = $false
             $earlyExit = $false
@@ -450,7 +494,6 @@ function Find-OptimalCrf {
                 $bestBitrate = $bitrate
 
                 if ($bitrate -ge ($EffectiveTargetKbps - 100)) {
-                    # Close enough to the target — no need to keep searching
                     Write-Log "  Early exit: ${bitrate} kbps is within 100 kbps of target ${EffectiveTargetKbps}"
                     $earlyExit = $true
                 } else {
@@ -458,29 +501,34 @@ function Find-OptimalCrf {
                     $hi = $mid - 1
                 }
             } elseif ($bitrate -gt $EffectiveTargetKbps) {
-                # Bitrate too high, increase CRF
+                # Bitrate too high -> need higher CRF
                 $lo = $mid + 1
+                # Track: this CRF produced too-high bitrate, so the answer is above this CRF
+                if ($provenTooHigh -lt 0 -or $mid -gt $provenTooHigh) {
+                    $provenTooHigh = $mid
+                }
             } else {
-                # Bitrate too low (below acceptable range), decrease CRF for more quality
+                # Bitrate too low (below acceptable range) -> need lower CRF for more quality
                 if ($bestCrf -lt 0 -or $mid -lt $bestCrf) {
-                    # Keep this as a fallback - it's below target which is fine, just not optimal
                     $isNewBest = $true
                     $bestCrf = $mid
                     $bestBitrate = $bitrate
                 }
                 $hi = $mid - 1
+                # Track: this CRF produced too-low bitrate, so the answer is below this CRF
+                if ($provenTooLow -lt 0 -or $mid -lt $provenTooLow) {
+                    $provenTooLow = $mid
+                }
             }
 
             # Manage temp files when encoding the full video during search
             if ($IsFullEncode -and $tempFile) {
                 if ($isNewBest) {
-                    # Clean up previous best temp file
                     if ($bestTempFile -and (Test-Path $bestTempFile)) {
                         Remove-Item $bestTempFile -Force -ErrorAction SilentlyContinue
                     }
                     $bestTempFile = $tempFile
                 } else {
-                    # Not the best, clean up
                     Remove-Item $tempFile -Force -ErrorAction SilentlyContinue
                 }
             }
@@ -493,19 +541,20 @@ function Find-OptimalCrf {
             break
         }
 
-        # Not in sweet spot — clean up and reset for next phase (full range)
-        Write-Log "  No sweet-spot result in $($phase.Label), expanding search..."
-        if ($bestTempFile -and (Test-Path $bestTempFile)) {
-            Remove-Item $bestTempFile -Force -ErrorAction SilentlyContinue
+        # Not in sweet spot — clean up best (which is out of range) and continue to next phase
+        # but KEEP the proven bounds so the next phase benefits from what we learned
+        if ($phase.Label -notmatch "^expanded") {
+            Write-Log "  No sweet-spot result in $($phase.Label), expanding search with proven bounds..."
+            if ($bestTempFile -and (Test-Path $bestTempFile)) {
+                Remove-Item $bestTempFile -Force -ErrorAction SilentlyContinue
+            }
+            $bestCrf = -1
+            $bestBitrate = 0
+            $bestTempFile = $null
         }
-        $bestCrf = -1
-        $bestBitrate = 0
-        $bestTempFile = $null
     }
 
-    # If we never found anything in range, but we have a best that's below target, use it
     if ($bestCrf -lt 0) {
-        # Last resort: just use CRF 37
         Write-Log "  Binary search did not converge, falling back to CRF 37" "WARN"
         $bestCrf = 37
         $bestBitrate = 0
