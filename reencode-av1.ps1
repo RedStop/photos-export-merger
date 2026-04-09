@@ -352,6 +352,8 @@ function Find-OptimalCrf {
     .SYNOPSIS
         Binary-search for a CRF that yields a bitrate in [targetBitrate - margin, targetBitrate].
         When IsFullEncode is set, the best sample file is kept and returned for reuse as the final output.
+        When SeedCrf is provided, the search starts with a narrow window around the seed value
+        and falls back to the full CRF range if no sweet-spot result is found.
     #>
     param(
         [string]$InputFile,
@@ -359,86 +361,114 @@ function Find-OptimalCrf {
         [string[]]$ExtraArgs,
         [string]$Duration = "10",
         [string]$AudioBitrate = "128k",
-        [switch]$IsFullEncode
+        [switch]$IsFullEncode,
+        [int]$SeedCrf = -1
     )
 
-    $lo = $CrfMin
-    $hi = $CrfMax
+    $lowerBound = $EffectiveTargetKbps - $MarginKbps
+
+    # Build search phases: narrow seeded range first (if provided), then full range as fallback
+    $phases = @()
+    if ($SeedCrf -ge 0) {
+        $seedLo = [math]::Max($CrfMin, $SeedCrf - 5)
+        $seedHi = [math]::Min($CrfMax, $SeedCrf + 5)
+        $phases += @{ Lo = $seedLo; Hi = $seedHi; Label = "seeded CRF=${SeedCrf}, range=[${seedLo}, ${seedHi}]" }
+    }
+    $phases += @{ Lo = $CrfMin; Hi = $CrfMax; Label = "full range=[${CrfMin}, ${CrfMax}]" }
+
     $bestCrf = -1
     $bestBitrate = 0
     $bestTempFile = $null
-    $iteration = 0
-    $lowerBound = $EffectiveTargetKbps - $MarginKbps
 
-    Write-Log "  Binary search: target=${EffectiveTargetKbps} kbps, acceptable range=[${lowerBound}, ${EffectiveTargetKbps}]"
+    foreach ($phase in $phases) {
+        $lo = $phase.Lo
+        $hi = $phase.Hi
+        $iteration = 0
 
-    while ($lo -le $hi -and $iteration -lt $MaxIterations) {
-        $iteration++
-        $mid = [math]::Floor(($lo + $hi) / 2)
+        Write-Log "  Binary search ($($phase.Label)): target=${EffectiveTargetKbps} kbps, acceptable range=[${lowerBound}, ${EffectiveTargetKbps}]"
 
-        if ($IsFullEncode) {
-            $sampleResult = Get-SampleBitrate -InputFile $InputFile -Crf $mid -ExtraArgs $ExtraArgs -Duration $Duration -AudioBitrate $AudioBitrate -KeepTempFile
-            $bitrate = $sampleResult.Bitrate
-            $tempFile = $sampleResult.TempFile
-        } else {
-            $bitrate = Get-SampleBitrate -InputFile $InputFile -Crf $mid -ExtraArgs $ExtraArgs -Duration $Duration -AudioBitrate $AudioBitrate
-            $tempFile = $null
-        }
+        while ($lo -le $hi -and $iteration -lt $MaxIterations) {
+            $iteration++
+            $mid = [math]::Floor(($lo + $hi) / 2)
 
-        if ($bitrate -lt 0) {
-            Write-Log "  Iteration ${iteration}: CRF=$mid -> encode failed" "WARN"
-            if ($tempFile -and (Test-Path $tempFile)) { Remove-Item $tempFile -Force -ErrorAction SilentlyContinue }
-            $lo = $mid + 1
-            continue
-        }
-
-        Write-Log "  Iteration ${iteration}: CRF=$mid -> ${bitrate} kbps"
-
-        $isNewBest = $false
-        $earlyExit = $false
-        if ($bitrate -le $EffectiveTargetKbps -and $bitrate -ge $lowerBound) {
-            # In the sweet spot
-            $isNewBest = $true
-            $bestCrf = $mid
-            $bestBitrate = $bitrate
-
-            if ($bitrate -ge ($EffectiveTargetKbps - 100)) {
-                # Close enough to the target — no need to keep searching
-                Write-Log "  Early exit: ${bitrate} kbps is within 100 kbps of target ${EffectiveTargetKbps}"
-                $earlyExit = $true
+            if ($IsFullEncode) {
+                $sampleResult = Get-SampleBitrate -InputFile $InputFile -Crf $mid -ExtraArgs $ExtraArgs -Duration $Duration -AudioBitrate $AudioBitrate -KeepTempFile
+                $bitrate = $sampleResult.Bitrate
+                $tempFile = $sampleResult.TempFile
             } else {
-                # Try to get a slightly lower CRF (better quality) that's still in range
-                $hi = $mid - 1
+                $bitrate = Get-SampleBitrate -InputFile $InputFile -Crf $mid -ExtraArgs $ExtraArgs -Duration $Duration -AudioBitrate $AudioBitrate
+                $tempFile = $null
             }
-        } elseif ($bitrate -gt $EffectiveTargetKbps) {
-            # Bitrate too high, increase CRF
-            $lo = $mid + 1
-        } else {
-            # Bitrate too low (below acceptable range), decrease CRF for more quality
-            if ($bestCrf -lt 0 -or $mid -lt $bestCrf) {
-                # Keep this as a fallback - it's below target which is fine, just not optimal
+
+            if ($bitrate -lt 0) {
+                Write-Log "  Iteration ${iteration}: CRF=$mid -> encode failed" "WARN"
+                if ($tempFile -and (Test-Path $tempFile)) { Remove-Item $tempFile -Force -ErrorAction SilentlyContinue }
+                $lo = $mid + 1
+                continue
+            }
+
+            Write-Log "  Iteration ${iteration}: CRF=$mid -> ${bitrate} kbps"
+
+            $isNewBest = $false
+            $earlyExit = $false
+            if ($bitrate -le $EffectiveTargetKbps -and $bitrate -ge $lowerBound) {
+                # In the sweet spot
                 $isNewBest = $true
                 $bestCrf = $mid
                 $bestBitrate = $bitrate
-            }
-            $hi = $mid - 1
-        }
 
-        # Manage temp files when encoding the full video during search
-        if ($IsFullEncode -and $tempFile) {
-            if ($isNewBest) {
-                # Clean up previous best temp file
-                if ($bestTempFile -and (Test-Path $bestTempFile)) {
-                    Remove-Item $bestTempFile -Force -ErrorAction SilentlyContinue
+                if ($bitrate -ge ($EffectiveTargetKbps - 100)) {
+                    # Close enough to the target — no need to keep searching
+                    Write-Log "  Early exit: ${bitrate} kbps is within 100 kbps of target ${EffectiveTargetKbps}"
+                    $earlyExit = $true
+                } else {
+                    # Try to get a slightly lower CRF (better quality) that's still in range
+                    $hi = $mid - 1
                 }
-                $bestTempFile = $tempFile
+            } elseif ($bitrate -gt $EffectiveTargetKbps) {
+                # Bitrate too high, increase CRF
+                $lo = $mid + 1
             } else {
-                # Not the best, clean up
-                Remove-Item $tempFile -Force -ErrorAction SilentlyContinue
+                # Bitrate too low (below acceptable range), decrease CRF for more quality
+                if ($bestCrf -lt 0 -or $mid -lt $bestCrf) {
+                    # Keep this as a fallback - it's below target which is fine, just not optimal
+                    $isNewBest = $true
+                    $bestCrf = $mid
+                    $bestBitrate = $bitrate
+                }
+                $hi = $mid - 1
             }
+
+            # Manage temp files when encoding the full video during search
+            if ($IsFullEncode -and $tempFile) {
+                if ($isNewBest) {
+                    # Clean up previous best temp file
+                    if ($bestTempFile -and (Test-Path $bestTempFile)) {
+                        Remove-Item $bestTempFile -Force -ErrorAction SilentlyContinue
+                    }
+                    $bestTempFile = $tempFile
+                } else {
+                    # Not the best, clean up
+                    Remove-Item $tempFile -Force -ErrorAction SilentlyContinue
+                }
+            }
+
+            if ($earlyExit) { break }
         }
 
-        if ($earlyExit) { break }
+        # If we found a sweet-spot result, no need to try the next phase
+        if ($bestCrf -ge 0 -and $bestBitrate -ge $lowerBound -and $bestBitrate -le $EffectiveTargetKbps) {
+            break
+        }
+
+        # Not in sweet spot — clean up and reset for next phase (full range)
+        Write-Log "  No sweet-spot result in $($phase.Label), expanding search..."
+        if ($bestTempFile -and (Test-Path $bestTempFile)) {
+            Remove-Item $bestTempFile -Force -ErrorAction SilentlyContinue
+        }
+        $bestCrf = -1
+        $bestBitrate = 0
+        $bestTempFile = $null
     }
 
     # If we never found anything in range, but we have a best that's below target, use it
@@ -698,7 +728,8 @@ foreach ($file in $videoFiles) {
                     -ExtraArgs $extraArgs `
                     -Duration $fullDuration `
                     -AudioBitrate $effectiveAudioBitrate `
-                    -IsFullEncode
+                    -IsFullEncode `
+                    -SeedCrf $optimalCrf
 
                 if ($preciseResult.TempFile -and (Test-Path $preciseResult.TempFile)) {
                     Move-Item -Path $preciseResult.TempFile -Destination $outputPath -Force
