@@ -27,6 +27,16 @@ python -m pytest TestMerger.py
 # Run tests (custom runner with class selection)
 python TestMerger.py --class TestPhotosExportMerger --class TestJpegCompressionWithFullTree
 python TestMerger.py --list-classes
+
+# Run reencode_av1 (requires ffmpeg and ffprobe on PATH)
+python -m reencode_av1                              # default settings
+python -m reencode_av1 --target-bitrate 2000        # lower target
+python -m reencode_av1 --dry-run                    # preview only
+python -m reencode_av1 --interpolate                # use CRF interpolation
+python -m reencode_av1 --precise                    # full-video search if out of range
+
+# Run reencode_av1 tests
+python -m pytest TestReencodeAv1.py -v
 ```
 
 ## Testing
@@ -41,9 +51,24 @@ The custom test runner (`python TestMerger.py`) runs all classes by default exce
 
 - **reencode-av1.ps1** — PowerShell script for batch re-encoding videos to AV1 (libsvtav1) with automatic CRF tuning. Recursively finds videos in the current directory, binary-searches CRF values by encoding a 10-second sample to find one that produces a bitrate in the acceptable range (default: 2000–2500 kbit/s), then encodes the full video. Skips videos already encoded as AV1 or VP9. Downscales videos above 1080p (never upscales). Outputs .mkv files with Opus audio. Requires ffmpeg and ffprobe on PATH. Run `.\reencode-av1.ps1 -Help` for full usage.
 
+- **reencode_av1/** — Python package equivalent of reencode-av1.ps1, offering the same AV1 batch re-encoding with additional features. Run via `python -m reencode_av1`. Requires ffmpeg and ffprobe on PATH. No external Python dependencies (standard library only). See `python -m reencode_av1 --help` for full usage. Key improvements over the PowerShell script: multi-segment sampling (encodes 5 segments via ffmpeg concat filter for more representative bitrate estimation), log-linear CRF interpolation (`--interpolate`), precise mode (`--precise`, redoes search with full-video encodes if the final bitrate is out of range), and configurable audio bitrate (auto 64k/channel or manual override).
+
+  Package structure:
+  - `__main__.py` — CLI parsing, validation, and main processing loop
+  - `encode.py` — FFmpeg encoding helpers (sample, segment, and full encodes with progress display)
+  - `filters.py` — Video filter helpers (scaling, GOP settings, bitrate window computation, segment offset calculation)
+  - `probe.py` — Video probing utilities using ffprobe (`VideoInfo` dataclass, bitrate extraction)
+  - `search.py` — CRF search strategies (binary search with seeded/expanded phases, log-linear interpolation with binary search fallback)
+
+## Testing — reencode_av1
+
+`TestReencodeAv1.py` is a pytest-based test suite with 126 tests covering all modules of the reencode_av1 package. Tests use `unittest.mock` to mock ffprobe/ffmpeg calls, so no actual video files or encoding tools are required to run them.
+
+Test categories: `_parse_fraction` edge cases, `get_video_info` with mocked ffprobe (metadata parsing, VFR detection, missing streams, bitrate fallbacks, probe failures), `get_video_bitrate` (stream bitrate, file-size fallback, error handling), `_get_scale_filter` (landscape/portrait/square at various resolutions), `build_extra_args` (scaling, GOP calculation), `compute_segment_offsets` (spacing, clamping, boundary conditions), `compute_windows` (default values, low-target clamping), `_base_encode_args` (codec flags, CRF, preset, audio), `_extract_vf_filter` (extraction and edge cases), `_parse_time_to_seconds` (ffmpeg time string parsing), `_SearchState` (state management and temp file cleanup), `interpolate_crf` (interpolation, clamping, log-linear verification), `find_optimal_crf` (convergence, fallback, seeded search, temp file preservation), `find_optimal_crf_interpolated` (convergence and binary search fallback), `get_output_path` (extension handling), `compute_audio_bitrate` (auto/override), `validate_args` (11 validation cases), `build_parser` (CLI defaults and parsing), `process_file` (skip conditions, dry run, temp file cleanup on exception), and parametrized window invariant checks across multiple parameter combinations.
+
 ## Architecture
 
-Five modules with clear separation of concerns:
+Five modules with clear separation of concerns, plus a standalone video re-encoding package:
 
 1. **AbstractMediaMerger.py** — Abstract base class defining the 9-step merge pipeline. Defines `WriteStrategy` enum (DIRECT, PARTIAL_WITH_SIDECAR, VIDEO_WITH_SIDECAR), `MediaFileInfo` dataclass (includes pre-extracted `description` and `gps` fields to avoid shipping full `json_data` to workers, plus `existing_xmp_dates` for conditional date updates and `actual_ext` for extension mismatch handling), and `MergeStats` dataclass (with a `merge()` method for aggregating partial stats from parallel workers). Implements GPS resolution, duplicate filename resolution (appending `_2`, `_3`, etc.), dry-run logging, and summary reporting. Accepts a `num_workers` parameter (default 1); `_process_files` owns the serial-vs-parallel decision and writer lifecycle.
 
@@ -54,6 +79,10 @@ Five modules with clear separation of concerns:
 4. **JsonKeyExtractor.py** — Analysis entry point. Scans a directory tree once, groups files by directory, extracts JSON structure (2-level depth), and generates analysis output (combined_structure.json, individual_files.json, file_types.json, plus conditional error/conflict files).
 
 5. **TestMerger.py** — Integration test suite (see Testing section above).
+
+6. **reencode_av1/** — Python package for batch AV1 re-encoding with automatic CRF tuning (see Standalone Scripts section above).
+
+7. **TestReencodeAv1.py** — pytest test suite for reencode_av1 (see Testing — reencode_av1 section above).
 
 **Data flow:** JsonKeyExtractor scans directories → JsonFileIdentifier matches JSON-to-media files → PhotosExportMerger writes metadata to EXIF.
 
