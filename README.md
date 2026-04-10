@@ -163,11 +163,14 @@ Two implementations are available — a PowerShell script and a Python package. 
 
 ### Python (reencode_av1/)
 
-The Python package offers the same core functionality with additional features: multi-segment sampling (5 segments via ffmpeg concat filter for more representative bitrate estimation), log-linear CRF interpolation, precise mode (full-video search when the final bitrate is out of range), and configurable audio bitrate. No external Python dependencies.
+The Python package offers the same core functionality with additional features: multi-segment sampling (5 segments via ffmpeg concat filter for more representative bitrate estimation), log-linear CRF interpolation, precise mode (full-video search when the final bitrate is out of range), configurable audio bitrate, and optional directory argument. No external Python dependencies.
 
 ```bash
-# Default settings — target ≤2500 kbit/s video bitrate
+# Default settings — target ≤2500 kbit/s video bitrate, current directory
 python -m reencode_av1
+
+# Process a specific directory
+python -m reencode_av1 /path/to/videos
 
 # Lower target bitrate
 python -m reencode_av1 --target-bitrate 2000
@@ -181,12 +184,15 @@ python -m reencode_av1 --interpolate
 # Redo search with full-video encodes if result is out of range
 python -m reencode_av1 --precise
 
+# Combine options with a specific directory
+python -m reencode_av1 /path/to/videos --target-bitrate 2000 --interpolate
+
 # Show full help
 python -m reencode_av1 --help
 ```
 
 **How it works:**
-- Recursively finds video files in the current directory
+- Recursively finds video files in the specified directory (or the current directory if none given)
 - Skips videos already encoded as AV1 or VP9
 - Binary-searches CRF values by encoding a short sample (default 10s) to find one that produces a bitrate just below the target
 - If the original bitrate is already below the target, targets the original bitrate instead (never increases bitrate)

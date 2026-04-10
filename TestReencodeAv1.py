@@ -738,6 +738,7 @@ class TestValidateArgs:
             "preset": 3,
             "segment_count": 5,
             "segment_duration": 3.0,
+            "directory": None,
         }
         defaults.update(overrides)
         return argparse.Namespace(**defaults)
@@ -802,6 +803,20 @@ class TestValidateArgs:
         with pytest.raises(SystemExit):
             validate_args(args)
 
+    def test_valid_directory(self):
+        with tempfile.TemporaryDirectory() as d:
+            args = self._make_args(directory=Path(d))
+            validate_args(args)  # should not raise
+
+    def test_nonexistent_directory(self):
+        args = self._make_args(directory=Path("/nonexistent/path/xyz"))
+        with pytest.raises(SystemExit):
+            validate_args(args)
+
+    def test_none_directory(self):
+        args = self._make_args(directory=None)
+        validate_args(args)  # should not raise
+
 
 class TestBuildParser:
     def test_defaults(self):
@@ -825,6 +840,22 @@ class TestBuildParser:
         assert args.preset == 6
         assert args.dry_run is True
         assert args.interpolate is True
+
+    def test_default_directory_is_none(self):
+        parser = build_parser()
+        args = parser.parse_args([])
+        assert args.directory is None
+
+    def test_directory_argument(self):
+        parser = build_parser()
+        args = parser.parse_args(["/some/path"])
+        assert args.directory == Path("/some/path")
+
+    def test_directory_with_options(self):
+        parser = build_parser()
+        args = parser.parse_args(["--dry-run", "/some/path"])
+        assert args.directory == Path("/some/path")
+        assert args.dry_run is True
 
 
 class TestProcessFile:

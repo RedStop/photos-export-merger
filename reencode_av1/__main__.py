@@ -32,7 +32,8 @@ def build_parser() -> argparse.ArgumentParser:
         formatter_class=argparse.RawDescriptionHelpFormatter,
         epilog="""\
 examples:
-  python -m reencode_av1                              # default settings
+  python -m reencode_av1                              # current directory
+  python -m reencode_av1 /path/to/videos              # specific directory
   python -m reencode_av1 --target-bitrate 2000        # lower target
   python -m reencode_av1 --dry-run                    # preview only
   python -m reencode_av1 --interpolate                # use interpolation
@@ -104,6 +105,10 @@ examples:
         "-v", "--verbose", action="store_true",
         help="Enable debug logging",
     )
+    p.add_argument(
+        "directory", nargs="?", type=Path, default=None,
+        help="Directory to scan for video files (default: current directory)",
+    )
 
     return p
 
@@ -163,6 +168,10 @@ def validate_args(args: argparse.Namespace) -> None:
 
     if args.segment_duration <= 0:
         errors.append("--segment-duration must be > 0")
+
+    if args.directory is not None:
+        if not args.directory.is_dir():
+            errors.append(f"directory does not exist or is not a directory: {args.directory}")
 
     if errors:
         for e in errors:
@@ -440,7 +449,7 @@ def main() -> None:
         log.error("ffmpeg and ffprobe must be on PATH")
         sys.exit(1)
 
-    cwd = Path.cwd()
+    cwd = args.directory.resolve() if args.directory else Path.cwd()
     log.info("=" * 60)
     log.info("AV1 Re-encode Session Started")
     log.info("=" * 60)

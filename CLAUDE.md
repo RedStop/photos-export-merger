@@ -29,7 +29,8 @@ python TestMerger.py --class TestPhotosExportMerger --class TestJpegCompressionW
 python TestMerger.py --list-classes
 
 # Run reencode_av1 (requires ffmpeg and ffprobe on PATH)
-python -m reencode_av1                              # default settings
+python -m reencode_av1                              # current directory
+python -m reencode_av1 /path/to/videos              # specific directory
 python -m reencode_av1 --target-bitrate 2000        # lower target
 python -m reencode_av1 --dry-run                    # preview only
 python -m reencode_av1 --interpolate                # use CRF interpolation
@@ -51,7 +52,7 @@ The custom test runner (`python TestMerger.py`) runs all classes by default exce
 
 - **reencode-av1.ps1** — PowerShell script for batch re-encoding videos to AV1 (libsvtav1) with automatic CRF tuning. Recursively finds videos in the current directory, binary-searches CRF values by encoding a 10-second sample to find one that produces a bitrate in the acceptable range (default: 2000–2500 kbit/s), then encodes the full video. Skips videos already encoded as AV1 or VP9. Downscales videos above 1080p (never upscales). Outputs .mkv files with Opus audio. Requires ffmpeg and ffprobe on PATH. Run `.\reencode-av1.ps1 -Help` for full usage.
 
-- **reencode_av1/** — Python package equivalent of reencode-av1.ps1, offering the same AV1 batch re-encoding with additional features. Run via `python -m reencode_av1`. Requires ffmpeg and ffprobe on PATH. No external Python dependencies (standard library only). See `python -m reencode_av1 --help` for full usage. Key improvements over the PowerShell script: multi-segment sampling (encodes 5 segments via ffmpeg concat filter for more representative bitrate estimation), log-linear CRF interpolation (`--interpolate`), precise mode (`--precise`, redoes search with full-video encodes if the final bitrate is out of range), and configurable audio bitrate (auto 64k/channel or manual override).
+- **reencode_av1/** — Python package equivalent of reencode-av1.ps1, offering the same AV1 batch re-encoding with additional features. Run via `python -m reencode_av1 [directory]`. Requires ffmpeg and ffprobe on PATH. No external Python dependencies (standard library only). See `python -m reencode_av1 --help` for full usage. Key improvements over the PowerShell script: multi-segment sampling (encodes 5 segments via ffmpeg concat filter for more representative bitrate estimation), log-linear CRF interpolation (`--interpolate`), precise mode (`--precise`, redoes search with full-video encodes if the final bitrate is out of range), configurable audio bitrate (auto 64k/channel or manual override), and optional directory argument (defaults to the current directory).
 
   Package structure:
   - `__main__.py` — CLI parsing, validation, and main processing loop
