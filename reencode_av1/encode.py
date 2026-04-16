@@ -151,7 +151,7 @@ def encode_segments(
     """Encode multiple segments via concat and return the average video bitrate.
 
     Uses ffmpeg's concat filter by opening the input once per segment
-    with ``-ss``/``-t``, then concatenating the streams.  If *extra_args*
+    with ``-ss``/``-t``, then concatenating the streams. If *extra_args*
     contains a ``-vf`` scale filter it is folded into the filter_complex
     chain (since ``-vf`` and ``-filter_complex`` cannot coexist).
     """
@@ -162,7 +162,8 @@ def encode_segments(
 
     # Build input args: -ss <offset> -t <dur> -i <file> for each segment
     input_args: list[str] = []
-    filter_parts: list[str] = []
+    filter_parts: list[str] = []      # scale filter definitions only
+    concat_inputs: list[str] = []     # labels fed to concat
     n = len(offsets)
 
     for i, offset in enumerate(offsets):
@@ -171,17 +172,21 @@ def encode_segments(
             "-t", f"{seg_duration:.3f}",
             "-i", str(input_path),
         ])
+
         if vf_filter:
             # Apply the scale filter per-stream before concat
             filter_parts.append(f"[{i}:v]{vf_filter}[v{i}];")
-            filter_parts.append(f"[v{i}][{i}:a]")
+            concat_inputs.append(f"[v{i}]")
         else:
-            filter_parts.append(f"[{i}:v][{i}:a]")
+            concat_inputs.append(f"[{i}:v]")
 
-    # Join — if we inserted per-stream filters, parts already include
-    # the semicolons; the final concat line has no leading semicolon.
+        concat_inputs.append(f"[{i}:a]")
+
+    # Construct filter_complex
     filter_complex = (
-        "".join(filter_parts) + f"concat=n={n}:v=1:a=1[outv][outa]"
+        "".join(filter_parts)
+        + "".join(concat_inputs)
+        + f"concat=n={n}:v=1:a=1[outv][outa]"
     )
 
     ff_args = [
@@ -194,12 +199,20 @@ def encode_segments(
         str(temp_path),
     ]
 
+    # Log the complete command at DEBUG level (always)
+    cmd_str = " ".join(ff_args)
+    log.debug("FFmpeg command: %s", cmd_str)
+
     try:
         result = subprocess.run(ff_args, capture_output=True, text=True)
 
         if not temp_path.exists():
             stderr = result.stderr.strip()
             if stderr:
+                # If DEBUG logging is disabled, emit the command at WARNING
+                # level before the error message (per request)
+                if not log.isEnabledFor(logging.DEBUG):
+                    log.warning("    FFmpeg command: %s", cmd_str)
                 log.warning("    Segment encode error (CRF=%d): %s", crf, stderr)
             return -1
 
