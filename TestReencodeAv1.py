@@ -327,14 +327,14 @@ class TestComputeSegmentOffsets:
 
 class TestComputeWindows:
     def test_defaults(self):
-        # target=2500, allowed=500, target_window=100, buffer=50
-        w = compute_windows(2500, 500, 100, 50)
+        # target=2500, allowed=1500, target_window=100, buffer=50
+        w = compute_windows(2500, 1500, 100, 50)
         assert w.target == 2500
-        assert w.sample_lo == 2050   # 2500 - 500 + 50
+        assert w.sample_lo == 1050   # 2500 - 1500 + 50
         assert w.sample_hi == 2450   # 2500 - 50
         assert w.sample_confident_lo == 2400  # 2500 - 100
         assert w.sample_confident_hi == 2450  # 2500 - 50
-        assert w.final_lo == 2000    # 2500 - 500
+        assert w.final_lo == 1000    # 2500 - 1500
         assert w.final_hi == 2500
         assert w.final_accept_lo == 2400  # 2500 - 100
         assert w.final_accept_hi == 2500
@@ -730,7 +730,7 @@ class TestValidateArgs:
     def _make_args(self, **overrides):
         defaults = {
             "target_bitrate": 2500,
-            "allowed_bitrate_window": 500,
+            "allowed_bitrate_window": 1500,
             "target_bitrate_window": 100,
             "sample_bitrate_window_buffer": None,
             "crf_min": 1,
@@ -759,7 +759,7 @@ class TestValidateArgs:
             validate_args(args)
 
     def test_target_window_exceeds_allowed(self):
-        args = self._make_args(target_bitrate_window=600)
+        args = self._make_args(target_bitrate_window=1600)
         with pytest.raises(SystemExit):
             validate_args(args)
 
@@ -864,7 +864,7 @@ class TestProcessFile:
     def _make_args(self, **overrides):
         defaults = {
             "target_bitrate": 2500,
-            "allowed_bitrate_window": 500,
+            "allowed_bitrate_window": 1500,
             "target_bitrate_window": 100,
             "sample_bitrate_window_buffer": 50,
             "crf_min": 1,

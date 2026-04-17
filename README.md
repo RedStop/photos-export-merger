@@ -178,7 +178,7 @@ python -m reencode_av1 --target-bitrate 2000
 # Preview what would be done
 python -m reencode_av1 --dry-run
 
-# Use CRF interpolation for faster convergence
+# Use CRF interpolation for faster convergence (recommended)
 python -m reencode_av1 --interpolate
 
 # Redo search with full-video encodes if result is out of range

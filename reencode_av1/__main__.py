@@ -46,8 +46,8 @@ examples:
         help="Target video bitrate in kbps (default: 2500)",
     )
     p.add_argument(
-        "--allowed-bitrate-window", type=int, default=500,
-        help="Acceptable final bitrate range below target (default: 500)",
+        "--allowed-bitrate-window", type=int, default=1500,
+        help="Acceptable final bitrate range below target (default: 1500)",
     )
     p.add_argument(
         "--target-bitrate-window", type=int, default=100,
