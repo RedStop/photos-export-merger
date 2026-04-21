@@ -216,6 +216,7 @@ def find_optimal_crf(
     seed_crf: int = -1,
     seed_lo: int = -1,
     seed_hi: int = -1,
+    seed_known: list[tuple[int, int]] | None = None,
 ) -> CrfResult:
     """Find the optimal CRF via binary search.
 
@@ -241,6 +242,29 @@ def find_optimal_crf(
         and optionally a temp file (when *full_encode* is True).
     """
     state = _SearchState()
+
+    # Pre-populate proven bounds from any seed_known data points so that
+    # the binary search range is tighter from the very first iteration.
+    if seed_known:
+        if full_encode:
+            accept_lo_ck = windows.final_lo
+            accept_hi_ck = windows.final_hi
+        else:
+            accept_lo_ck = windows.sample_lo
+            accept_hi_ck = windows.sample_hi
+        for sk_crf, sk_bitrate in seed_known:
+            log.info(
+                "  Binary search seeded with known point: CRF=%d -> %d kbps",
+                sk_crf, sk_bitrate,
+            )
+            if sk_bitrate > accept_hi_ck:
+                # This CRF overshoots — proven too-high bound
+                if state.proven_too_high_crf < 0 or sk_crf < state.proven_too_high_crf:
+                    state.proven_too_high_crf = sk_crf
+            elif sk_bitrate < accept_lo_ck:
+                # This CRF undershoots — proven too-low bound
+                if state.proven_too_low_crf < 0 or sk_crf > state.proven_too_low_crf:
+                    state.proven_too_low_crf = sk_crf
 
     phases: list[tuple[int, int, str]] = []
 
@@ -367,6 +391,7 @@ def find_optimal_crf_interpolated(
     seed_crf: int = -1,
     seed_lo: int = -1,
     seed_hi: int = -1,
+    seed_known: list[tuple[int, int]] | None = None,
 ) -> CrfResult:
     """Find optimal CRF using log-linear interpolation with binary search fallback.
 
@@ -375,6 +400,14 @@ def find_optimal_crf_interpolated(
 
     When *seed_crf* is provided, the initial probes are placed around the
     seed value for faster convergence.
+
+    When *seed_known* is provided, those ``(crf, bitrate)`` pairs are
+    injected into the known-points table before the first probe, so that
+    data already collected (e.g. from a preceding full encode) immediately
+    guides the interpolation rather than being discarded.  Points whose
+    bitrate falls in the acceptable range also pre-populate *best_crf* /
+    *best_bitrate*, potentially allowing the search to skip encodes
+    entirely if the seeded result is already good enough.
     """
     if full_encode:
         accept_lo = windows.final_lo
@@ -393,6 +426,22 @@ def find_optimal_crf_interpolated(
     best_bitrate = 0
     best_temp_file: Path | None = None
     tried_crfs: set[int] = set()
+
+    # Inject any pre-existing measurements (e.g. from a prior full encode)
+    # so the interpolation starts with real data instead of blind probes.
+    if seed_known:
+        for sk_crf, sk_bitrate in seed_known:
+            log.info(
+                "  Interpolation seeded with known point: CRF=%d -> %d kbps",
+                sk_crf, sk_bitrate,
+            )
+            known.append((sk_crf, sk_bitrate, None))
+            tried_crfs.add(sk_crf)
+            if accept_lo <= sk_bitrate <= accept_hi:
+                if best_crf < 0 or sk_crf < best_crf:
+                    best_crf = sk_crf
+                    best_bitrate = sk_bitrate
+                    best_temp_file = None
 
     # Initial probes at two spread-out points
     if seed_crf >= 0:
@@ -511,6 +560,7 @@ def find_optimal_crf_interpolated(
             offsets=offsets, seg_duration=seg_duration,
             full_encode=full_encode,
             seed_crf=seed_crf, seed_lo=seed_lo, seed_hi=seed_hi,
+            seed_known=seed_known,
         )
 
     log.info("  Selected CRF=%d (estimated %d kbps)", best_crf, best_bitrate)

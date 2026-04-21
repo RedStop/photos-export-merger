@@ -400,6 +400,7 @@ def process_file(
                 args.crf_min, args.crf_max,
                 full_encode=True,
                 seed_crf=result.crf,
+                seed_known=[(result.crf, out_bitrate)],
             )
             if precise_result.temp_file:
                 temp_files.append(precise_result.temp_file)
