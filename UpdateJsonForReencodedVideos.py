@@ -22,7 +22,7 @@ from pathlib import Path
 # ── Configuration ─────────────────────────────────────────────────────────────
 
 # Add more extensions here as needed
-ORIGINAL_VIDEO_EXTENSIONS = {".mp4", ".mov"}
+ORIGINAL_VIDEO_EXTENSIONS = {".mp4", ".mov", ".avi", ".mpeg", ".m4v"}
 
 REENCODED_EXTENSION = ".mkv"
 
