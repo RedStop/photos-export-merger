@@ -52,6 +52,9 @@ def _make_temp_path() -> Path:
     """Create a unique temporary file path for an MKV encode."""
     return Path(tempfile.gettempdir()) / f"av1_sample_{uuid.uuid4().hex}.mkv"
 
+def args_to_str(args: list[str]) -> str:
+    """Convert a list of ffmpeg args to a string for logging."""
+    return " ".join(f'"{a}"' if (" " in a) else a for a in args)
 
 def encode_sample(
     input_path: Path,
@@ -106,7 +109,7 @@ def encode_sample(
             crf, result.returncode,
         )
         if not log.isEnabledFor(logging.DEBUG):
-            log.error("    FFmpeg command: %s", " ".join(ff_args))
+            log.error("    FFmpeg command: %s", args_to_str(ff_args))
         if result.stderr.strip():
             log.error("    ffmpeg stderr:\n%s", result.stderr.strip())
         if result.stdout.strip():
@@ -242,7 +245,7 @@ def encode_segments(
     ]
 
     # Log the complete command at DEBUG level (always)
-    cmd_str = " ".join(ff_args)
+    cmd_str = args_to_str(ff_args)
     log.debug("FFmpeg command: %s", cmd_str)
 
     try:
@@ -310,9 +313,7 @@ def encode_full(
         str(output_path),
     ]
 
-    cmd_str = "ffmpeg " + " ".join(
-        f'"{a}"' if " " in a else a for a in ff_args
-    )
+    cmd_str = "ffmpeg " + args_to_str(ff_args)
     log.info("  Command: %s", cmd_str)
 
     return _run_ffmpeg_with_progress(ff_args, duration_sec)
