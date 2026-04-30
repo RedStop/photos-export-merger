@@ -87,18 +87,42 @@ def encode_sample(
         str(temp_path),
     ]
 
-    result = subprocess.run(ff_args, capture_output=True, text=True)
+    try:
+        result = subprocess.run(ff_args, capture_output=True, text=True)
+    except FileNotFoundError:
+        log.error("    ffmpeg executable not found — is ffmpeg on PATH?")
+        return -1, None
 
     if not temp_path.exists():
-        stderr = result.stderr.strip()
-        if stderr:
-            log.warning("    ffmpeg error (CRF=%d): %s", crf, stderr)
-        else:
-            log.warning(
-                "    ffmpeg produced no output (CRF=%d, exit=%d)",
-                crf, result.returncode,
+        log.error(
+            "    ffmpeg failed (CRF=%d, exit=%d)",
+            crf, result.returncode,
+        )
+        if not log.isEnabledFor(logging.DEBUG):
+            log.error("    FFmpeg command: %s", " ".join(ff_args))
+        if result.stderr.strip():
+            log.error("    ffmpeg stderr:\n%s", result.stderr.strip())
+        if result.stdout.strip():
+            log.error("    ffmpeg stdout:\n%s", result.stdout.strip())
+        if not result.stderr.strip() and not result.stdout.strip():
+            log.error(
+                "    ffmpeg produced no output (exit=%d) — "
+                "check that the input file exists and is readable, "
+                "and that ffmpeg supports the required codecs",
+                result.returncode,
             )
         return -1, None
+
+    if result.returncode != 0:
+        log.error(
+            "    ffmpeg exited with code %d (CRF=%d) but output file exists — "
+            "encode may be incomplete or corrupt",
+            result.returncode, crf,
+        )
+        if result.stderr.strip():
+            log.error("    ffmpeg stderr:\n%s", result.stderr.strip())
+        if result.stdout.strip():
+            log.error("    ffmpeg stdout:\n%s", result.stdout.strip())
 
     bitrate = get_video_bitrate(temp_path, audio_bitrate_kbps)
 
@@ -205,19 +229,44 @@ def encode_segments(
 
     try:
         result = subprocess.run(ff_args, capture_output=True, text=True)
+    except FileNotFoundError:
+        log.error("    ffmpeg executable not found — is ffmpeg on PATH?")
+        temp_path.unlink(missing_ok=True)
+        return -1
 
+    try:
         if not temp_path.exists():
-            stderr = result.stderr.strip()
-            if stderr:
-                # If DEBUG logging is disabled, emit the command at WARNING
-                # level before the error message (per request)
-                if not log.isEnabledFor(logging.DEBUG):
-                    log.warning("    FFmpeg command: %s", cmd_str)
-                log.warning("    Segment encode error (CRF=%d): %s", crf, stderr)
+            log.error(
+                "    Segment encode failed (CRF=%d, exit=%d)",
+                crf, result.returncode,
+            )
+            if not log.isEnabledFor(logging.DEBUG):
+                log.error("    FFmpeg command: %s", cmd_str)
+            if result.stderr.strip():
+                log.error("    ffmpeg stderr:\n%s", result.stderr.strip())
+            if result.stdout.strip():
+                log.error("    ffmpeg stdout:\n%s", result.stdout.strip())
+            if not result.stderr.strip() and not result.stdout.strip():
+                log.error(
+                    "    ffmpeg produced no output (exit=%d) — "
+                    "check that the input file exists and is readable, "
+                    "and that ffmpeg supports the required codecs",
+                    result.returncode,
+                )
             return -1
 
-        bitrate = get_video_bitrate(temp_path, audio_bitrate_kbps)
-        return bitrate
+        if result.returncode != 0:
+            log.error(
+                "    ffmpeg exited with code %d (CRF=%d) but output file exists — "
+                "encode may be incomplete or corrupt",
+                result.returncode, crf,
+            )
+            if result.stderr.strip():
+                log.error("    ffmpeg stderr:\n%s", result.stderr.strip())
+            if result.stdout.strip():
+                log.error("    ffmpeg stdout:\n%s", result.stdout.strip())
+
+        return get_video_bitrate(temp_path, audio_bitrate_kbps)
     finally:
         temp_path.unlink(missing_ok=True)
 
