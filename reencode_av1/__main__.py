@@ -261,8 +261,12 @@ def process_file(
         log.info("  Video is %.3f fps (not 30 fps)", info.fps)
 
     # Audio bitrate
+    has_audio = info.audio_channels > 0 and info.audio_codec is not None
     audio_str, audio_kbps = compute_audio_bitrate(info, args.audio_bitrate)
-    log.info("  Audio: %d channel(s) -> Opus %s", info.audio_channels, audio_str)
+    if has_audio:
+        log.info("  Audio: %d channel(s) -> Opus %s", info.audio_channels, audio_str)
+    else:
+        log.info("  No audio stream detected")
 
     # Effective target (never increase bitrate)
     effective_target = args.target_bitrate
@@ -319,7 +323,7 @@ def process_file(
             args.preset, audio_kbps, args.max_iterations,
             args.crf_min, args.crf_max,
             offsets=offsets, seg_duration=args.segment_duration,
-            full_encode=is_short_video,
+            full_encode=is_short_video, has_audio=has_audio,
         )
         if result.temp_file:
             temp_files.append(result.temp_file)
@@ -342,7 +346,7 @@ def process_file(
             start = time.monotonic()
             exit_code = encode_full(
                 input_path, output_path, result.crf, extra_args,
-                audio_str, args.preset, info.duration_sec,
+                audio_str, args.preset, info.duration_sec, has_audio=has_audio,
             )
             elapsed = time.monotonic() - start
 

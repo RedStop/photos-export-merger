@@ -68,6 +68,7 @@ def _evaluate_crf_sample(
     offsets: list[float] | None,
     seg_duration: float,
     full_encode: bool,
+    has_audio: bool = True,
 ) -> tuple[int, Path | None]:
     """Evaluate a CRF value using the appropriate sampling method.
 
@@ -76,18 +77,18 @@ def _evaluate_crf_sample(
     if full_encode:
         return encode_sample(
             input_path, crf, extra_args, audio_bitrate, preset,
-            audio_bitrate_kbps, keep_file=True,
+            audio_bitrate_kbps, keep_file=True, has_audio=has_audio,
         )
     if offsets:
         bitrate = encode_segments(
             input_path, crf, extra_args, audio_bitrate, preset,
-            audio_bitrate_kbps, offsets, seg_duration,
+            audio_bitrate_kbps, offsets, seg_duration, has_audio=has_audio,
         )
         return bitrate, None
     # Single-segment fallback (shouldn't normally happen)
     bitrate, _ = encode_sample(
         input_path, crf, extra_args, audio_bitrate, preset,
-        audio_bitrate_kbps, duration=seg_duration,
+        audio_bitrate_kbps, duration=seg_duration, has_audio=has_audio,
     )
     return bitrate, None
 
@@ -108,6 +109,7 @@ def _binary_search_phase(
     seg_duration: float,
     full_encode: bool,
     label: str,
+    has_audio: bool = True,
 ) -> bool:
     """Run one phase of binary search.
 
@@ -138,7 +140,7 @@ def _binary_search_phase(
             input_path, mid, extra_args, audio_bitrate, preset,
             audio_bitrate_kbps,
             offsets=offsets, seg_duration=seg_duration,
-            full_encode=full_encode,
+            full_encode=full_encode, has_audio=has_audio,
         )
 
         if bitrate < 0:
@@ -217,6 +219,7 @@ def find_optimal_crf(
     seed_lo: int = -1,
     seed_hi: int = -1,
     seed_known: list[tuple[int, int]] | None = None,
+    has_audio: bool = True,
 ) -> CrfResult:
     """Find the optimal CRF via binary search.
 
@@ -312,7 +315,7 @@ def find_optimal_crf(
             input_path, lo, hi, windows, extra_args, audio_bitrate,
             preset, audio_bitrate_kbps, max_iterations, state,
             offsets=offsets, seg_duration=seg_duration,
-            full_encode=full_encode, label=label,
+            full_encode=full_encode, label=label, has_audio=has_audio,
         )
 
         if found:
@@ -392,6 +395,7 @@ def find_optimal_crf_interpolated(
     seed_lo: int = -1,
     seed_hi: int = -1,
     seed_known: list[tuple[int, int]] | None = None,
+    has_audio: bool = True,
 ) -> CrfResult:
     """Find optimal CRF using log-linear interpolation with binary search fallback.
 
@@ -516,7 +520,7 @@ def find_optimal_crf_interpolated(
             input_path, crf, extra_args, audio_bitrate, preset,
             audio_bitrate_kbps,
             offsets=offsets, seg_duration=seg_duration,
-            full_encode=full_encode,
+            full_encode=full_encode, has_audio=has_audio,
         )
 
         if bitrate < 0:
@@ -560,7 +564,7 @@ def find_optimal_crf_interpolated(
             offsets=offsets, seg_duration=seg_duration,
             full_encode=full_encode,
             seed_crf=seed_crf, seed_lo=seed_lo, seed_hi=seed_hi,
-            seed_known=seed_known,
+            seed_known=seed_known, has_audio=has_audio,
         )
 
     log.info("  Selected CRF=%d (estimated %d kbps)", best_crf, best_bitrate)

@@ -28,19 +28,24 @@ def _base_encode_args(
     extra_args: list[str],
     audio_bitrate: str,
     preset: int,
+    has_audio: bool = True,
 ) -> list[str]:
     """Return the common codec/quality arguments shared by all encodes."""
-    return [
+    args = [
         *extra_args,
         "-c:v", "libsvtav1",
         "-preset", str(preset),
         "-crf", str(crf),
         "-pix_fmt", "yuv420p10le",
-        "-c:a", "libopus",
-        "-b:a", audio_bitrate,
-        "-vbr", "on",
-        "-compression_level", "10",
     ]
+    if has_audio:
+        args += [
+            "-c:a", "libopus",
+            "-b:a", audio_bitrate,
+            "-vbr", "on",
+            "-compression_level", "10",
+        ]
+    return args
 
 
 def _make_temp_path() -> Path:
@@ -58,6 +63,7 @@ def encode_sample(
     *,
     duration: float | None = None,
     keep_file: bool = False,
+    has_audio: bool = True,
 ) -> tuple[int, Path | None]:
     """Encode a sample (or full video) at a given CRF.
 
@@ -70,6 +76,7 @@ def encode_sample(
         audio_bitrate_kbps: numeric audio bitrate for fallback calculation.
         duration: if set, only encode the first *duration* seconds.
         keep_file: if True, return the temp file path instead of deleting it.
+        has_audio: if False, omit all audio codec arguments.
 
     Returns:
         ``(bitrate_kbps, temp_path | None)``.  *temp_path* is only set when
@@ -83,7 +90,7 @@ def encode_sample(
         "-y", "-hide_banner", "-loglevel", "error",
         *time_args,
         "-i", str(input_path),
-        *_base_encode_args(crf, extra_args, audio_bitrate, preset),
+        *_base_encode_args(crf, extra_args, audio_bitrate, preset, has_audio),
         str(temp_path),
     ]
 
@@ -171,6 +178,7 @@ def encode_segments(
     audio_bitrate_kbps: int,
     offsets: list[float],
     seg_duration: float,
+    has_audio: bool = True,
 ) -> int:
     """Encode multiple segments via concat and return the average video bitrate.
 
@@ -204,22 +212,32 @@ def encode_segments(
         else:
             concat_inputs.append(f"[{i}:v]")
 
-        concat_inputs.append(f"[{i}:a]")
+        if has_audio:
+            concat_inputs.append(f"[{i}:a]")
 
-    # Construct filter_complex
+    # Construct filter_complex — omit audio streams/outputs when not present
+    if has_audio:
+        concat_spec = f"concat=n={n}:v=1:a=1[outv][outa]"
+    else:
+        concat_spec = f"concat=n={n}:v=1:a=0[outv]"
+
     filter_complex = (
         "".join(filter_parts)
         + "".join(concat_inputs)
-        + f"concat=n={n}:v=1:a=1[outv][outa]"
+        + concat_spec
     )
+
+    map_args = ["-map", "[outv]"]
+    if has_audio:
+        map_args += ["-map", "[outa]"]
 
     ff_args = [
         "ffmpeg",
         "-y", "-hide_banner", "-loglevel", "error",
         *input_args,
         "-filter_complex", filter_complex,
-        "-map", "[outv]", "-map", "[outa]",
-        *_base_encode_args(crf, remaining_args, audio_bitrate, preset),
+        *map_args,
+        *_base_encode_args(crf, remaining_args, audio_bitrate, preset, has_audio),
         str(temp_path),
     ]
 
@@ -279,6 +297,7 @@ def encode_full(
     audio_bitrate: str,
     preset: int,
     duration_sec: float,
+    has_audio: bool = True,
 ) -> int:
     """Encode the full video with live progress display.
 
@@ -287,7 +306,7 @@ def encode_full(
     ff_args = [
         "-y", "-hide_banner", "-stats",
         "-i", str(input_path),
-        *_base_encode_args(crf, extra_args, audio_bitrate, preset),
+        *_base_encode_args(crf, extra_args, audio_bitrate, preset, has_audio),
         str(output_path),
     ]
 
