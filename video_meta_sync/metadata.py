@@ -22,6 +22,8 @@ from zoneinfo import ZoneInfo
 
 import exiftool
 
+import re
+
 from .constants import ALL_DATETIME_TAGS, DATETIME_TAGS_UTC, GPS_TAGS
 
 log = logging.getLogger(__name__)
@@ -30,6 +32,42 @@ log = logging.getLogger(__name__)
 _EXIF_FMT = "%Y:%m:%d %H:%M:%S"
 # exiftool datetime format with timezone offset (±HH:MM)
 _EXIF_FMT_TZ = "%Y:%m:%d %H:%M:%S%z"
+
+# Matches any QuickTime track-level date atom, e.g.:
+#   QuickTime:Track3:TrackCreateDate
+#   QuickTime:Track4:MediaCreateDate
+#   QuickTime:Track10:TrackModifyDate
+_TRACK_DATE_RE = re.compile(
+    r"^QuickTime:Track\d+:(?:Track|Media)(?:Create|Modify)Date$"
+)
+
+
+def _collect_datetime_tags(raw_tags: dict[str, Any]) -> dict[str, tuple[str, bool]]:
+    """
+    Return every date/time tag present in *raw_tags* together with a flag
+    indicating whether the value must be treated as UTC.
+
+    Static tags defined in ALL_DATETIME_TAGS are included first.
+    Then every tag matching _TRACK_DATE_RE that was not already listed is
+    appended — all QuickTime track-level atoms are UTC by spec.
+
+    Returns
+    -------
+    dict mapping tag_name → (raw_value_str, is_utc_only)
+    """
+    result: dict[str, tuple[str, bool]] = {}
+
+    # Static tags (order matters: TZ-aware first, then UTC-only).
+    for tag in ALL_DATETIME_TAGS:
+        if tag in raw_tags:
+            result[tag] = (str(raw_tags[tag]), tag in DATETIME_TAGS_UTC)
+
+    # Dynamic track-level tags not already covered.
+    for key, value in raw_tags.items():
+        if key not in result and _TRACK_DATE_RE.match(key):
+            result[key] = (str(value), True)  # always UTC by QuickTime spec
+
+    return result
 
 
 def _local_tz() -> tzinfo:
@@ -128,8 +166,8 @@ def _select_earliest_time(
     raw_tags: dict[str, Any],
 ) -> tuple[datetime, tzinfo] | None:
     """
-    Iterate ALL_DATETIME_TAGS, parse each, convert to UTC, and return
-    (earliest_utc, recording_tz).
+    Iterate all date/time tags (static + dynamically discovered track-level
+    atoms), parse each, convert to UTC, and return (earliest_utc, recording_tz).
 
     The recording timezone is taken from the winning field if it was
     timezone-aware; otherwise the local machine timezone is used.
@@ -137,18 +175,13 @@ def _select_earliest_time(
     best_utc: datetime | None = None
     best_tz: tzinfo | None = None
 
-    for tag in ALL_DATETIME_TAGS:
-        raw_value = raw_tags.get(tag)
-        if raw_value is None:
-            continue
-
-        dt = _parse_exif_datetime(str(raw_value))
+    for tag, (raw_value, is_utc_only) in _collect_datetime_tags(raw_tags).items():
+        dt = _parse_exif_datetime(raw_value)
         if dt is None:
             continue
 
-        is_utc_only_tag = tag in DATETIME_TAGS_UTC
         # Tags in DATETIME_TAGS_UTC have no offset in the file; treat as UTC.
-        if is_utc_only_tag and dt.tzinfo is None:
+        if is_utc_only and dt.tzinfo is None:
             dt = dt.replace(tzinfo=timezone.utc)
 
         utc_dt = _to_utc(dt)
@@ -156,7 +189,7 @@ def _select_earliest_time(
         if best_utc is None or utc_dt < best_utc:
             best_utc = utc_dt
             # Preserve the original offset if the field had one.
-            if dt.tzinfo is not None and not is_utc_only_tag:
+            if dt.tzinfo is not None and not is_utc_only:
                 best_tz = dt.tzinfo
             else:
                 best_tz = None  # will fall back to local machine tz later

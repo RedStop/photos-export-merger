@@ -50,11 +50,12 @@ DATETIME_TAGS_WITH_TZ: tuple[str, ...] = (
 )
 
 # Tags that are stored as plain UTC (no offset in the value itself).
+# Track-level TrackCreateDate / MediaCreateDate tags are intentionally
+# absent here — they are discovered dynamically from the raw ExifTool
+# output at runtime (see metadata._collect_datetime_tags), because track
+# numbering varies by container and muxer and cannot be predicted in advance.
 DATETIME_TAGS_UTC: tuple[str, ...] = (
     "QuickTime:CreateDate",
-    "QuickTime:Track1:TrackCreateDate",
-    "QuickTime:Track2:MediaCreateDate",
-    "QuickTime:Track5:MediaCreateDate",
 )
 
 # All datetime tags in one tuple (TZ-aware first).
