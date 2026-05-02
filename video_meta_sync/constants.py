@@ -6,31 +6,9 @@ Constants used across the video_meta_sync package.
 # Used to identify candidate "original" video files when scanning for pairs.
 KNOWN_VIDEO_EXTENSIONS: frozenset[str] = frozenset(
     {
-        "mp4",
-        "mov",
-        "mkv",
-        "avi",
-        "wmv",
-        "flv",
-        "webm",
-        "m4v",
-        "mpg",
-        "mpeg",
-        "3gp",
-        "3g2",
-        "ts",
-        "mts",
-        "m2ts",
-        "vob",
-        "ogv",
-        "rm",
-        "rmvb",
-        "divx",
-        "xvid",
-        "f4v",
-        "mxf",
-        "dv",
-        "asf",
+        "mp4", "mov", "mkv", "avi", "wmv", "flv", "webm", "m4v", "mpg",
+        "mpeg", "3gp", "3g2", "ts", "mts", "m2ts", "vob", "ogv", "rm",
+        "rmvb", "divx", "xvid", "f4v", "mxf", "dv", "asf",
     }
 )
 
