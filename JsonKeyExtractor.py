@@ -100,6 +100,49 @@ def mergeStructures(struct1, struct2, currentPath="", currentFile="", typeConfli
     
     return result
 
+VIDEO_EXTENSIONS = {
+    ".mp4",".mov",".mkv",".avi",".wmv",".flv",".webm",".m4v",".mpg",".mpeg",
+    ".3gp",".3g2",".ts",".mts",".m2ts",".vob",".ogv",".rm",".rmvb",".divx",
+    ".xvid",".f4v",".mxf",".dv",".asf"
+}
+
+PHOTO_EXTENSIONS = {
+    ".jpg", ".jpeg", ".tiff", ".tif", ".dng", ".cr2", ".heic",
+    ".png", ".gif", ".jpe", ".jfif"
+}
+
+def findMotionPhotos(directory: Path, allFiles) -> Dict[str, list]:
+    """
+    Detect motion photos: image files that share a stem with one or more video
+    files in the same directory.
+
+    Returns a dict mapping "folder\\image_filename" (relative to directory)
+    to a sorted list of associated video filenames.
+    """
+    # Build per-directory lookup: stem -> {photos: [...], videos: [...]}
+    byDir = defaultdict(lambda: defaultdict(lambda: {"photos": [], "videos": []}))
+
+    for file in allFiles:
+        ext = file.suffix.lower()
+        if ext == '.json':
+            continue
+        if ext in PHOTO_EXTENSIONS:
+            byDir[file.parent][file.stem]["photos"].append(file.name)
+        elif ext in VIDEO_EXTENSIONS:
+            byDir[file.parent][file.stem]["videos"].append(file.name)
+
+    motionPhotos: Dict[str, list] = {}
+    for dir_path, stems in byDir.items():
+        for stem, groups in stems.items():
+            if groups["photos"] and groups["videos"]:
+                rel_dir = str(dir_path.relative_to(directory))
+                for photo in sorted(groups["photos"]):
+                    key = f"{rel_dir}\\{photo}" if rel_dir != '.' else photo
+                    motionPhotos[key] = sorted(groups["videos"])
+
+    return motionPhotos
+
+
 def processJsonFiles(directoryPath, outputDir='output'):
     """
     Process all JSON files in directory and subdirectories.
@@ -132,6 +175,9 @@ def processJsonFiles(directoryPath, outputDir='output'):
     print("Scanning directory tree...")
     allFiles = [f for f in directory.rglob('*') if f.is_file()]
     
+    # Detect motion photos (images sharing a stem with one or more videos)
+    motionPhotos = findMotionPhotos(directory, allFiles)
+
     # Group files by their parent directory, excluding JSON files
     nonJsonFilesByDirectory = defaultdict(SortedSet)
     for file in allFiles:
@@ -314,6 +360,9 @@ def processJsonFiles(directoryPath, outputDir='output'):
     if unreferencedFilesByFolder:
         outputFiles["unreferenced_files"] = unreferencedFilesByFolder
 
+    if motionPhotos:
+        outputFiles["motion_photos"] = motionPhotos
+
     if descriptions:
         outputFiles["descriptions"] = descriptions
     
@@ -363,6 +412,10 @@ def processJsonFiles(directoryPath, outputDir='output'):
     if unreferencedFilesByFolder:
         totalUnreferenced = sum(len(files) for files in unreferencedFilesByFolder.values())
         print(f"Unreferenced files: {totalUnreferenced} file(s) in {len(unreferencedFilesByFolder)} folder(s)")
+
+    if motionPhotos:
+        totalMotionVideos = sum(len(vids) for vids in motionPhotos.values())
+        print(f"Motion photos found: {len(motionPhotos)} photo(s) with {totalMotionVideos} associated video(s)")
     
     print(f"\nOutput saved to directory: {outputPath.absolute()}")
     print(f"Generated files:")
