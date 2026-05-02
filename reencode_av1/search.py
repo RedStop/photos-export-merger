@@ -549,27 +549,25 @@ def find_optimal_crf_interpolated(
 
                 # If the two brackets are consecutive CRFs there is no integer
                 # CRF left to try between them — interpolation cannot converge.
-                # Fall through to binary search immediately, seeding it with
-                # the nearest above point.
+                # Return nearest_above directly as the best achievable result
+                # (tightest overshoot, closest to in-range).
                 if nearest_below[0] - nearest_above[0] <= 1:
-                    log.warning(
+                    log.info(
                         "  Interpolation brackets are consecutive CRFs "
                         "(above=%d @ %d kbps, below=%d @ %d kbps) — "
-                        "switching to binary search",
+                        "no integer CRF to probe; returning nearest overshoot CRF=%d",
                         nearest_above[0], nearest_above[1],
                         nearest_below[0], nearest_below[1],
+                        nearest_above[0],
                     )
                     # Clean up non-best temp files collected so far
                     for c, b, f in known:
                         if f and f != best_temp_file and f.exists():
                             f.unlink(missing_ok=True)
-                    return find_optimal_crf(
-                        input_path, windows, extra_args, audio_bitrate, preset,
-                        audio_bitrate_kbps, max_iterations, crf_min, crf_max,
-                        offsets=offsets, seg_duration=seg_duration,
-                        full_encode=full_encode,
-                        seed_crf=nearest_above[0],
-                        has_audio=has_audio,
+                    return CrfResult(
+                        crf=nearest_above[0],
+                        estimated_bitrate=nearest_above[1],
+                        temp_file=nearest_above[2],
                     )
 
                 crf = interpolate_crf(
@@ -577,6 +575,10 @@ def find_optimal_crf_interpolated(
                     nearest_above[0], nearest_above[1],
                     windows.target, crf_min, crf_max,
                 )
+                # Clamp strictly inside the bracket — interpolation can
+                # overshoot if nearest_below[1] > windows.target, producing a
+                # CRF outside [nearest_above[0], nearest_below[0]].
+                crf = max(nearest_above[0] + 1, min(nearest_below[0] - 1, crf))
             elif above:
                 # All probes too high — try higher CRF
                 max_tried = max(c for c, _, _ in known)
