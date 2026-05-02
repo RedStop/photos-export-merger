@@ -124,16 +124,7 @@ def _binary_search_phase(
     Updates *state* in place.  Returns True if an acceptable result was
     found (and we can stop searching).
     """
-    if full_encode:
-        accept_lo = windows.final_lo
-        accept_hi = windows.final_hi
-        confident_lo = windows.final_accept_lo
-        confident_hi = windows.final_accept_hi
-    else:
-        accept_lo = windows.sample_lo
-        accept_hi = windows.sample_hi
-        confident_lo = windows.sample_confident_lo
-        confident_hi = windows.sample_confident_hi
+    accept_lo, accept_hi, confident_lo, confident_hi = _select_windows(windows, full_encode)
 
     log.info(
         "  Binary search (%s): target=%d, accept=[%d, %d], confident=[%d, %d]",
@@ -353,6 +344,18 @@ def find_optimal_crf(
     )
 
 
+# ── Shared helpers ───────────────────────────────────────────────────────────
+
+def _select_windows(
+    windows: BitrateWindows,
+    full_encode: bool,
+) -> tuple[int, int, int, int]:
+    """Return ``(accept_lo, accept_hi, confident_lo, confident_hi)`` for the current mode."""
+    if full_encode:
+        return windows.final_lo, windows.final_hi, windows.final_accept_lo, windows.final_accept_hi
+    return windows.sample_lo, windows.sample_hi, windows.sample_confident_lo, windows.sample_confident_hi
+
+
 # ── Interpolation ────────────────────────────────────────────────────────────
 
 def interpolate_crf(
@@ -383,6 +386,134 @@ def interpolate_crf(
 
     crf_est = crf1 + (crf2 - crf1) * (log_b1 - log_target) / (log_b1 - log_b2)
     return max(crf_min, min(crf_max, round(crf_est)))
+
+
+def _extrapolate_crf(
+    known: list[_KnownPoint],
+    target_bitrate: int,
+    crf_min: int,
+    crf_max: int,
+    *,
+    direction: int,
+) -> int:
+    """Extrapolate a CRF when all known points are on the same side of the target.
+
+    *direction* must be +1 (all overshooting → need a higher CRF) or -1 (all
+    undershooting → need a lower CRF).  Uses the two extreme known points to
+    fit the log-linear slope; if only one point exists a synthetic anchor is
+    added at the boundary of the CRF range.
+    """
+    anchor_lo = min(known, key=lambda x: x.crf)
+    anchor_hi = max(known, key=lambda x: x.crf)
+
+    if anchor_lo is anchor_hi:
+        p0 = known[0]
+        if direction == 1:
+            # Virtual anchor at crf_max with near-zero bitrate pushes slope upward.
+            crf = interpolate_crf(p0.crf, p0.bitrate, crf_max, 1, target_bitrate, crf_min, crf_max)
+        else:
+            # Virtual anchor at crf_min with 10× bitrate pushes slope downward.
+            crf = interpolate_crf(crf_min, p0.bitrate * 10, p0.crf, p0.bitrate, target_bitrate, crf_min, crf_max)
+    else:
+        crf = interpolate_crf(
+            anchor_lo.crf, anchor_lo.bitrate,
+            anchor_hi.crf, anchor_hi.bitrate,
+            target_bitrate, crf_min, crf_max,
+        )
+
+    if direction == 1:
+        max_tried = anchor_hi.crf
+        if crf <= max_tried:
+            crf = min(crf_max, max_tried + 5)
+    else:
+        min_tried = anchor_lo.crf
+        if crf >= min_tried:
+            crf = max(crf_min, min_tried - 5)
+
+    return crf
+
+
+def _nudge_crf(crf: int, tried_crfs: set[int], crf_min: int, crf_max: int) -> int | None:
+    """Return *crf*, nudged by ±1 if already tried, or None if no untried neighbour exists."""
+    if crf not in tried_crfs:
+        return crf
+    if crf + 1 <= crf_max and crf + 1 not in tried_crfs:
+        return crf + 1
+    if crf - 1 >= crf_min and crf - 1 not in tried_crfs:
+        return crf - 1
+    return None
+
+
+def _resolve_next_crf(
+    known: list[_KnownPoint],
+    best_crf: int,
+    best_bitrate: int,
+    accept_lo: int,
+    accept_hi: int,
+    crf_min: int,
+    crf_max: int,
+    windows_target: int,
+) -> int | None:
+    """Choose the next CRF to probe based on the current known-points table.
+
+    Returns the suggested CRF integer, or None if the search should stop
+    (no further improvement is possible).
+    """
+    above    = [p for p in known if p.bitrate > accept_hi]
+    below    = [p for p in known if p.bitrate < accept_lo]
+    in_range = [p for p in known if accept_lo <= p.bitrate <= accept_hi]
+
+    if in_range:
+        if not above:
+            return None  # no overshoot to squeeze against
+
+        nearest_above = max(above, key=lambda x: x.crf)
+        if best_crf - nearest_above.crf <= 1:
+            log.info(
+                "  Interpolation brackets are consecutive CRFs "
+                "(above=%d @ %d kbps, best=%d @ %d kbps) — "
+                "no integer CRF to probe, stopping",
+                nearest_above.crf, nearest_above.bitrate,
+                best_crf, best_bitrate,
+            )
+            return None
+
+        crf = interpolate_crf(
+            best_crf, best_bitrate,
+            nearest_above.crf, nearest_above.bitrate,
+            windows_target, crf_min, crf_max,
+        )
+        return max(nearest_above.crf + 1, min(best_crf - 1, crf))
+
+    if above and below:
+        nearest_above = max(above, key=lambda x: x.crf)
+        nearest_below = min(below, key=lambda x: x.crf)
+
+        if nearest_below.crf - nearest_above.crf <= 1:
+            log.info(
+                "  Interpolation brackets are consecutive CRFs "
+                "(above=%d @ %d kbps, below=%d @ %d kbps) — "
+                "no integer CRF to probe; returning nearest overshoot CRF=%d",
+                nearest_above.crf, nearest_above.bitrate,
+                nearest_below.crf, nearest_below.bitrate,
+                nearest_above.crf,
+            )
+            return nearest_above  # type: ignore[return-value]  # sentinel: caller checks for _KnownPoint
+
+        crf = interpolate_crf(
+            nearest_below.crf, nearest_below.bitrate,
+            nearest_above.crf, nearest_above.bitrate,
+            windows_target, crf_min, crf_max,
+        )
+        return max(nearest_above.crf + 1, min(nearest_below.crf - 1, crf))
+
+    if above:
+        return _extrapolate_crf(known, accept_hi, crf_min, crf_max, direction=1)
+
+    if below:
+        return _extrapolate_crf(known, accept_lo, crf_min, crf_max, direction=-1)
+
+    return None
 
 
 def find_optimal_crf_interpolated(
@@ -421,18 +552,8 @@ def find_optimal_crf_interpolated(
     *best_bitrate*, potentially allowing the search to skip encodes
     entirely if the seeded result is already good enough.
     """
-    if full_encode:
-        accept_lo = windows.final_lo
-        accept_hi = windows.final_hi
-        confident_lo = windows.final_accept_lo
-        confident_hi = windows.final_accept_hi
-    else:
-        accept_lo = windows.sample_lo
-        accept_hi = windows.sample_hi
-        confident_lo = windows.sample_confident_lo
-        confident_hi = windows.sample_confident_hi
+    accept_lo, accept_hi, confident_lo, confident_hi = _select_windows(windows, full_encode)
 
-    # Collect known data points
     known: list[_KnownPoint] = []
     best_crf = -1
     best_bitrate = 0
@@ -444,8 +565,7 @@ def find_optimal_crf_interpolated(
             if p.temp_file and p.temp_file != winner and p.temp_file.exists():
                 p.temp_file.unlink(missing_ok=True)
 
-    # Inject any pre-existing measurements (e.g. from a prior full encode)
-    # so the interpolation starts with real data instead of blind probes.
+    # Inject any pre-existing measurements so interpolation starts with real data.
     if seed_known:
         for sk_crf, sk_bitrate in seed_known:
             log.info(
@@ -459,30 +579,19 @@ def find_optimal_crf_interpolated(
                     best_crf = sk_crf
                     best_bitrate = sk_bitrate
 
-    # Initial probes at two spread-out points
+    # Build the list of initial CRF probes.
     if seed_crf >= 0:
-        # Probe around the seed for faster convergence.
-        #
-        # If seed_known is provided we can infer the required search direction:
-        #   - seed bitrate > target  → seed CRF is too low  → only probe higher CRFs
-        #   - seed bitrate < accept_lo → seed CRF is too high → only probe lower CRFs
-        # In either case the seeded point itself already acts as one bracket, so
-        # a single additional probe in the correct direction is sufficient.
         lo_bound = seed_lo if seed_lo >= 0 else crf_min
         hi_bound = seed_hi if seed_hi >= 0 else crf_max
 
         if seed_known:
-            # Determine direction from the seeded measurement.
+            # One probe in the direction implied by the seeded measurement.
             sk_crf, sk_bitrate = seed_known[0]
             if sk_bitrate > accept_hi:
-                # Seed overshoots — must go higher (larger CRF, lower bitrate).
                 probe_crfs = [min(hi_bound, sk_crf + 3)]
             elif sk_bitrate < accept_lo:
-                # Seed undershoots — must go lower (smaller CRF, higher bitrate).
                 probe_crfs = [max(lo_bound, sk_crf - 3)]
             else:
-                # Seed is already in range; shouldn't normally happen in precise
-                # mode, but handle gracefully with a single probe toward target.
                 probe_crfs = [sk_crf]
         else:
             probe_crfs = [
@@ -490,172 +599,46 @@ def find_optimal_crf_interpolated(
                 min(hi_bound, seed_crf + 3),
             ]
     else:
-        # Empirically, optimal CRF almost always falls in [24, 50].
-        # Seed the two bracketing probes at the 25th and 75th percentile
-        # of that sweet-spot range rather than the full [crf_min, crf_max]
-        # span, so the first interpolation step lands much closer to the
-        # target without wasting an encode at a very low CRF (high bitrate).
+        # Probe at the 25th and 75th percentile of the empirical sweet-spot [24, 50]
+        # to bracket the target quickly without wasting encodes at extreme CRF values.
         _SWEET_LO, _SWEET_HI = 24, 50
         sweet_lo = max(crf_min, _SWEET_LO)
         sweet_hi = min(crf_max, _SWEET_HI)
         probe_crfs = [
-            sweet_lo + (sweet_hi - sweet_lo) // 4,      # ~30 — low-CRF anchor
-            sweet_lo + 3 * (sweet_hi - sweet_lo) // 4,  # ~44 — high-CRF anchor
+            sweet_lo + (sweet_hi - sweet_lo) // 4,      # ~30
+            sweet_lo + 3 * (sweet_hi - sweet_lo) // 4,  # ~44
         ]
 
-    interpolation_iters = max(max_iterations, 6)  # allow a few extra for convergence
+    interpolation_iters = max(max_iterations, 6)
 
     for iteration in range(1, interpolation_iters + 1):
-        # Determine which CRF to try
         if iteration <= len(probe_crfs):
             crf = probe_crfs[iteration - 1]
         elif len(known) >= 2:
-            # Find the two closest bracketing points
-            above = [p for p in known if p.bitrate > accept_hi]
-            below = [p for p in known if p.bitrate < accept_lo]
-            in_range = [p for p in known if accept_lo <= p.bitrate <= accept_hi]
-
-            if in_range:
-                # Already have an acceptable result — try to improve by
-                # interpolating between best_crf (the highest-CRF / lowest-
-                # bitrate accepted result) and the nearest overshoot above it.
-                # Using best_crf as the lower anchor (rather than the lowest
-                # CRF seen in range) ensures we probe the gap between the
-                # current best and the overshoot boundary, rather than
-                # driving further below an already-acceptable lower CRF.
-                if above:
-                    # Use the tightest upper bracket: the highest CRF that
-                    # still overshoots (closest to the acceptable range).
-                    nearest_above = max(above, key=lambda x: x.crf)
-
-                    # If best_crf and nearest_above are consecutive integers,
-                    # there is no integer CRF left to probe between them —
-                    # interpolation cannot improve the result further.
-                    if best_crf - nearest_above.crf <= 1:
-                        log.info(
-                            "  Interpolation brackets are consecutive CRFs "
-                            "(above=%d @ %d kbps, best=%d @ %d kbps) — "
-                            "no integer CRF to probe, stopping",
-                            nearest_above.crf, nearest_above.bitrate,
-                            best_crf, best_bitrate,
-                        )
-                        break
-
-                    crf = interpolate_crf(
-                        best_crf, best_bitrate,
-                        nearest_above.crf, nearest_above.bitrate,
-                        windows.target, crf_min, crf_max,
-                    )
-                    # Clamp strictly inside the bracket — interpolation can
-                    # overshoot if best_bitrate > windows.target, producing a
-                    # CRF outside [nearest_above.crf, best_crf].
-                    crf = max(nearest_above.crf + 1, min(best_crf - 1, crf))
-                else:
-                    break  # no room to improve
-            elif above and below:
-                # Use the tightest brackets on each side:
-                #   nearest_above = highest CRF still above target (tightest upper bound)
-                #   nearest_below = lowest CRF that undershoots (tightest lower bound)
-                nearest_above = max(above, key=lambda x: x.crf)
-                nearest_below = min(below, key=lambda x: x.crf)
-
-                # If the two brackets are consecutive CRFs there is no integer
-                # CRF left to try between them — interpolation cannot converge.
-                # Return nearest_above directly as the best achievable result
-                # (tightest overshoot, closest to in-range).
-                if nearest_below.crf - nearest_above.crf <= 1:
-                    log.info(
-                        "  Interpolation brackets are consecutive CRFs "
-                        "(above=%d @ %d kbps, below=%d @ %d kbps) — "
-                        "no integer CRF to probe; returning nearest overshoot CRF=%d",
-                        nearest_above.crf, nearest_above.bitrate,
-                        nearest_below.crf, nearest_below.bitrate,
-                        nearest_above.crf,
-                    )
-                    _cleanup_except(nearest_above.temp_file)
-                    return CrfResult(
-                        crf=nearest_above.crf,
-                        estimated_bitrate=nearest_above.bitrate,
-                        temp_file=nearest_above.temp_file,
-                    )
-
-                crf = interpolate_crf(
-                    nearest_below.crf, nearest_below.bitrate,
-                    nearest_above.crf, nearest_above.bitrate,
-                    windows.target, crf_min, crf_max,
+            next_crf = _resolve_next_crf(
+                known, best_crf, best_bitrate,
+                accept_lo, accept_hi, crf_min, crf_max, windows.target,
+            )
+            if next_crf is None:
+                break
+            # _resolve_next_crf returns a _KnownPoint as a sentinel when the
+            # consecutive-bracket early-return case is hit.
+            if isinstance(next_crf, _KnownPoint):
+                winner = next_crf
+                _cleanup_except(winner.temp_file)
+                return CrfResult(
+                    crf=winner.crf,
+                    estimated_bitrate=winner.bitrate,
+                    temp_file=winner.temp_file,
                 )
-                # Clamp strictly inside the bracket — interpolation can
-                # overshoot if nearest_below.bitrate > windows.target, producing a
-                # CRF outside [nearest_above.crf, nearest_below.crf].
-                crf = max(nearest_above.crf + 1, min(nearest_below.crf - 1, crf))
-            elif above:
-                # All probes too high — extrapolate to a higher CRF.
-                # Use the two extreme known points (lowest and highest CRF) to
-                # fit the log-linear slope; if only one point exists, pair it
-                # with crf_max as a virtual anchor (bitrate ~1 there ensures the
-                # extrapolated CRF lands well past the current maximum tried).
-                max_tried = max(p.crf for p in known)
-                if len(known) >= 2:
-                    anchor_lo = min(known, key=lambda x: x.crf)
-                    anchor_hi = max(known, key=lambda x: x.crf)
-                    crf = interpolate_crf(
-                        anchor_lo.crf, anchor_lo.bitrate,
-                        anchor_hi.crf, anchor_hi.bitrate,
-                        accept_hi, crf_min, crf_max,
-                    )
-                else:
-                    # Single point: extrapolate using crf_max as a virtual anchor.
-                    # Assume bitrate at crf_max is ~1 kbps (effectively zero) so
-                    # the log-linear slope points well past the current point.
-                    p0 = known[0]
-                    crf = interpolate_crf(
-                        p0.crf, p0.bitrate,
-                        crf_max, 1,
-                        accept_hi, crf_min, crf_max,
-                    )
-                # Must be strictly above max_tried; fall back to +5 if not.
-                if crf <= max_tried:
-                    crf = min(crf_max, max_tried + 5)
-            else:
-                # All probes too low — extrapolate to a lower CRF.
-                # Mirror of the above branch: use the two extreme known points,
-                # or pair with crf_min (bitrate → very high) as a virtual anchor.
-                min_tried = min(p.crf for p in known)
-                if len(known) >= 2:
-                    anchor_lo = min(known, key=lambda x: x.crf)
-                    anchor_hi = max(known, key=lambda x: x.crf)
-                    crf = interpolate_crf(
-                        anchor_lo.crf, anchor_lo.bitrate,
-                        anchor_hi.crf, anchor_hi.bitrate,
-                        accept_lo, crf_min, crf_max,
-                    )
-                else:
-                    # Single point: extrapolate using crf_min as a virtual anchor.
-                    # Use a very high synthetic bitrate so the slope points well
-                    # below the current point.  10× the known bitrate is a
-                    # conservative but effective stand-in.
-                    p0 = known[0]
-                    synthetic_hi = p0.bitrate * 10
-                    crf = interpolate_crf(
-                        crf_min, synthetic_hi,
-                        p0.crf, p0.bitrate,
-                        accept_lo, crf_min, crf_max,
-                    )
-                # Must be strictly below min_tried; fall back to -5 if not.
-                if crf >= min_tried:
-                    crf = max(crf_min, min_tried - 5)
+            crf = next_crf
         else:
             break
 
         crf = max(crf_min, min(crf_max, crf))
-        if crf in tried_crfs:
-            # Avoid re-testing the same CRF; nudge by 1
-            if crf + 1 <= crf_max and crf + 1 not in tried_crfs:
-                crf += 1
-            elif crf - 1 >= crf_min and crf - 1 not in tried_crfs:
-                crf -= 1
-            else:
-                break
+        crf = _nudge_crf(crf, tried_crfs, crf_min, crf_max)
+        if crf is None:
+            break
         tried_crfs.add(crf)
 
         bitrate, temp_file = _evaluate_crf_sample(
@@ -675,17 +658,14 @@ def find_optimal_crf_interpolated(
         known.append(_KnownPoint(crf=crf, bitrate=bitrate, temp_file=temp_file))
 
         if accept_lo <= bitrate <= accept_hi:
-            is_new_best = best_crf < 0 or crf < best_crf
-            if is_new_best:
+            if best_crf < 0 or crf < best_crf:
                 best_crf = crf
                 best_bitrate = bitrate
-
             if confident_lo <= bitrate <= confident_hi:
                 log.info("  Interpolation converged in confident zone")
                 break
 
-    # Resolve the temp file for the winner from the known-points table,
-    # then delete every other temp file that was accumulated during the search.
+    # Resolve the temp file for the winner, then clean up everything else.
     best_temp_file: Path | None = None
     if best_crf >= 0:
         for p in known:
