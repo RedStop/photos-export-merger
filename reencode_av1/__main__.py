@@ -40,6 +40,8 @@ examples:
   python -m reencode_av1 --precise                    # full-video search if out of range
   python -m reencode_av1 --min-encode-bitrate 1000    # skip files already under 1000 kbps
   python -m reencode_av1 --min-encode-bitrate 0       # always encode regardless of bitrate
+  python -m reencode_av1 --max-crf 55                 # tighter quality floor
+  python -m reencode_av1 --crf-ceiling-fallback 52    # specific fallback CRF when over max-crf
 """,
     )
 
@@ -74,6 +76,21 @@ examples:
     p.add_argument(
         "--crf-max", type=int, default=63,
         help="Maximum CRF value (default: 63)",
+    )
+    p.add_argument(
+        "--max-crf", type=int, default=59,
+        help=(
+            "If the search selects a CRF above this value the target bitrate is "
+            "considered unachievable at acceptable quality. The video is then encoded "
+            "with --crf-ceiling-fallback instead (default: 59)."
+        ),
+    )
+    p.add_argument(
+        "--crf-ceiling-fallback", type=int, default=None,
+        help=(
+            "CRF to use when the search exceeds --max-crf. "
+            "Defaults to --max-crf when not set, but 48 is recommended."
+        ),
     )
     p.add_argument(
         "--max-iterations", type=int, default=15,
@@ -177,6 +194,22 @@ def validate_args(args: argparse.Namespace) -> None:
     if not (0 <= args.crf_min < args.crf_max <= 63):
         errors.append("--crf-min and --crf-max must satisfy 0 <= min < max <= 63")
 
+    if not (args.crf_min <= args.max_crf <= args.crf_max):
+        errors.append(
+            f"--max-crf ({args.max_crf}) must be within [--crf-min, --crf-max] "
+            f"([{args.crf_min}, {args.crf_max}])"
+        )
+
+    # Resolve default for crf-ceiling-fallback
+    if args.crf_ceiling_fallback is None:
+        args.crf_ceiling_fallback = args.max_crf
+
+    if not (args.crf_min <= args.crf_ceiling_fallback <= args.crf_max):
+        errors.append(
+            f"--crf-ceiling-fallback ({args.crf_ceiling_fallback}) must be within "
+            f"[--crf-min, --crf-max] ([{args.crf_min}, {args.crf_max}])"
+        )
+
     if not (0 <= args.preset <= 13):
         errors.append("--preset must be in [0, 13]")
 
@@ -247,12 +280,18 @@ def process_file(
 ) -> str:
     """Process a single video file.
 
-    Returns ``"processed"``, ``"skipped"``, or ``"failed"``.
+    Returns one of:
+      ``"processed"``, ``"failed"``,
+      ``"skipped:no_info"``, ``"skipped:low_bitrate"``,
+      ``"skipped:already_av1"``, ``"skipped:output_exists"``,
+      ``"skipped:dry_run"``,
+      ``"processed:crf_ceiling"`` (encoded with fallback CRF because search exceeded max-crf),
+      ``"processed:crf_ceiling:low_original"`` (as above + original bitrate was low).
     """
     info = get_video_info(input_path)
     if info is None:
         log.warning("  Could not read video info, skipping")
-        return "skipped"
+        return "skipped:no_info"
 
     log.info(
         "  Codec=%s Resolution=%dx%d FPS=%.3f Bitrate=%d kbps AudioCh=%d",
@@ -266,18 +305,18 @@ def process_file(
             "  Source bitrate (%d kbps) is at or below --min-encode-bitrate (%d kbps), skipping",
             info.bitrate_kbps, args.min_encode_bitrate,
         )
-        return "skipped"
+        return "skipped:low_bitrate"
 
     # Skip AV1 / VP9
     if info.codec in SKIP_CODECS:
         log.info("  Already encoded as %s, skipping", info.codec)
-        return "skipped"
+        return "skipped:already_av1"
 
     # Check output
     output_path = get_output_path(input_path)
     if output_path.exists():
         log.info("  Output already exists: %s, skipping", output_path)
-        return "skipped"
+        return "skipped:output_exists"
 
     # Log VFR / non-30fps
     if info.is_vfr:
@@ -314,7 +353,7 @@ def process_file(
 
     if args.dry_run:
         log.info("  [DRY RUN] Would encode to: %s", output_path)
-        return "skipped"
+        return "skipped:dry_run"
 
     # Determine if short video
     total_sample_time = args.segment_count * args.segment_duration
@@ -352,6 +391,33 @@ def process_file(
         )
         if result.temp_file:
             temp_files.append(result.temp_file)
+
+        # ── max-crf ceiling check ────────────────────────────────────
+        crf_ceiling_triggered = False
+        if result.crf > args.max_crf:
+            log.warning(
+                "  Search selected CRF=%d which exceeds --max-crf (%d). "
+                "Ignoring target bitrate and encoding with --crf-ceiling-fallback=%d.",
+                result.crf, args.max_crf, args.crf_ceiling_fallback,
+            )
+            crf_ceiling_triggered = True
+
+            # Discard the temp file from the search (wrong CRF)
+            if result.temp_file and result.temp_file.exists():
+                result.temp_file.unlink(missing_ok=True)
+                result.temp_file = None
+
+            # Override the CRF; force a fresh full encode below
+            from dataclasses import replace as _dc_replace
+            result = _dc_replace(result, crf=args.crf_ceiling_fallback, temp_file=None)
+
+            if info.bitrate_kbps > 0 and info.bitrate_kbps < 2 * args.target_bitrate:
+                log.warning(
+                    "  Original bitrate (%d kbps) is less than double the target (%d kbps). "
+                    "The source may already be low-quality.",
+                    info.bitrate_kbps, args.target_bitrate,
+                )
+                crf_ceiling_triggered = "low_original"
 
         # ── Full encode ──────────────────────────────────────────────
         if is_short_video and result.temp_file and result.temp_file.exists():
@@ -395,6 +461,10 @@ def process_file(
                 "  Done in %s. %.1f MB -> %.1f MB (could not determine output bitrate)",
                 elapsed_str, in_size_mb, out_size_mb,
             )
+            if crf_ceiling_triggered == "low_original":
+                return "processed:crf_ceiling:low_original"
+            if crf_ceiling_triggered:
+                return "processed:crf_ceiling"
             return "processed"
 
         log.info(
@@ -416,7 +486,7 @@ def process_file(
             )
 
         # ── Precise mode ─────────────────────────────────────────────
-        if args.precise and out_of_range and not is_short_video:
+        if args.precise and out_of_range and not is_short_video and not crf_ceiling_triggered:
             log.info("  --precise: final bitrate out of range, starting full-video search...")
             output_path.unlink(missing_ok=True)
 
@@ -456,6 +526,10 @@ def process_file(
                 log.error("  Full-video search produced no usable file")
                 return "failed"
 
+        if crf_ceiling_triggered == "low_original":
+            return "processed:crf_ceiling:low_original"
+        if crf_ceiling_triggered:
+            return "processed:crf_ceiling"
         return "processed"
 
     finally:
@@ -466,6 +540,51 @@ def process_file(
                     tmp.unlink(missing_ok=True)
             except OSError:
                 pass
+
+
+def _print_statistics(
+    total: int,
+    already_reencoded: int,
+    processed: int,
+    failed: int,
+    skipped_no_info: int,
+    skipped_low_bitrate: int,
+    skipped_already_av1: int,
+    skipped_dry_run: int,
+    crf_ceiling_count: int,
+    low_original_videos: list[Path],
+    interrupted: bool = False,
+) -> None:
+    """Print a summary of the encoding session statistics."""
+    log.info("=" * 60)
+    log.info("Session %s", "Interrupted — Partial Statistics" if interrupted else "Complete — Statistics")
+    log.info("=" * 60)
+    log.info("Total video files found : %d", total)
+    log.info("")
+    log.info("Already re-encoded      : %d  (output file already existed, not counted in skips below)", already_reencoded)
+    log.info("")
+    log.info("Skipped (excl. above)   : %d", skipped_no_info + skipped_low_bitrate + skipped_already_av1 + skipped_dry_run)
+    if skipped_no_info:
+        log.info("  ├─ Could not read video info : %d", skipped_no_info)
+    if skipped_already_av1:
+        log.info("  ├─ Already AV1/VP9           : %d", skipped_already_av1)
+    if skipped_low_bitrate:
+        log.info("  ├─ Bitrate at/below min      : %d", skipped_low_bitrate)
+    if skipped_dry_run:
+        log.info("  └─ Dry run                   : %d", skipped_dry_run)
+    log.info("")
+    log.info("Successfully re-encoded : %d", processed)
+    log.info("Failed                  : %d", failed)
+    log.info("")
+    log.info("Exceeded max-CRF (used --crf-ceiling-fallback) : %d", crf_ceiling_count)
+    if crf_ceiling_count:
+        log.info("  └─ Of which had low original bitrate (<2x target) : %d", len(low_original_videos))
+        if low_original_videos:
+            log.info("")
+            log.info("  Low-bitrate originals that triggered CRF ceiling:")
+            for p in low_original_videos:
+                log.info("    %s", p)
+    log.info("=" * 60)
 
 
 def main() -> None:
@@ -491,6 +610,7 @@ def main() -> None:
     log.info("Allowed window: %d kbps", args.allowed_bitrate_window)
     log.info("Target window: %d kbps", args.target_bitrate_window)
     log.info("Sample buffer: %d kbps", args.sample_bitrate_window_buffer)
+    log.info("Max CRF: %d | CRF ceiling fallback: %d", args.max_crf, args.crf_ceiling_fallback)
 
     windows = compute_windows(
         args.target_bitrate,
@@ -518,25 +638,64 @@ def main() -> None:
     total = len(video_files)
     log.info("Found %d video file(s)", total)
 
-    processed = skipped = failed = 0
+    # Statistics counters
+    processed = 0
+    failed = 0
+    already_reencoded = 0
+    skipped_no_info = 0
+    skipped_low_bitrate = 0
+    skipped_already_av1 = 0
+    skipped_dry_run = 0
+    crf_ceiling_count = 0
+    low_original_videos: list[Path] = []
 
-    for i, file_path in enumerate(video_files, 1):
-        log.info("-" * 60)
-        log.info("Processing [%d/%d]: %s", i, total, file_path)
+    interrupted = False
 
-        result = process_file(file_path, args)
-        if result == "processed":
-            processed += 1
-        elif result == "skipped":
-            skipped += 1
-        else:
-            failed += 1
+    try:
+        for i, file_path in enumerate(video_files, 1):
+            log.info("-" * 60)
+            log.info("Processing [%d/%d]: %s", i, total, file_path)
 
-    log.info("=" * 60)
-    log.info("Session Complete")
-    log.info(
-        "Processed: %d | Skipped: %d | Failed: %d | Total: %d",
-        processed, skipped, failed, total,
+            result = process_file(file_path, args)
+
+            if result == "processed":
+                processed += 1
+            elif result == "processed:crf_ceiling":
+                processed += 1
+                crf_ceiling_count += 1
+            elif result == "processed:crf_ceiling:low_original":
+                processed += 1
+                crf_ceiling_count += 1
+                low_original_videos.append(file_path)
+            elif result == "failed":
+                failed += 1
+            elif result == "skipped:output_exists":
+                already_reencoded += 1
+            elif result == "skipped:no_info":
+                skipped_no_info += 1
+            elif result == "skipped:low_bitrate":
+                skipped_low_bitrate += 1
+            elif result == "skipped:already_av1":
+                skipped_already_av1 += 1
+            elif result == "skipped:dry_run":
+                skipped_dry_run += 1
+
+    except KeyboardInterrupt:
+        interrupted = True
+        log.warning("Interrupted by user (Ctrl+C)")
+
+    _print_statistics(
+        total=total,
+        already_reencoded=already_reencoded,
+        processed=processed,
+        failed=failed,
+        skipped_no_info=skipped_no_info,
+        skipped_low_bitrate=skipped_low_bitrate,
+        skipped_already_av1=skipped_already_av1,
+        skipped_dry_run=skipped_dry_run,
+        crf_ceiling_count=crf_ceiling_count,
+        low_original_videos=low_original_videos,
+        interrupted=interrupted,
     )
 
 
