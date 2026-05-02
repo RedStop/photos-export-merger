@@ -436,8 +436,13 @@ def find_optimal_crf_interpolated(
     known: list[_KnownPoint] = []
     best_crf = -1
     best_bitrate = 0
-    best_temp_file: Path | None = None
     tried_crfs: set[int] = set()
+
+    def _cleanup_except(winner: Path | None) -> None:
+        """Delete every temp file in *known* except *winner*."""
+        for p in known:
+            if p.temp_file and p.temp_file != winner and p.temp_file.exists():
+                p.temp_file.unlink(missing_ok=True)
 
     # Inject any pre-existing measurements (e.g. from a prior full encode)
     # so the interpolation starts with real data instead of blind probes.
@@ -453,7 +458,6 @@ def find_optimal_crf_interpolated(
                 if best_crf < 0 or sk_crf < best_crf:
                     best_crf = sk_crf
                     best_bitrate = sk_bitrate
-                    best_temp_file = None
 
     # Initial probes at two spread-out points
     if seed_crf >= 0:
@@ -568,10 +572,7 @@ def find_optimal_crf_interpolated(
                         nearest_below.crf, nearest_below.bitrate,
                         nearest_above.crf,
                     )
-                    # Clean up non-best temp files collected so far
-                    for p in known:
-                        if p.temp_file and p.temp_file != best_temp_file and p.temp_file.exists():
-                            p.temp_file.unlink(missing_ok=True)
+                    _cleanup_except(nearest_above.temp_file)
                     return CrfResult(
                         crf=nearest_above.crf,
                         estimated_bitrate=nearest_above.bitrate,
@@ -676,26 +677,22 @@ def find_optimal_crf_interpolated(
         if accept_lo <= bitrate <= accept_hi:
             is_new_best = best_crf < 0 or crf < best_crf
             if is_new_best:
-                if best_temp_file and best_temp_file.exists():
-                    best_temp_file.unlink(missing_ok=True)
                 best_crf = crf
                 best_bitrate = bitrate
-                best_temp_file = temp_file
-            elif temp_file and temp_file.exists():
-                temp_file.unlink(missing_ok=True)
 
             if confident_lo <= bitrate <= confident_hi:
                 log.info("  Interpolation converged in confident zone")
                 break
-        else:
-            # Not in range — clean up temp file if not best
-            if temp_file and temp_file.exists():
-                temp_file.unlink(missing_ok=True)
 
-    # Clean up non-best temp files
-    for p in known:
-        if p.temp_file and p.temp_file != best_temp_file and p.temp_file.exists():
-            p.temp_file.unlink(missing_ok=True)
+    # Resolve the temp file for the winner from the known-points table,
+    # then delete every other temp file that was accumulated during the search.
+    best_temp_file: Path | None = None
+    if best_crf >= 0:
+        for p in known:
+            if p.crf == best_crf:
+                best_temp_file = p.temp_file
+                break
+    _cleanup_except(best_temp_file)
 
     if best_crf < 0:
         log.warning("  Interpolation did not converge, falling back to binary search")
