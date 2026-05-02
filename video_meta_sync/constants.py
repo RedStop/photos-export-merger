@@ -64,6 +64,9 @@ ALL_DATETIME_TAGS: tuple[str, ...] = DATETIME_TAGS_WITH_TZ + DATETIME_TAGS_UTC
 # ---------------------------------------------------------------------------
 # GPS tags
 # ---------------------------------------------------------------------------
+
+# Tags used to detect GPS presence in the raw exiftool output (with -G0:1,
+# no -n flag).  These are used only for detection, not for writing.
 GPS_TAGS: tuple[str, ...] = (
     "Composite:GPSLatitude",
     "Composite:GPSLongitude",
@@ -72,6 +75,23 @@ GPS_TAGS: tuple[str, ...] = (
     "Composite:GPSPosition",
     "QuickTime:Keys:GPSCoordinates",
     "QuickTime:UserData:GPSCoordinates",
+)
+
+# Tag names requested in the secondary -n (decimal) exiftool call.
+# These are the plain (no-group) forms that exiftool exposes as decimal
+# numbers when -n is passed.
+GPS_DECIMAL_TAGS: tuple[str, ...] = (
+    "GPSLatitude",
+    "GPSLongitude",
+    "GPSAltitude",
+)
+
+# XMP tags used when writing GPS into a sidecar or writable container.
+# Decimal values (negative = S/W) are sufficient; no Ref tag needed.
+GPS_XMP_WRITE_TAGS: tuple[str, str, str] = (
+    "XMP:GPSLatitude",
+    "XMP:GPSLongitude",
+    "XMP:GPSAltitude",
 )
 
 # Date/time tag *base names* (no group prefix) written back into writable

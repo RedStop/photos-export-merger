@@ -34,6 +34,31 @@ from .metadata import VideoMetadata
 log = logging.getLogger(__name__)
 
 
+def _build_gps_args(meta: VideoMetadata) -> list[str]:
+    """
+    Return exiftool argument strings that write decimal GPS values into the
+    sidecar using XMP tags.
+
+    ``-tagsfromfile`` cannot copy ``Composite:*`` tags (they are synthesised
+    by exiftool at read time and have no underlying atom to copy), so GPS must
+    always be written explicitly from the pre-extracted decimal values stored
+    in ``meta.gps_decimal``.
+    """
+    args: list[str] = []
+    lat = meta.gps_decimal.get("GPSLatitude")
+    lon = meta.gps_decimal.get("GPSLongitude")
+    alt = meta.gps_decimal.get("GPSAltitude")
+
+    if lat is not None:
+        args.append(f"-XMP:GPSLatitude={lat}")
+    if lon is not None:
+        args.append(f"-XMP:GPSLongitude={lon}")
+    if alt is not None:
+        args.append(f"-XMP:GPSAltitude={alt}")
+
+    return args
+
+
 def _build_date_override_args(meta: VideoMetadata) -> list[str]:
     """
     Return exiftool argument strings that override every date/time field
@@ -83,6 +108,7 @@ def write_sidecar(
         return sidecar_path
 
     date_args = _build_date_override_args(meta)
+    gps_args  = _build_gps_args(meta)
 
     try:
         with exiftool.ExifToolHelper() as et:
@@ -94,6 +120,9 @@ def write_sidecar(
                 "-all:all",
                 # Override all date/time fields.
                 *date_args,
+                # Write decimal GPS (Composite tags are not copied by
+                # -tagsfromfile, so these must be set explicitly).
+                *gps_args,
                 # Source file that provides the output filename template.
                 str(reencoded),
             )

@@ -24,7 +24,7 @@ import exiftool
 
 import re
 
-from .constants import ALL_DATETIME_TAGS, DATETIME_TAGS_UTC, GPS_TAGS
+from .constants import ALL_DATETIME_TAGS, DATETIME_TAGS_UTC, GPS_TAGS, GPS_DECIMAL_TAGS
 
 log = logging.getLogger(__name__)
 
@@ -137,6 +137,13 @@ class VideoMetadata:
     original_time_taken: datetime          # always UTC-aware
     recording_tz: tzinfo
     gps_tags: dict[str, Any] = field(default_factory=dict)
+    gps_decimal: dict[str, float] = field(default_factory=dict)
+    """
+    Decimal GPS values keyed by plain tag name (no group prefix), e.g.
+    ``{"GPSLatitude": -25.765, "GPSLongitude": 28.233, "GPSAltitude": 1370.3}``.
+    Negative latitude → South; negative longitude → West.
+    Present only when the original file contains GPS data.
+    """
 
     @property
     def original_time_in_recording_tz(self) -> datetime:
@@ -201,6 +208,44 @@ def _select_earliest_time(
     return best_utc, recording_tz
 
 
+def _extract_gps_decimal(original: Path) -> dict[str, float]:
+    """
+    Run exiftool with ``-n`` on *original* and return a dict of decimal GPS
+    values, e.g. ``{"GPSLatitude": -25.765, "GPSLongitude": 28.233}``.
+
+    ``-n`` suppresses unit/direction formatting so values come back as plain
+    floats (negative for S/W).  Only keys that are actually present and
+    parseable as floats are included.
+    """
+    try:
+        with exiftool.ExifToolHelper() as et:
+            results = et.get_tags(
+                str(original),
+                tags=list(GPS_DECIMAL_TAGS),
+                params=["-n"],          # decimal, no unit strings
+            )
+    except exiftool.exceptions.ExifToolExecuteError as exc:
+        log.warning("exiftool -n GPS call failed for '%s': %s", original, exc)
+        return {}
+
+    if not results:
+        return {}
+
+    raw = results[0]
+    decimal: dict[str, float] = {}
+    for tag in GPS_DECIMAL_TAGS:
+        # exiftool may return the tag with or without a group prefix; try both.
+        value = raw.get(tag) or raw.get(f"Composite:{tag}") or raw.get(f"EXIF:{tag}")
+        if value is None:
+            continue
+        try:
+            decimal[tag] = float(value)
+        except (TypeError, ValueError):
+            log.debug("Could not parse GPS decimal value for %s: %r", tag, value)
+
+    return decimal
+
+
 def extract_metadata(original: Path) -> VideoMetadata | None:
     """
     Run exiftool on *original* and return a populated VideoMetadata, or None
@@ -233,6 +278,9 @@ def extract_metadata(original: Path) -> VideoMetadata | None:
 
     gps_tags = {k: v for k, v in raw_tags.items() if k in GPS_TAGS}
 
+    # Second exiftool pass with -n to get decimal GPS values for writing.
+    gps_decimal = _extract_gps_decimal(original) if gps_tags else {}
+
     log.debug(
         "'%s' → original time taken: %s (recording tz: %s)",
         original,
@@ -245,4 +293,5 @@ def extract_metadata(original: Path) -> VideoMetadata | None:
         original_time_taken=original_time_taken,
         recording_tz=recording_tz,
         gps_tags=gps_tags,
+        gps_decimal=gps_decimal,
     )

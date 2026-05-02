@@ -23,7 +23,7 @@ import exiftool
 from .constants import (
     EXIFTOOL_DATE_WRITE_TAGS,
     METADATA_WRITABLE_EXTENSIONS,
-    GPS_TAGS,
+    GPS_XMP_WRITE_TAGS,
 )
 from .metadata import VideoMetadata
 
@@ -54,19 +54,18 @@ def _build_tag_args(meta: VideoMetadata) -> list[str]:
     args.append(f"-Keys:CreationDate={local_str}")
 
     # --- GPS ---
-    lat = meta.gps_tags.get("Composite:GPSLatitude")
-    lon = meta.gps_tags.get("Composite:GPSLongitude")
-    alt = meta.gps_tags.get("Composite:GPSAltitude")
+    # Use pre-extracted decimal values (negative = S/W).
+    # XMP GPS tags accept signed decimals directly; no Ref tag is required.
+    lat = meta.gps_decimal.get("GPSLatitude")
+    lon = meta.gps_decimal.get("GPSLongitude")
+    alt = meta.gps_decimal.get("GPSAltitude")
 
     if lat is not None:
-        args.append(f"-GPSLatitude={lat}")
+        args.append(f"-XMP:GPSLatitude={lat}")
     if lon is not None:
-        args.append(f"-GPSLongitude={lon}")
+        args.append(f"-XMP:GPSLongitude={lon}")
     if alt is not None:
-        args.append(f"-GPSAltitude={alt}")
-        alt_ref = meta.gps_tags.get("Composite:GPSAltitudeRef", "Above Sea Level")
-        ref_val = "0" if "above" in str(alt_ref).lower() else "1"
-        args.append(f"-GPSAltitudeRef={ref_val}")
+        args.append(f"-XMP:GPSAltitude={alt}")
 
     # --- Device info ---
     for exif_key, write_tag in [
