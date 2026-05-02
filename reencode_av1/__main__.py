@@ -38,12 +38,22 @@ examples:
   python -m reencode_av1 --dry-run                    # preview only
   python -m reencode_av1 --interpolate                # use interpolation
   python -m reencode_av1 --precise                    # full-video search if out of range
+  python -m reencode_av1 --min-encode-bitrate 1000    # skip files already under 1000 kbps
+  python -m reencode_av1 --min-encode-bitrate 0       # always encode regardless of bitrate
 """,
     )
 
     p.add_argument(
         "--target-bitrate", type=int, default=2500,
         help="Target video bitrate in kbps (default: 2500)",
+    )
+    p.add_argument(
+        "--min-encode-bitrate", type=int, default=None,
+        help=(
+            "Skip re-encoding if the source video bitrate is already at or below this "
+            "value in kbps. Defaults to --target-bitrate when not set. "
+            "Set to 0 to disable and always encode."
+        ),
     )
     p.add_argument(
         "--allowed-bitrate-window", type=int, default=1500,
@@ -131,6 +141,13 @@ def validate_args(args: argparse.Namespace) -> None:
         errors.append(
             "--target-bitrate-window must be <= --allowed-bitrate-window"
         )
+
+    # Resolve default for min-encode-bitrate
+    if args.min_encode_bitrate is None:
+        args.min_encode_bitrate = args.target_bitrate
+
+    if args.min_encode_bitrate < 0:
+        errors.append("--min-encode-bitrate must be >= 0 (use 0 to disable)")
 
     # Resolve default for sample buffer
     if args.sample_bitrate_window_buffer is None:
@@ -242,6 +259,14 @@ def process_file(
         info.codec, info.width, info.height, info.fps,
         info.bitrate_kbps, info.audio_channels,
     )
+
+    # Skip if source bitrate is already at or below the minimum encode threshold
+    if args.min_encode_bitrate > 0 and 0 < info.bitrate_kbps <= args.min_encode_bitrate:
+        log.info(
+            "  Source bitrate (%d kbps) is at or below --min-encode-bitrate (%d kbps), skipping",
+            info.bitrate_kbps, args.min_encode_bitrate,
+        )
+        return "skipped"
 
     # Skip AV1 / VP9
     if info.codec in SKIP_CODECS:
@@ -459,6 +484,10 @@ def main() -> None:
     log.info("AV1 Re-encode Session Started")
     log.info("=" * 60)
     log.info("Target: %d kbps", args.target_bitrate)
+    log.info(
+        "Min encode bitrate: %s",
+        f"{args.min_encode_bitrate} kbps" if args.min_encode_bitrate > 0 else "disabled (0)",
+    )
     log.info("Allowed window: %d kbps", args.allowed_bitrate_window)
     log.info("Target window: %d kbps", args.target_bitrate_window)
     log.info("Sample buffer: %d kbps", args.sample_bitrate_window_buffer)
