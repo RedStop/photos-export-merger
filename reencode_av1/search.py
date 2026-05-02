@@ -588,13 +588,61 @@ def find_optimal_crf_interpolated(
                 # CRF outside [nearest_above.crf, nearest_below.crf].
                 crf = max(nearest_above.crf + 1, min(nearest_below.crf - 1, crf))
             elif above:
-                # All probes too high — try higher CRF
+                # All probes too high — extrapolate to a higher CRF.
+                # Use the two extreme known points (lowest and highest CRF) to
+                # fit the log-linear slope; if only one point exists, pair it
+                # with crf_max as a virtual anchor (bitrate ~1 there ensures the
+                # extrapolated CRF lands well past the current maximum tried).
                 max_tried = max(p.crf for p in known)
-                crf = min(crf_max, max_tried + 5)
+                if len(known) >= 2:
+                    anchor_lo = min(known, key=lambda x: x.crf)
+                    anchor_hi = max(known, key=lambda x: x.crf)
+                    crf = interpolate_crf(
+                        anchor_lo.crf, anchor_lo.bitrate,
+                        anchor_hi.crf, anchor_hi.bitrate,
+                        accept_hi, crf_min, crf_max,
+                    )
+                else:
+                    # Single point: extrapolate using crf_max as a virtual anchor.
+                    # Assume bitrate at crf_max is ~1 kbps (effectively zero) so
+                    # the log-linear slope points well past the current point.
+                    p0 = known[0]
+                    crf = interpolate_crf(
+                        p0.crf, p0.bitrate,
+                        crf_max, 1,
+                        accept_hi, crf_min, crf_max,
+                    )
+                # Must be strictly above max_tried; fall back to +5 if not.
+                if crf <= max_tried:
+                    crf = min(crf_max, max_tried + 5)
             else:
-                # All probes too low — try lower CRF
+                # All probes too low — extrapolate to a lower CRF.
+                # Mirror of the above branch: use the two extreme known points,
+                # or pair with crf_min (bitrate → very high) as a virtual anchor.
                 min_tried = min(p.crf for p in known)
-                crf = max(crf_min, min_tried - 5)
+                if len(known) >= 2:
+                    anchor_lo = min(known, key=lambda x: x.crf)
+                    anchor_hi = max(known, key=lambda x: x.crf)
+                    crf = interpolate_crf(
+                        anchor_lo.crf, anchor_lo.bitrate,
+                        anchor_hi.crf, anchor_hi.bitrate,
+                        accept_lo, crf_min, crf_max,
+                    )
+                else:
+                    # Single point: extrapolate using crf_min as a virtual anchor.
+                    # Use a very high synthetic bitrate so the slope points well
+                    # below the current point.  10× the known bitrate is a
+                    # conservative but effective stand-in.
+                    p0 = known[0]
+                    synthetic_hi = p0.bitrate * 10
+                    crf = interpolate_crf(
+                        crf_min, synthetic_hi,
+                        p0.crf, p0.bitrate,
+                        accept_lo, crf_min, crf_max,
+                    )
+                # Must be strictly below min_tried; fall back to -5 if not.
+                if crf >= min_tried:
+                    crf = max(crf_min, min_tried - 5)
         else:
             break
 
