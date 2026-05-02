@@ -499,7 +499,7 @@ def find_optimal_crf_interpolated(
             crf = probe_crfs[iteration - 1]
         elif len(known) >= 2:
             # Find the two closest bracketing points
-            above = [(c, b, f) for c, b, f in known if b > windows.target]
+            above = [(c, b, f) for c, b, f in known if b > accept_hi]
             below = [(c, b, f) for c, b, f in known if b < accept_lo]
             in_range = [(c, b, f) for c, b, f in known if accept_lo <= b <= accept_hi]
 
