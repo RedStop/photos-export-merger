@@ -457,9 +457,17 @@ def find_optimal_crf_interpolated(
             min(hi_bound, seed_crf + 3),
         ]
     else:
+        # Empirically, optimal CRF almost always falls in [24, 50].
+        # Seed the two bracketing probes at the 25th and 75th percentile
+        # of that sweet-spot range rather than the full [crf_min, crf_max]
+        # span, so the first interpolation step lands much closer to the
+        # target without wasting an encode at a very low CRF (high bitrate).
+        _SWEET_LO, _SWEET_HI = 24, 50
+        sweet_lo = max(crf_min, _SWEET_LO)
+        sweet_hi = min(crf_max, _SWEET_HI)
         probe_crfs = [
-            crf_min + (crf_max - crf_min) // 4,   # ~25th percentile
-            crf_min + 3 * (crf_max - crf_min) // 4,  # ~75th percentile
+            sweet_lo + (sweet_hi - sweet_lo) // 4,      # ~30 — low-CRF anchor
+            sweet_lo + 3 * (sweet_hi - sweet_lo) // 4,  # ~44 — high-CRF anchor
         ]
 
     interpolation_iters = max(max_iterations, 6)  # allow a few extra for convergence
