@@ -515,11 +515,29 @@ def find_optimal_crf_interpolated(
                     # Use the tightest upper bracket: the highest CRF that
                     # still overshoots (closest to the acceptable range).
                     nearest_above = max(above, key=lambda x: x[0])
+
+                    # If best_crf and nearest_above are consecutive integers,
+                    # there is no integer CRF left to probe between them —
+                    # interpolation cannot improve the result further.
+                    if best_crf - nearest_above[0] <= 1:
+                        log.info(
+                            "  Interpolation brackets are consecutive CRFs "
+                            "(above=%d @ %d kbps, best=%d @ %d kbps) — "
+                            "no integer CRF to probe, stopping",
+                            nearest_above[0], nearest_above[1],
+                            best_crf, best_bitrate,
+                        )
+                        break
+
                     crf = interpolate_crf(
                         best_crf, best_bitrate,
                         nearest_above[0], nearest_above[1],
                         windows.target, crf_min, crf_max,
                     )
+                    # Clamp strictly inside the bracket — interpolation can
+                    # overshoot if best_bitrate > windows.target, producing a
+                    # CRF outside [nearest_above[0], best_crf].
+                    crf = max(nearest_above[0] + 1, min(best_crf - 1, crf))
                 else:
                     break  # no room to improve
             elif above and below:
