@@ -452,9 +452,10 @@ def _resolve_next_crf(
     accept_hi: int,
     crf_min: int,
     crf_max: int,
-    windows_target: int,
 ) -> int | None:
     """Choose the next CRF to probe based on the current known-points table.
+
+    accept_hi is also the target bitrate.
 
     Returns the suggested CRF integer, or None if the search should stop
     (no further improvement is possible).
@@ -462,6 +463,7 @@ def _resolve_next_crf(
     above    = [p for p in known if p.bitrate > accept_hi]
     below    = [p for p in known if p.bitrate < accept_lo]
     in_range = [p for p in known if accept_lo <= p.bitrate <= accept_hi]
+    target_bitrate = accept_hi
 
     if in_range:
         if not above:
@@ -481,7 +483,7 @@ def _resolve_next_crf(
         crf = interpolate_crf(
             best_crf, best_bitrate,
             nearest_above.crf, nearest_above.bitrate,
-            windows_target, crf_min, crf_max,
+            target_bitrate, crf_min, crf_max,
         )
         return max(nearest_above.crf + 1, min(best_crf - 1, crf))
 
@@ -503,15 +505,15 @@ def _resolve_next_crf(
         crf = interpolate_crf(
             nearest_below.crf, nearest_below.bitrate,
             nearest_above.crf, nearest_above.bitrate,
-            windows_target, crf_min, crf_max,
+            target_bitrate, crf_min, crf_max,
         )
         return max(nearest_above.crf + 1, min(nearest_below.crf - 1, crf))
 
     if above:
-        return _extrapolate_crf(known, accept_hi, crf_min, crf_max, direction=1)
+        return _extrapolate_crf(known, target_bitrate, crf_min, crf_max, direction=1)
 
     if below:
-        return _extrapolate_crf(known, accept_lo, crf_min, crf_max, direction=-1)
+        return _extrapolate_crf(known, target_bitrate, crf_min, crf_max, direction=-1)
 
     return None
 
@@ -615,9 +617,10 @@ def find_optimal_crf_interpolated(
         if iteration <= len(probe_crfs):
             crf = probe_crfs[iteration - 1]
         elif len(known) >= 2:
+            # accept_hi is the target bitrate
             next_crf = _resolve_next_crf(
                 known, best_crf, best_bitrate,
-                accept_lo, accept_hi, crf_min, crf_max, windows.target,
+                accept_lo, accept_hi, crf_min, crf_max,
             )
             if next_crf is None:
                 break
