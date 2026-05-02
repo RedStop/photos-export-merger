@@ -731,13 +731,17 @@ class TestValidateArgs:
         defaults = {
             "target_bitrate": 2500,
             "allowed_bitrate_window": 1500,
-            "target_bitrate_window": 100,
+            "target_bitrate_window": 200,
+            "min_encode_bitrate": None,
             "sample_bitrate_window_buffer": None,
             "crf_min": 1,
             "crf_max": 63,
+            "max_crf": 63,
+            "crf_ceiling_fallback": None,
             "preset": 3,
             "segment_count": 5,
             "segment_duration": 3.0,
+            "audio_bitrate": 0,
             "directory": None,
         }
         defaults.update(overrides)
@@ -795,7 +799,7 @@ class TestValidateArgs:
             validate_args(args)
 
     def test_confident_zone_inverted(self):
-        """target_window < buffer makes the confident zone inverted."""
+        """target_window < 2*buffer makes the confident zone inverted."""
         args = self._make_args(
             target_bitrate_window=10,
             sample_bitrate_window_buffer=50,

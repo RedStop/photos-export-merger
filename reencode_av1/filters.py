@@ -112,7 +112,7 @@ def compute_windows(
         target=target,
         sample_lo=max(0, target - allowed_window + sample_buffer),
         sample_hi=max(0, target - sample_buffer),
-        sample_confident_lo=max(0, target - target_window),
+        sample_confident_lo=max(0, target - target_window + sample_buffer),
         sample_confident_hi=max(0, target - sample_buffer),
         final_lo=max(0, target - allowed_window),
         final_hi=target,

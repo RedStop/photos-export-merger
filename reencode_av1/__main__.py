@@ -62,12 +62,12 @@ examples:
         help="Acceptable final bitrate range below target (default: 1500)",
     )
     p.add_argument(
-        "--target-bitrate-window", type=int, default=100,
-        help="Immediate-accept zone width below target for full encodes (default: 100)",
+        "--target-bitrate-window", type=int, default=200,
+        help="Immediate-accept zone width below target for full encodes (default: 200)",
     )
     p.add_argument(
         "--sample-bitrate-window-buffer", type=int, default=None,
-        help="Inward buffer narrowing the sample search window (default: half of target-bitrate-window)",
+        help="Inward buffer narrowing the sample search window (default: quarter of target-bitrate-window)",
     )
     p.add_argument(
         "--crf-min", type=int, default=1,
@@ -168,7 +168,7 @@ def validate_args(args: argparse.Namespace) -> None:
 
     # Resolve default for sample buffer
     if args.sample_bitrate_window_buffer is None:
-        args.sample_bitrate_window_buffer = args.target_bitrate_window // 2
+        args.sample_bitrate_window_buffer = args.target_bitrate_window // 4
 
     buf = args.sample_bitrate_window_buffer
     if buf < 0:
@@ -183,11 +183,11 @@ def validate_args(args: argparse.Namespace) -> None:
             f"Reduce --sample-bitrate-window-buffer or increase --allowed-bitrate-window."
         )
 
-    # Check confident zone: target_window >= buffer
-    if args.target_bitrate_window < buf:
+    # Check confident zone: target_window >= 2*buffer
+    if args.target_bitrate_window < 2 * buf:
         errors.append(
             f"Confident sample zone is inverted: "
-            f"target_window ({args.target_bitrate_window}) < buffer ({buf}). "
+            f"target_window ({args.target_bitrate_window}) < 2*buffer ({2 * buf}). "
             f"Increase --target-bitrate-window or decrease --sample-bitrate-window-buffer."
         )
 
@@ -218,6 +218,9 @@ def validate_args(args: argparse.Namespace) -> None:
 
     if args.segment_duration <= 0:
         errors.append("--segment-duration must be > 0")
+
+    if args.audio_bitrate < 0:
+        errors.append("--audio-bitrate must be >= 0 (use 0 for auto)")
 
     if args.directory is not None:
         if not args.directory.is_dir():
