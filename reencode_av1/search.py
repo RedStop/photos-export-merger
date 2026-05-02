@@ -525,7 +525,7 @@ def find_optimal_crf_interpolated(
             elif above and below:
                 # Use the tightest brackets on each side:
                 #   nearest_above = highest CRF still above target (tightest upper bound)
-                #   nearest_below = highest CRF that undershoots (tightest lower bound)
+                #   nearest_below = lowest CRF that undershoots (tightest lower bound)
                 nearest_above = max(above, key=lambda x: x[0])
                 nearest_below = min(below, key=lambda x: x[0])
 
