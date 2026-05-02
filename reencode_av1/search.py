@@ -395,6 +395,7 @@ def _extrapolate_crf(
     crf_max: int,
     *,
     direction: int,
+    crf_nudge_size: int = 5,
 ) -> int:
     """Extrapolate a CRF when all known points are on the same side of the target.
 
@@ -424,11 +425,11 @@ def _extrapolate_crf(
     if direction == 1:
         max_tried = anchor_hi.crf
         if crf <= max_tried:
-            crf = min(crf_max, max_tried + 5)
+            crf = min(crf_max, max_tried + crf_nudge_size)
     else:
         min_tried = anchor_lo.crf
         if crf >= min_tried:
-            crf = max(crf_min, min_tried - 5)
+            crf = max(crf_min, min_tried - crf_nudge_size)
 
     return crf
 
@@ -467,7 +468,35 @@ def _resolve_next_crf(
 
     if in_range:
         if not above:
-            return None  # no overshoot to squeeze against
+            # No overshoot to bracket against, but the seed landed below the
+            # target bitrate. There may still be a lower CRF (higher quality,
+            # higher bitrate) that stays within accept_hi, so try to push
+            # toward the top of the acceptable range.
+
+            # Use the lowest-CRF in-range point as the reference
+            lowest_crf_in_range = min(in_range, key=lambda x: x.crf)
+            if lowest_crf_in_range.crf <= crf_min:
+                # Already at the quality ceiling — nothing lower to try.
+                log.info(
+                    "  No above point and lowest in-range CRF=%d is already at "
+                    "crf_min=%d — cannot lower CRF further, stopping",
+                    lowest_crf_in_range.crf, crf_min,
+                )
+                return None
+
+            # Extrapolate toward accept_hi from the lowest-CRF in-range point
+            crf = _extrapolate_crf(known, target_bitrate, crf_min, crf_max, direction=-1, crf_nudge_size=2)
+
+            # Clamp strictly below the current best (lower CRF = higher quality)
+            # and above crf_min.
+            crf = max(crf_min, min(lowest_crf_in_range.crf - 1, crf))
+
+            log.info(
+                "  No above point; probing lower CRF=%d to approach "
+                "accept_hi=%d (best in-range: CRF=%d @ %d kbps)",
+                crf, accept_hi, best_crf, best_bitrate,
+            )
+            return crf
 
         nearest_above = max(above, key=lambda x: x.crf)
         if best_crf - nearest_above.crf <= 1:
