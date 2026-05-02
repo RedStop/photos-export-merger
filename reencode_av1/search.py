@@ -449,13 +449,34 @@ def find_optimal_crf_interpolated(
 
     # Initial probes at two spread-out points
     if seed_crf >= 0:
-        # Probe around the seed for faster convergence
+        # Probe around the seed for faster convergence.
+        #
+        # If seed_known is provided we can infer the required search direction:
+        #   - seed bitrate > target  → seed CRF is too low  → only probe higher CRFs
+        #   - seed bitrate < accept_lo → seed CRF is too high → only probe lower CRFs
+        # In either case the seeded point itself already acts as one bracket, so
+        # a single additional probe in the correct direction is sufficient.
         lo_bound = seed_lo if seed_lo >= 0 else crf_min
         hi_bound = seed_hi if seed_hi >= 0 else crf_max
-        probe_crfs = [
-            max(lo_bound, seed_crf - 3),
-            min(hi_bound, seed_crf + 3),
-        ]
+
+        if seed_known:
+            # Determine direction from the seeded measurement.
+            sk_crf, sk_bitrate = seed_known[0]
+            if sk_bitrate > accept_hi:
+                # Seed overshoots — must go higher (larger CRF, lower bitrate).
+                probe_crfs = [min(hi_bound, sk_crf + 3)]
+            elif sk_bitrate < accept_lo:
+                # Seed undershoots — must go lower (smaller CRF, higher bitrate).
+                probe_crfs = [max(lo_bound, sk_crf - 3)]
+            else:
+                # Seed is already in range; shouldn't normally happen in precise
+                # mode, but handle gracefully with a single probe toward target.
+                probe_crfs = [sk_crf]
+        else:
+            probe_crfs = [
+                max(lo_bound, seed_crf - 3),
+                min(hi_bound, seed_crf + 3),
+            ]
     else:
         # Empirically, optimal CRF almost always falls in [24, 50].
         # Seed the two bracketing probes at the 25th and 75th percentile
