@@ -512,7 +512,9 @@ def find_optimal_crf_interpolated(
                 # current best and the overshoot boundary, rather than
                 # driving further below an already-acceptable lower CRF.
                 if above:
-                    nearest_above = min(above, key=lambda x: x[0])
+                    # Use the tightest upper bracket: the highest CRF that
+                    # still overshoots (closest to the acceptable range).
+                    nearest_above = max(above, key=lambda x: x[0])
                     crf = interpolate_crf(
                         best_crf, best_bitrate,
                         nearest_above[0], nearest_above[1],
@@ -521,8 +523,37 @@ def find_optimal_crf_interpolated(
                 else:
                     break  # no room to improve
             elif above and below:
-                nearest_above = min(above, key=lambda x: x[0])
+                # Use the tightest brackets on each side:
+                #   nearest_above = highest CRF still above target (tightest upper bound)
+                #   nearest_below = highest CRF that undershoots (tightest lower bound)
+                nearest_above = max(above, key=lambda x: x[0])
                 nearest_below = max(below, key=lambda x: x[0])
+
+                # If the two brackets are consecutive CRFs there is no integer
+                # CRF left to try between them — interpolation cannot converge.
+                # Fall through to binary search immediately, seeding it with
+                # the nearest above point.
+                if nearest_below[0] - nearest_above[0] <= 1:
+                    log.warning(
+                        "  Interpolation brackets are consecutive CRFs "
+                        "(above=%d @ %d kbps, below=%d @ %d kbps) — "
+                        "switching to binary search",
+                        nearest_above[0], nearest_above[1],
+                        nearest_below[0], nearest_below[1],
+                    )
+                    # Clean up non-best temp files collected so far
+                    for c, b, f in known:
+                        if f and f != best_temp_file and f.exists():
+                            f.unlink(missing_ok=True)
+                    return find_optimal_crf(
+                        input_path, windows, extra_args, audio_bitrate, preset,
+                        audio_bitrate_kbps, max_iterations, crf_min, crf_max,
+                        offsets=offsets, seg_duration=seg_duration,
+                        full_encode=full_encode,
+                        seed_crf=nearest_above[0],
+                        has_audio=has_audio,
+                    )
+
                 crf = interpolate_crf(
                     nearest_below[0], nearest_below[1],
                     nearest_above[0], nearest_above[1],
