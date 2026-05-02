@@ -475,12 +475,17 @@ def find_optimal_crf_interpolated(
             in_range = [(c, b, f) for c, b, f in known if accept_lo <= b <= accept_hi]
 
             if in_range:
-                # Already have an acceptable result — try to improve
-                best_in = min(in_range, key=lambda x: x[0])  # lowest CRF in range
+                # Already have an acceptable result — try to improve by
+                # interpolating between best_crf (the highest-CRF / lowest-
+                # bitrate accepted result) and the nearest overshoot above it.
+                # Using best_crf as the lower anchor (rather than the lowest
+                # CRF seen in range) ensures we probe the gap between the
+                # current best and the overshoot boundary, rather than
+                # driving further below an already-acceptable lower CRF.
                 if above:
                     nearest_above = min(above, key=lambda x: x[0])
                     crf = interpolate_crf(
-                        best_in[0], best_in[1],
+                        best_crf, best_bitrate,
                         nearest_above[0], nearest_above[1],
                         windows.target, crf_min, crf_max,
                     )
