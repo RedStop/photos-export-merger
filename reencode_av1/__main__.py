@@ -617,6 +617,8 @@ def main() -> None:
     log.info("Allowed window: %d kbps", args.allowed_bitrate_window)
     log.info("Target window: %d kbps", args.target_bitrate_window)
     log.info("Sample buffer: %d kbps", args.sample_bitrate_window_buffer)
+    log.info("Max CRF: %d", args.crf_max)
+    log.info("Min CRF: %d", args.crf_min)
     log.info("Max acceptable CRF: %d | CRF ceiling fallback: %d", args.max_acceptable_crf, args.crf_ceiling_fallback)
 
     windows = compute_windows(
