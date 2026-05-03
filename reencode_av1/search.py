@@ -39,9 +39,13 @@ class _SearchState:
     best_temp_file: Path | None = None
     total_iterations: int = 0
 
-    # Proven bounds: tighten the range as we learn
-    proven_too_high_crf: int = -1  # lowest CRF known to overshoot target
-    proven_too_low_crf: int = -1   # highest CRF known to undershoot floor
+    # Proven bounds: tighten the search range as we learn.
+    # bitrate_overshoot_crf_floor   — lowest CRF observed whose bitrate exceeds accept_hi (overshoots).
+    #                         The next probe must use a CRF strictly above this value.
+    # bitrate_undershoot_crf_ceiling — highest CRF observed whose bitrate falls below accept_lo (undershoots).
+    #                         The next probe must use a CRF strictly below this value.
+    bitrate_overshoot_crf_floor: int = -1
+    bitrate_undershoot_crf_ceiling: int = -1
 
     def update_best(
         self,
@@ -176,22 +180,22 @@ def _binary_search_phase(
             hi = mid - 1
 
         elif bitrate > accept_hi:
-            # Bitrate too high -> increase CRF
+            # Bitrate too high (CRF too low / quality too high) -> increase CRF to reduce bitrate
             if temp_file and temp_file.exists():
                 temp_file.unlink(missing_ok=True)
             lo = mid + 1
-            if state.proven_too_high_crf < 0 or mid < state.proven_too_high_crf:
-                state.proven_too_high_crf = mid
+            if state.bitrate_overshoot_crf_floor < 0 or mid < state.bitrate_overshoot_crf_floor:
+                state.bitrate_overshoot_crf_floor = mid  # new lowest CRF confirmed to overshoot the accept_hi bitrate
 
         else:
-            # Bitrate too low -> decrease CRF
+            # Bitrate too low (CRF too high / quality too low) -> decrease CRF to raise bitrate
             if state.best_crf < 0 or mid < state.best_crf:
                 state.update_best(mid, bitrate, temp_file)
             elif temp_file and temp_file.exists():
                 temp_file.unlink(missing_ok=True)
             hi = mid - 1
-            if state.proven_too_low_crf < 0 or mid > state.proven_too_low_crf:
-                state.proven_too_low_crf = mid
+            if state.bitrate_undershoot_crf_ceiling < 0 or mid > state.bitrate_undershoot_crf_ceiling:
+                state.bitrate_undershoot_crf_ceiling = mid  # new highest CRF confirmed to undershoot the accept_lo bitrate
 
     # Check if the best is in the acceptable range
     return (
@@ -260,13 +264,13 @@ def find_optimal_crf(
                 sk_crf, sk_bitrate,
             )
             if sk_bitrate > accept_hi_ck:
-                # This CRF overshoots — proven too-high bound
-                if state.proven_too_high_crf < 0 or sk_crf < state.proven_too_high_crf:
-                    state.proven_too_high_crf = sk_crf
+                # Bitrate overshoots (too high) at this CRF — tighten the bitrate overshoot CRF floor
+                if state.bitrate_overshoot_crf_floor < 0 or sk_crf < state.bitrate_overshoot_crf_floor:
+                    state.bitrate_overshoot_crf_floor = sk_crf
             elif sk_bitrate < accept_lo_ck:
-                # This CRF undershoots — proven too-low bound
-                if state.proven_too_low_crf < 0 or sk_crf > state.proven_too_low_crf:
-                    state.proven_too_low_crf = sk_crf
+                # Bitrate undershoots (too low) at this CRF — tighten the bitrate undershoot CRF ceiling
+                if state.bitrate_undershoot_crf_ceiling < 0 or sk_crf > state.bitrate_undershoot_crf_ceiling:
+                    state.bitrate_undershoot_crf_ceiling = sk_crf
 
     phases: list[tuple[int, int, str]] = []
 
@@ -284,15 +288,17 @@ def find_optimal_crf(
 
     for phase_lo, phase_hi, label in phases:
         if label == "DYNAMIC":
-            # Compute expanded range from proven bounds
+            # Compute the tightest search range the proven bounds allow.
+            # We must probe strictly above the floor (lower CRFs cuase the bitrate overshoot)
+            # and strictly below the ceiling (higher CRFs cuase the bitrate to undershoot).
             lo = (
-                state.proven_too_high_crf + 1
-                if state.proven_too_high_crf >= 0
+                state.bitrate_overshoot_crf_floor + 1
+                if state.bitrate_overshoot_crf_floor >= 0
                 else crf_min
             )
             hi = (
-                state.proven_too_low_crf - 1
-                if state.proven_too_low_crf >= 0
+                state.bitrate_undershoot_crf_ceiling - 1
+                if state.bitrate_undershoot_crf_ceiling >= 0
                 else crf_max
             )
             lo = max(crf_min, lo)
@@ -304,8 +310,8 @@ def find_optimal_crf(
 
             label = (
                 f"expanded [{lo}, {hi}] "
-                f"(bounds: high@{state.proven_too_high_crf}, "
-                f"low@{state.proven_too_low_crf})"
+                f"(bitrate_overshoot_crf_floor={state.bitrate_overshoot_crf_floor}, "
+                f"bitrate_undershoot_crf_ceiling={state.bitrate_undershoot_crf_ceiling})"
             )
         else:
             lo, hi = phase_lo, phase_hi
@@ -410,10 +416,12 @@ def _extrapolate_crf(
     if anchor_lo is anchor_hi:
         p0 = known[0]
         if direction == 1:
-            # Virtual anchor at crf_max with near-zero bitrate pushes slope upward.
+            # All points overshoot (bitrate too high); virtual anchor at crf_max with near-zero bitrate
+            # pushes the interpolated slope toward a higher CRF (lower bitrate).
             crf = interpolate_crf(p0.crf, p0.bitrate, crf_max, 1, target_bitrate, crf_min, crf_max)
         else:
-            # Virtual anchor at crf_min with 10× bitrate pushes slope downward.
+            # All points undershoot (bitrate too low); virtual anchor at crf_min with 10× bitrate
+            # pushes the interpolated slope toward a lower CRF (higher bitrate).
             crf = interpolate_crf(crf_min, p0.bitrate * 10, p0.crf, p0.bitrate, target_bitrate, crf_min, crf_max)
     else:
         crf = interpolate_crf(
@@ -423,10 +431,12 @@ def _extrapolate_crf(
         )
 
     if direction == 1:
+        # Overshooting side: nudge toward higher CRF (lower bitrate) if estimate didn't move far enough
         max_tried = anchor_hi.crf
         if crf <= max_tried:
             crf = min(crf_max, max_tried + crf_nudge_size)
     else:
+        # Undershooting side: nudge toward lower CRF (higher bitrate) if estimate didn't move far enough
         min_tried = anchor_lo.crf
         if crf >= min_tried:
             crf = max(crf_min, min_tried - crf_nudge_size)
@@ -461,15 +471,16 @@ def _resolve_next_crf(
     Returns the suggested CRF integer, or None if the search should stop
     (no further improvement is possible).
     """
-    above    = [p for p in known if p.bitrate > accept_hi]
-    below    = [p for p in known if p.bitrate < accept_lo]
+    bitrate_above    = [p for p in known if p.bitrate > accept_hi]   # CRF too low  → bitrate overshoots
+    bitrate_below    = [p for p in known if p.bitrate < accept_lo]   # CRF too high → bitrate undershoots
     in_range = [p for p in known if accept_lo <= p.bitrate <= accept_hi]
     target_bitrate = accept_hi
 
     if in_range:
-        if not above:
-            # No overshoot to bracket against, but the seed landed below the
-            # target bitrate. There may still be a lower CRF (higher quality,
+        if not bitrate_above:
+            # No overshoot (bitrate above accept_hi) to bracket against,
+            # but the seed landed below the target bitrate.
+            # There may still be a lower CRF (higher quality,
             # higher bitrate) that stays within accept_hi, so try to push
             # toward the top of the acceptable range.
 
@@ -487,22 +498,22 @@ def _resolve_next_crf(
             # Extrapolate toward accept_hi from the lowest-CRF in-range point
             crf = _extrapolate_crf(known, target_bitrate, crf_min, crf_max, direction=-1, crf_nudge_size=2)
 
-            # Clamp strictly below the current best (lower CRF = higher quality)
+            # Clamp strictly below the current best CRF (lower CRF = higher quality = higher bitrate)
             # and above crf_min.
             crf = max(crf_min, min(lowest_crf_in_range.crf - 1, crf))
 
             log.info(
-                "  No above point; probing lower CRF=%d to approach "
-                "accept_hi=%d (best in-range: CRF=%d @ %d kbps)",
+                "  No bitrate-above point; probing lower CRF=%d to approach "
+                "accept_hi=%d kbps (best in-range: CRF=%d @ %d kbps)",
                 crf, accept_hi, best_crf, best_bitrate,
             )
             return crf
 
-        nearest_above = max(above, key=lambda x: x.crf)
+        nearest_above = min(bitrate_above, key=lambda x: x.bitrate)  # lowest bitrate that still overshoots bitrate
         if best_crf - nearest_above.crf <= 1:
             log.info(
                 "  Interpolation brackets are consecutive CRFs "
-                "(above=%d @ %d kbps, best=%d @ %d kbps) — "
+                "(bitrate-above CRF=%d @ %d kbps, best in-range CRF=%d @ %d kbps) — "
                 "no integer CRF to probe, stopping",
                 nearest_above.crf, nearest_above.bitrate,
                 best_crf, best_bitrate,
@@ -516,14 +527,14 @@ def _resolve_next_crf(
         )
         return max(nearest_above.crf + 1, min(best_crf - 1, crf))
 
-    if above and below:
-        nearest_above = max(above, key=lambda x: x.crf)
-        nearest_below = min(below, key=lambda x: x.crf)
+    if bitrate_above and bitrate_below:
+        nearest_above = min(bitrate_above, key=lambda x: x.bitrate)  # lowest bitrate that still overshoots bitrate
+        nearest_below = max(bitrate_below, key=lambda x: x.bitrate)  # highest bitrate that still undershoots bitrate
 
         if nearest_below.crf - nearest_above.crf <= 1:
             log.info(
                 "  Interpolation brackets are consecutive CRFs "
-                "(above=%d @ %d kbps, below=%d @ %d kbps) — "
+                "(bitrate-above CRF=%d @ %d kbps, bitrate-below CRF=%d @ %d kbps) — "
                 "no integer CRF to probe; returning nearest overshoot CRF=%d",
                 nearest_above.crf, nearest_above.bitrate,
                 nearest_below.crf, nearest_below.bitrate,
@@ -538,10 +549,10 @@ def _resolve_next_crf(
         )
         return max(nearest_above.crf + 1, min(nearest_below.crf - 1, crf))
 
-    if above:
+    if bitrate_above:
         return _extrapolate_crf(known, target_bitrate, crf_min, crf_max, direction=1)
 
-    if below:
+    if bitrate_below:
         return _extrapolate_crf(known, target_bitrate, crf_min, crf_max, direction=-1)
 
     return None
@@ -606,6 +617,7 @@ def find_optimal_crf_interpolated(
             known.append(_KnownPoint(crf=sk_crf, bitrate=sk_bitrate))
             tried_crfs.add(sk_crf)
             if accept_lo <= sk_bitrate <= accept_hi:
+                # Prefer lower CRF (higher quality, higher bitrate) within the acceptable range
                 if best_crf < 0 or sk_crf < best_crf:
                     best_crf = sk_crf
                     best_bitrate = sk_bitrate
@@ -619,8 +631,10 @@ def find_optimal_crf_interpolated(
             # One probe in the direction implied by the seeded measurement.
             sk_crf, sk_bitrate = seed_known[0]
             if sk_bitrate > accept_hi:
+                # Bitrate overshoots (too high) → need higher CRF → probe above seed CRF
                 probe_crfs = [min(hi_bound, sk_crf + 3)]
             elif sk_bitrate < accept_lo:
+                # Bitrate undershoots (too low) → need lower CRF → probe below seed CRF
                 probe_crfs = [max(lo_bound, sk_crf - 3)]
             else:
                 probe_crfs = [sk_crf]
@@ -690,6 +704,7 @@ def find_optimal_crf_interpolated(
         known.append(_KnownPoint(crf=crf, bitrate=bitrate, temp_file=temp_file))
 
         if accept_lo <= bitrate <= accept_hi:
+            # Prefer lower CRF (higher quality, higher bitrate) within the acceptable range
             if best_crf < 0 or crf < best_crf:
                 best_crf = crf
                 best_bitrate = bitrate
