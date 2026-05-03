@@ -74,8 +74,8 @@ examples:
         help="Minimum CRF value (default: 1)",
     )
     p.add_argument(
-        "--crf-max", type=int, default=63,
-        help="Maximum CRF value (default: 63)",
+        "--crf-max", type=int, default=None,
+        help="Maximum CRF value (default: max-acceptable-crf + 1)",
     )
     p.add_argument(
         "--max-acceptable-crf", type=int, default=59,
@@ -190,6 +190,10 @@ def validate_args(args: argparse.Namespace) -> None:
             f"target_window ({args.target_bitrate_window}) < 2*buffer ({2 * buf}). "
             f"Increase --target-bitrate-window or decrease --sample-bitrate-window-buffer."
         )
+
+    # Resolve default for crf-max
+    if args.crf_max is None:
+        args.crf_max = min(args.max_acceptable_crf + 1, 63)
 
     if not (0 <= args.crf_min < args.crf_max <= 63):
         errors.append("--crf-min and --crf-max must satisfy 0 <= min < max <= 63")
