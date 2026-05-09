@@ -121,6 +121,8 @@ def _binary_search_phase(
     seg_duration: float,
     full_encode: bool,
     label: str,
+    crf_min: int,
+    max_acceptable_crf: int,
     has_audio: bool = True,
 ) -> bool:
     """Run one phase of binary search.
@@ -187,6 +189,16 @@ def _binary_search_phase(
             if state.bitrate_overshoot_crf_floor < 0 or mid < state.bitrate_overshoot_crf_floor:
                 state.bitrate_overshoot_crf_floor = mid  # new lowest CRF confirmed to overshoot the accept_hi bitrate
 
+            # If we're already at or above max_acceptable_crf and bitrate is still
+            # too high, the crf-ceiling-fallback will be used — no point searching further.
+            if mid >= max_acceptable_crf:
+                log.info(
+                    "  CRF=%d >= max-acceptable-crf=%d and bitrate (%d kbps) still exceeds "
+                    "accept_hi (%d kbps) — stopping search early (crf-ceiling-fallback applies)",
+                    mid, max_acceptable_crf, bitrate, accept_hi,
+                )
+                return False
+
         else:
             # Bitrate too low (CRF too high / quality too low) -> decrease CRF to raise bitrate
             if state.best_crf < 0 or mid < state.best_crf:
@@ -196,6 +208,16 @@ def _binary_search_phase(
             hi = mid - 1
             if state.bitrate_undershoot_crf_ceiling < 0 or mid > state.bitrate_undershoot_crf_ceiling:
                 state.bitrate_undershoot_crf_ceiling = mid  # new highest CRF confirmed to undershoot the accept_lo bitrate
+
+            # If we're at crf_min and the bitrate is still too low, we can't raise
+            # quality any further — keep this as best and stop searching.
+            if mid <= crf_min:
+                log.info(
+                    "  CRF=%d is already at crf_min=%d and bitrate (%d kbps) is still "
+                    "below accept_lo (%d kbps) — cannot lower CRF further, using crf_min",
+                    mid, crf_min, bitrate, accept_lo,
+                )
+                return False
 
     # Check if the best is in the acceptable range
     return (
@@ -216,12 +238,13 @@ def find_optimal_crf(
     crf_max: int,
     *,
     offsets: list[float] | None = None,
-    seg_duration: float = 3.0,
+    seg_duration: float = 5.0,
     full_encode: bool = False,
     seed_crf: int = -1,
     seed_lo: int = -1,
     seed_hi: int = -1,
     seed_known: list[tuple[int, int]] | None = None,
+    max_acceptable_crf: int = -1,
     has_audio: bool = True,
 ) -> CrfResult:
     """Find the optimal CRF via binary search.
@@ -247,6 +270,10 @@ def find_optimal_crf(
         A :class:`CrfResult` with the chosen CRF, estimated bitrate,
         and optionally a temp file (when *full_encode* is True).
     """
+    # Resolve default: if caller didn't supply max_acceptable_crf, disable early-exit
+    # by treating crf_max as the ceiling (the normal overflow path handles it).
+    _mac = max_acceptable_crf if max_acceptable_crf >= 0 else crf_max
+
     state = _SearchState()
 
     # Pre-populate proven bounds from any seed_known data points so that
@@ -320,7 +347,8 @@ def find_optimal_crf(
             input_path, lo, hi, windows, extra_args, audio_bitrate,
             preset, audio_bitrate_kbps, max_iterations, state,
             offsets=offsets, seg_duration=seg_duration,
-            full_encode=full_encode, label=label, has_audio=has_audio,
+            full_encode=full_encode, label=label,
+            crf_min=crf_min, max_acceptable_crf=_mac, has_audio=has_audio,
         )
 
         if found:
@@ -570,12 +598,13 @@ def find_optimal_crf_interpolated(
     crf_max: int,
     *,
     offsets: list[float] | None = None,
-    seg_duration: float = 3.0,
+    seg_duration: float = 5.0,
     full_encode: bool = False,
     seed_crf: int = -1,
     seed_lo: int = -1,
     seed_hi: int = -1,
     seed_known: list[tuple[int, int]] | None = None,
+    max_acceptable_crf: int = -1,
     has_audio: bool = True,
 ) -> CrfResult:
     """Find optimal CRF using log-linear interpolation with binary search fallback.
@@ -595,6 +624,7 @@ def find_optimal_crf_interpolated(
     entirely if the seeded result is already good enough.
     """
     accept_lo, accept_hi, confident_lo, confident_hi = _select_windows(windows, full_encode)
+    _mac = max_acceptable_crf if max_acceptable_crf >= 0 else crf_max
 
     known: list[_KnownPoint] = []
     best_crf = -1
@@ -711,6 +741,27 @@ def find_optimal_crf_interpolated(
             if confident_lo <= bitrate <= confident_hi:
                 log.info("  Interpolation converged in confident zone")
                 break
+        elif bitrate > accept_hi and crf >= _mac:
+            # Bitrate still too high at or above max_acceptable_crf — the
+            # crf-ceiling-fallback will be used; no need to keep probing.
+            log.info(
+                "  CRF=%d >= max-acceptable-crf=%d and bitrate (%d kbps) still exceeds "
+                "accept_hi (%d kbps) — stopping interpolation early (crf-ceiling-fallback applies)",
+                crf, _mac, bitrate, accept_hi,
+            )
+            break
+        elif bitrate < accept_lo and crf <= crf_min:
+            # Bitrate still too low at crf_min — can't lower CRF any further;
+            # keep crf_min as the best result and stop.
+            log.info(
+                "  CRF=%d is already at crf_min=%d and bitrate (%d kbps) is still "
+                "below accept_lo (%d kbps) — cannot lower CRF further, using crf_min",
+                crf, crf_min, bitrate, accept_lo,
+            )
+            if best_crf < 0 or crf < best_crf:
+                best_crf = crf
+                best_bitrate = bitrate
+            break
 
     # Resolve the temp file for the winner, then clean up everything else.
     best_temp_file: Path | None = None
@@ -729,7 +780,7 @@ def find_optimal_crf_interpolated(
             offsets=offsets, seg_duration=seg_duration,
             full_encode=full_encode,
             seed_crf=seed_crf, seed_lo=seed_lo, seed_hi=seed_hi,
-            seed_known=seed_known, has_audio=has_audio,
+            seed_known=seed_known, max_acceptable_crf=max_acceptable_crf, has_audio=has_audio,
         )
 
     log.info("  Selected CRF=%d (estimated %d kbps)", best_crf, best_bitrate)

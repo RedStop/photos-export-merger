@@ -70,8 +70,8 @@ examples:
         help="Inward buffer narrowing the sample search window (default: quarter of target-bitrate-window)",
     )
     p.add_argument(
-        "--crf-min", type=int, default=1,
-        help="Minimum CRF value (default: 1)",
+        "--crf-min", type=int, default=15,
+        help="Minimum CRF value (default: 15)",
     )
     p.add_argument(
         "--crf-max", type=int, default=None,
@@ -101,8 +101,16 @@ examples:
         help="Number of sample segments (default: 5)",
     )
     p.add_argument(
-        "--segment-duration", type=float, default=3.0,
-        help="Duration of each sample segment in seconds (default: 3.0)",
+        "--segment-duration", type=float, default=5.0,
+        help="Duration of each sample segment in seconds (default: 5.0)",
+    )
+    p.add_argument(
+        "--short-video-threshold", type=float, default=90.0,
+        help=(
+            "Videos at or shorter than this duration (in seconds) are encoded in full "
+            "during the CRF search instead of using segment sampling (default: 90.0). "
+            "Must be at least double segment-count * segment-duration."
+        ),
     )
     p.add_argument(
         "--audio-bitrate", type=int, default=0,
@@ -222,6 +230,17 @@ def validate_args(args: argparse.Namespace) -> None:
 
     if args.segment_duration <= 0:
         errors.append("--segment-duration must be > 0")
+
+    if args.short_video_threshold <= 0:
+        errors.append("--short-video-threshold must be > 0")
+    else:
+        min_threshold = 2.0 * args.segment_count * args.segment_duration
+        if args.short_video_threshold < min_threshold:
+            errors.append(
+                f"--short-video-threshold ({args.short_video_threshold}s) must be at least "
+                f"double segment-count * segment-duration "
+                f"(2 * {args.segment_count} * {args.segment_duration}s = {min_threshold}s)"
+            )
 
     if args.audio_bitrate < 0:
         errors.append("--audio-bitrate must be >= 0 (use 0 for auto)")
@@ -362,14 +381,15 @@ def process_file(
         log.info("  [DRY RUN] Would encode to: %s", output_path)
         return "skipped:dry_run"
 
-    # Determine if short video
-    total_sample_time = args.segment_count * args.segment_duration
-    is_short_video = info.duration_sec > 0 and info.duration_sec <= total_sample_time
+    # Determine if short video — videos at or under the threshold are encoded in
+    # full during the search (no segment sampling); longer videos use the short
+    # multi-segment encoding unless --precise mode is active.
+    is_short_video = info.duration_sec > 0 and info.duration_sec <= args.short_video_threshold
 
     if is_short_video:
         log.info(
-            "  Video (%.1fs) <= total sample time (%.1fs), encoding full video during search",
-            info.duration_sec, total_sample_time,
+            "  Video (%.1fs) <= %.0fs threshold, encoding full video during search",
+            info.duration_sec, args.short_video_threshold,
         )
 
     # Choose search function
@@ -394,7 +414,8 @@ def process_file(
             args.preset, audio_kbps, args.max_iterations,
             args.crf_min, args.crf_max,
             offsets=offsets, seg_duration=args.segment_duration,
-            full_encode=is_short_video, has_audio=has_audio,
+            full_encode=is_short_video, max_acceptable_crf=args.max_acceptable_crf,
+            has_audio=has_audio,
         )
         if result.temp_file:
             temp_files.append(result.temp_file)
@@ -507,6 +528,7 @@ def process_file(
                 full_encode=True,
                 seed_crf=result.crf,
                 seed_known=[(result.crf, out_bitrate)],
+                max_acceptable_crf=args.max_acceptable_crf,
             )
             if precise_result.temp_file:
                 temp_files.append(precise_result.temp_file)
