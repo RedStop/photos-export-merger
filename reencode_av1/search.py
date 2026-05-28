@@ -13,6 +13,8 @@ from .filters import BitrateWindows
 log = logging.getLogger(__name__)
 
 
+# ── Public result type ────────────────────────────────────────────────────────
+
 @dataclass
 class CrfResult:
     """Result of a CRF search."""
@@ -20,56 +22,34 @@ class CrfResult:
     crf: int
     estimated_bitrate: int
     temp_file: Path | None = None
+    crf_ceiling_used: bool = False
 
+
+# ── Internal types ────────────────────────────────────────────────────────────
 
 @dataclass
-class _KnownPoint:
-    """A measured CRF data point collected during interpolation search."""
+class _HistoryPoint:
+    """A single measured CRF → bitrate data point."""
     crf: int
     bitrate: int
     temp_file: Path | None = None
 
 
-@dataclass
-class _SearchState:
-    """Mutable state shared across search phases."""
+# ── Window selector ───────────────────────────────────────────────────────────
 
-    best_crf: int = -1
-    best_bitrate: int = 0
-    best_temp_file: Path | None = None
-    total_iterations: int = 0
-
-    # Proven bounds: tighten the search range as we learn.
-    # bitrate_overshoot_crf_floor   — lowest CRF observed whose bitrate exceeds accept_hi (overshoots).
-    #                         The next probe must use a CRF strictly above this value.
-    # bitrate_undershoot_crf_ceiling — highest CRF observed whose bitrate falls below accept_lo (undershoots).
-    #                         The next probe must use a CRF strictly below this value.
-    bitrate_overshoot_crf_floor: int = -1
-    bitrate_undershoot_crf_ceiling: int = -1
-
-    def update_best(
-        self,
-        crf: int,
-        bitrate: int,
-        temp_file: Path | None = None,
-    ) -> None:
-        """Replace the current best, cleaning up the previous temp file."""
-        if self.best_temp_file and self.best_temp_file.exists():
-            self.best_temp_file.unlink(missing_ok=True)
-        self.best_crf = crf
-        self.best_bitrate = bitrate
-        self.best_temp_file = temp_file
-
-    def clear_best(self) -> None:
-        """Discard the current best (and its temp file)."""
-        if self.best_temp_file and self.best_temp_file.exists():
-            self.best_temp_file.unlink(missing_ok=True)
-        self.best_crf = -1
-        self.best_bitrate = 0
-        self.best_temp_file = None
+def _select_windows(
+    windows: BitrateWindows,
+    full_encode: bool,
+) -> tuple[int, int, int, int]:
+    """Return ``(accept_lo, accept_hi, confident_lo, confident_hi)``."""
+    if full_encode:
+        return windows.final_lo, windows.final_hi, windows.final_accept_lo, windows.final_accept_hi
+    return windows.sample_lo, windows.sample_hi, windows.sample_confident_lo, windows.sample_confident_hi
 
 
-def _evaluate_crf_sample(
+# ── Encode helper ─────────────────────────────────────────────────────────────
+
+def _evaluate_crf(
     input_path: Path,
     crf: int,
     extra_args: list[str],
@@ -82,10 +62,7 @@ def _evaluate_crf_sample(
     full_encode: bool,
     has_audio: bool = True,
 ) -> tuple[int, Path | None]:
-    """Evaluate a CRF value using the appropriate sampling method.
-
-    Returns ``(bitrate_kbps, temp_file_or_none)``.
-    """
+    """Encode at *crf* and return ``(bitrate_kbps, temp_file_or_none)``."""
     if full_encode:
         return encode_sample(
             input_path, crf, extra_args, audio_bitrate, preset,
@@ -97,7 +74,7 @@ def _evaluate_crf_sample(
             audio_bitrate_kbps, offsets, seg_duration, has_audio=has_audio,
         )
         return bitrate, None
-    # Single-segment fallback (shouldn't normally happen)
+    # Single-segment fallback (short video without explicit offsets)
     bitrate, _ = encode_sample(
         input_path, crf, extra_args, audio_bitrate, preset,
         audio_bitrate_kbps, duration=seg_duration, has_audio=has_audio,
@@ -105,298 +82,133 @@ def _evaluate_crf_sample(
     return bitrate, None
 
 
-def _binary_search_phase(
-    input_path: Path,
-    lo: int,
-    hi: int,
-    windows: BitrateWindows,
-    extra_args: list[str],
-    audio_bitrate: str,
-    preset: int,
-    audio_bitrate_kbps: int,
-    max_iterations: int,
-    state: _SearchState,
-    *,
-    offsets: list[float] | None,
-    seg_duration: float,
-    full_encode: bool,
-    label: str,
-    crf_min: int,
-    max_acceptable_crf: int,
-    has_audio: bool = True,
-) -> bool:
-    """Run one phase of binary search.
+# ── Search methods ────────────────────────────────────────────────────────────
+# Each method receives the full search history and returns the next CRF to try.
+# They are pure selectors — they do not encode anything.
+#
+# Contract:
+#   • Return value is clamped to [crf_min, crf_max].
+#   • Duplicate-CRF detection, boundary checks, and stopping conditions are
+#     handled by the outer loop; the method does not need to worry about those.
 
-    Updates *state* in place.  Returns True if an acceptable result was
-    found (and we can stop searching).
-    """
-    accept_lo, accept_hi, confident_lo, confident_hi = _select_windows(windows, full_encode)
-
-    log.info(
-        "  Binary search (%s): target=%d, accept=[%d, %d], confident=[%d, %d]",
-        label, windows.target, accept_lo, accept_hi, confident_lo, confident_hi,
-    )
-
-    while lo <= hi and state.total_iterations < max_iterations:
-        state.total_iterations += 1
-        mid = (lo + hi) // 2
-
-        bitrate, temp_file = _evaluate_crf_sample(
-            input_path, mid, extra_args, audio_bitrate, preset,
-            audio_bitrate_kbps,
-            offsets=offsets, seg_duration=seg_duration,
-            full_encode=full_encode, has_audio=has_audio,
-        )
-
-        if bitrate < 0:
-            log.warning(
-                "  Iteration %d: CRF=%d -> encode failed",
-                state.total_iterations, mid,
-            )
-            if temp_file and temp_file.exists():
-                temp_file.unlink(missing_ok=True)
-            # Move away from the failing CRF
-            if (mid - lo) >= (hi - mid):
-                hi = mid - 1
-            else:
-                lo = mid + 1
-            continue
-
-        log.info(
-            "  Iteration %d: CRF=%d -> %d kbps",
-            state.total_iterations, mid, bitrate,
-        )
-
-        if accept_lo <= bitrate <= accept_hi:
-            # In acceptable range
-            state.update_best(mid, bitrate, temp_file)
-
-            if confident_lo <= bitrate <= confident_hi:
-                log.info(
-                    "  Early exit: %d kbps is in confident zone [%d, %d]",
-                    bitrate, confident_lo, confident_hi,
-                )
-                return True
-
-            # Try lower CRF (higher quality) while staying in range
-            hi = mid - 1
-
-        elif bitrate > accept_hi:
-            # Bitrate too high (CRF too low / quality too high) -> increase CRF to reduce bitrate
-            if temp_file and temp_file.exists():
-                temp_file.unlink(missing_ok=True)
-            lo = mid + 1
-            if state.bitrate_overshoot_crf_floor < 0 or mid < state.bitrate_overshoot_crf_floor:
-                state.bitrate_overshoot_crf_floor = mid  # new lowest CRF confirmed to overshoot the accept_hi bitrate
-
-            # If we're already at or above max_acceptable_crf and bitrate is still
-            # too high, the crf-ceiling-fallback will be used — no point searching further.
-            if mid >= max_acceptable_crf:
-                log.info(
-                    "  CRF=%d >= max-acceptable-crf=%d and bitrate (%d kbps) still exceeds "
-                    "accept_hi (%d kbps) — stopping search early (crf-ceiling-fallback applies)",
-                    mid, max_acceptable_crf, bitrate, accept_hi,
-                )
-                return False
-
-        else:
-            # Bitrate too low (CRF too high / quality too low) -> decrease CRF to raise bitrate
-            if state.best_crf < 0 or mid < state.best_crf:
-                state.update_best(mid, bitrate, temp_file)
-            elif temp_file and temp_file.exists():
-                temp_file.unlink(missing_ok=True)
-            hi = mid - 1
-            if state.bitrate_undershoot_crf_ceiling < 0 or mid > state.bitrate_undershoot_crf_ceiling:
-                state.bitrate_undershoot_crf_ceiling = mid  # new highest CRF confirmed to undershoot the accept_lo bitrate
-
-            # If we're at crf_min and the bitrate is still too low, we can't raise
-            # quality any further — keep this as best and stop searching.
-            if mid <= crf_min:
-                log.info(
-                    "  CRF=%d is already at crf_min=%d and bitrate (%d kbps) is still "
-                    "below accept_lo (%d kbps) — cannot lower CRF further, using crf_min",
-                    mid, crf_min, bitrate, accept_lo,
-                )
-                return False
-
-    # Check if the best is in the acceptable range
-    return (
-        state.best_crf >= 0
-        and accept_lo <= state.best_bitrate <= accept_hi
-    )
-
-
-def find_optimal_crf(
-    input_path: Path,
-    windows: BitrateWindows,
-    extra_args: list[str],
-    audio_bitrate: str,
-    preset: int,
-    audio_bitrate_kbps: int,
-    max_iterations: int,
+def _next_crf_binary(
+    history: list[_HistoryPoint],
+    target_bitrate: int,
     crf_min: int,
     crf_max: int,
     *,
-    offsets: list[float] | None = None,
-    seg_duration: float = 5.0,
-    full_encode: bool = False,
     seed_crf: int = -1,
-    seed_lo: int = -1,
-    seed_hi: int = -1,
-    seed_known: list[tuple[int, int]] | None = None,
-    max_acceptable_crf: int = -1,
-    has_audio: bool = True,
-) -> CrfResult:
-    """Find the optimal CRF via binary search.
+) -> int:
+    """Binary search: return the next CRF to probe.
 
-    Args:
-        input_path: source video.
-        windows: pre-computed bitrate acceptance windows.
-        extra_args: additional ffmpeg arguments.
-        audio_bitrate: audio bitrate string (e.g. ``"128k"``).
-        preset: SVT-AV1 preset.
-        audio_bitrate_kbps: numeric audio bitrate for calculations.
-        max_iterations: maximum total search iterations.
-        crf_min: absolute minimum CRF.
-        crf_max: absolute maximum CRF.
-        offsets: segment offsets for multi-segment sampling (None to disable).
-        seg_duration: duration of each segment.
-        full_encode: if True, encode the full video each iteration.
-        seed_crf: if >= 0, start with a narrow window around this value.
-        seed_lo: optional lower bound for the seeded phase.
-        seed_hi: optional upper bound for the seeded phase.
-
-    Returns:
-        A :class:`CrfResult` with the chosen CRF, estimated bitrate,
-        and optionally a temp file (when *full_encode* is True).
+    When *seed_crf* is provided the first two probes are anchored to it:
+      - iteration 0 (empty history): probe seed_crf itself.
+      - iteration 1 (one point at seed_crf): probe seed_crf ± 5 in the
+        direction that moves the bitrate toward the target.
+    After those two seeded probes (or when no seed is given) the method
+    derives [lo, hi] purely from the history and returns the midpoint.
     """
-    # Resolve default: if caller didn't supply max_acceptable_crf, disable early-exit
-    # by treating crf_max as the ceiling (the normal overflow path handles it).
-    _mac = max_acceptable_crf if max_acceptable_crf >= 0 else crf_max
-
-    state = _SearchState()
-
-    # Pre-populate proven bounds from any seed_known data points so that
-    # the binary search range is tighter from the very first iteration.
-    if seed_known:
-        if full_encode:
-            accept_lo_ck = windows.final_lo
-            accept_hi_ck = windows.final_hi
-        else:
-            accept_lo_ck = windows.sample_lo
-            accept_hi_ck = windows.sample_hi
-        for sk_crf, sk_bitrate in seed_known:
-            log.info(
-                "  Binary search seeded with known point: CRF=%d -> %d kbps",
-                sk_crf, sk_bitrate,
-            )
-            if sk_bitrate > accept_hi_ck:
-                # Bitrate overshoots (too high) at this CRF — tighten the bitrate overshoot CRF floor
-                if state.bitrate_overshoot_crf_floor < 0 or sk_crf < state.bitrate_overshoot_crf_floor:
-                    state.bitrate_overshoot_crf_floor = sk_crf
-            elif sk_bitrate < accept_lo_ck:
-                # Bitrate undershoots (too low) at this CRF — tighten the bitrate undershoot CRF ceiling
-                if state.bitrate_undershoot_crf_ceiling < 0 or sk_crf > state.bitrate_undershoot_crf_ceiling:
-                    state.bitrate_undershoot_crf_ceiling = sk_crf
-
-    phases: list[tuple[int, int, str]] = []
-
+    # ── Seeded bootstrap (first two probes) ──────────────────────────────────
     if seed_crf >= 0:
-        s_lo = max(crf_min, seed_crf - 5)
-        s_hi = min(crf_max, seed_crf + 5)
-        if seed_lo >= 0:
-            s_lo = max(s_lo, seed_lo)
-        if seed_hi >= 0:
-            s_hi = min(s_hi, seed_hi)
-        phases.append((s_lo, s_hi, f"seeded CRF={seed_crf} [{s_lo}, {s_hi}]"))
+        if not history:
+            return max(crf_min, min(crf_max, seed_crf))
 
-    # Dynamic fallback phase — placeholder, computed after phase 1
-    phases.append((-1, -1, "DYNAMIC"))
+        if len(history) == 1 and history[0].crf == seed_crf:
+            if history[0].bitrate > target_bitrate:
+                # Bitrate too high at seed → need higher CRF (lower bitrate)
+                return min(crf_max, seed_crf + 5)
+            else:
+                # Bitrate too low at seed → need lower CRF (higher bitrate)
+                return max(crf_min, seed_crf - 5)
 
-    for phase_lo, phase_hi, label in phases:
-        if label == "DYNAMIC":
-            # Compute the tightest search range the proven bounds allow.
-            # We must probe strictly above the floor (lower CRFs cuase the bitrate overshoot)
-            # and strictly below the ceiling (higher CRFs cuase the bitrate to undershoot).
-            lo = (
-                state.bitrate_overshoot_crf_floor + 1
-                if state.bitrate_overshoot_crf_floor >= 0
-                else crf_min
-            )
-            hi = (
-                state.bitrate_undershoot_crf_ceiling - 1
-                if state.bitrate_undershoot_crf_ceiling >= 0
-                else crf_max
-            )
-            lo = max(crf_min, lo)
-            hi = min(crf_max, hi)
+    # ── Normal binary search: derive [lo, hi] from history ───────────────────
+    # lo  = one above the highest CRF whose bitrate overshot (too high bitrate).
+    # hi  = one below the lowest  CRF whose bitrate undershot (too low bitrate).
+    overshoot_crfs  = [p.crf for p in history if p.bitrate > target_bitrate]
+    undershoot_crfs = [p.crf for p in history if p.bitrate <= target_bitrate]
 
-            if lo > hi:
-                log.info("  Expanded range [%d, %d] is empty, skipping", lo, hi)
-                continue
+    lo = (max(overshoot_crfs) + 1) if overshoot_crfs  else crf_min
+    hi = (min(undershoot_crfs) - 1) if undershoot_crfs else crf_max
 
-            label = (
-                f"expanded [{lo}, {hi}] "
-                f"(bitrate_overshoot_crf_floor={state.bitrate_overshoot_crf_floor}, "
-                f"bitrate_undershoot_crf_ceiling={state.bitrate_undershoot_crf_ceiling})"
-            )
-        else:
-            lo, hi = phase_lo, phase_hi
+    lo = max(crf_min, lo)
+    hi = min(crf_max, hi)
 
-        found = _binary_search_phase(
-            input_path, lo, hi, windows, extra_args, audio_bitrate,
-            preset, audio_bitrate_kbps, max_iterations, state,
-            offsets=offsets, seg_duration=seg_duration,
-            full_encode=full_encode, label=label,
-            crf_min=crf_min, max_acceptable_crf=_mac, has_audio=has_audio,
+    if lo > hi:
+        # History has pinned the range to nothing — return the undershoot
+        # boundary (lower bitrate / higher CRF), the safe side.
+        return max(crf_min, min(crf_max, hi + 1))
+
+    return (lo + hi) // 2
+
+
+def _next_crf_interpolated(
+    history: list[_HistoryPoint],
+    target_bitrate: int,
+    crf_min: int,
+    crf_max: int,
+    *,
+    seed_crf: int = -1,
+) -> int:
+    """Interpolation search: return the next CRF to probe.
+
+    Uses log-linear interpolation between the nearest bracketing points.
+    Falls back to extrapolation when all known points are on the same side
+    of the target, and to a sweet-spot probe when fewer than two points exist.
+    """
+    # ── Bootstrap: no history yet ────────────────────────────────────────────
+    if not history:
+        if seed_crf >= 0:
+            return max(crf_min, min(crf_max, seed_crf))
+        # Probe at the 25th percentile of the empirical sweet-spot [24, 50]
+        _SWEET_LO, _SWEET_HI = 24, 50
+        sweet_lo = max(crf_min, _SWEET_LO)
+        sweet_hi = min(crf_max, _SWEET_HI)
+        return sweet_lo + (sweet_hi - sweet_lo) // 4  # ≈ 30
+
+    # ── One point: pick the complementary probe ───────────────────────────────
+    if len(history) == 1:
+        p = history[0]
+        if seed_crf >= 0 and p.crf == seed_crf:
+            # Mirror the seed probe: go ±3 in the direction toward the target
+            if p.bitrate > target_bitrate:
+                return min(crf_max, seed_crf + 3)
+            else:
+                return max(crf_min, seed_crf - 3)
+        # No seed, or seed not the only point: probe the complementary quartile
+        _SWEET_LO, _SWEET_HI = 24, 50
+        sweet_lo = max(crf_min, _SWEET_LO)
+        sweet_hi = min(crf_max, _SWEET_HI)
+        return sweet_lo + 3 * (sweet_hi - sweet_lo) // 4  # ≈ 44
+
+    # ── Two or more points: interpolate / extrapolate ─────────────────────────
+    above = [p for p in history if p.bitrate > target_bitrate]   # CRF too low
+    below = [p for p in history if p.bitrate <= target_bitrate]  # CRF too high
+
+    if above and below:
+        # Bracket exists: interpolate between the nearest bracketing pair
+        nearest_above = min(above, key=lambda p: p.bitrate)  # lowest overshoot
+        nearest_below = max(below, key=lambda p: p.bitrate)  # highest undershoot
+        crf = _interpolate_crf(
+            nearest_below.crf, nearest_below.bitrate,
+            nearest_above.crf, nearest_above.bitrate,
+            target_bitrate, crf_min, crf_max,
         )
+        # Keep strictly inside the bracket
+        return max(nearest_above.crf + 1, min(nearest_below.crf - 1, crf))
 
-        if found:
-            break
+    if above:
+        # All points overshoot → extrapolate toward a higher CRF (lower bitrate)
+        return _extrapolate_crf(history, target_bitrate, crf_min, crf_max, direction=1)
 
-        # If seeded phase didn't find a sweet-spot, expand — but keep
-        # proven bounds and don't discard a best that may still be usable
-        if label.startswith("seeded"):
-            log.info("  No sweet-spot in seeded phase, expanding search...")
-            state.clear_best()
-
-    if state.best_crf < 0:
-        log.warning("  Binary search did not converge, falling back to CRF %d", crf_max)
-        state.best_crf = crf_max
-        state.best_bitrate = 0
-        if state.best_temp_file and state.best_temp_file.exists():
-            state.best_temp_file.unlink(missing_ok=True)
-            state.best_temp_file = None
-
-    log.info(
-        "  Selected CRF=%d (estimated %d kbps)", state.best_crf, state.best_bitrate
-    )
-    return CrfResult(
-        crf=state.best_crf,
-        estimated_bitrate=state.best_bitrate,
-        temp_file=state.best_temp_file,
-    )
+    # All points undershoot → extrapolate toward a lower CRF (higher bitrate)
+    return _extrapolate_crf(history, target_bitrate, crf_min, crf_max, direction=-1)
 
 
-# ── Shared helpers ───────────────────────────────────────────────────────────
+# ── Interpolation math helpers ────────────────────────────────────────────────
 
-def _select_windows(
-    windows: BitrateWindows,
-    full_encode: bool,
-) -> tuple[int, int, int, int]:
-    """Return ``(accept_lo, accept_hi, confident_lo, confident_hi)`` for the current mode."""
-    if full_encode:
-        return windows.final_lo, windows.final_hi, windows.final_accept_lo, windows.final_accept_hi
-    return windows.sample_lo, windows.sample_hi, windows.sample_confident_lo, windows.sample_confident_hi
-
-
-# ── Interpolation ────────────────────────────────────────────────────────────
-
-def interpolate_crf(
-    crf1: int,
-    bitrate1: int,
-    crf2: int,
-    bitrate2: int,
+def _interpolate_crf(
+    crf1: int, bitrate1: int,
+    crf2: int, bitrate2: int,
     target_bitrate: int,
     crf_min: int,
     crf_max: int,
@@ -406,7 +218,7 @@ def interpolate_crf(
     The relationship between CRF and log(bitrate) is approximately linear,
     so we interpolate in log-space for a better estimate.
 
-    Returns a CRF value clamped to ``[crf_min, crf_max]``.
+    Returns a CRF value clamped to [crf_min, crf_max].
     """
     if bitrate1 <= 0 or bitrate2 <= 0 or bitrate1 == bitrate2:
         return (crf1 + crf2) // 2
@@ -423,7 +235,7 @@ def interpolate_crf(
 
 
 def _extrapolate_crf(
-    known: list[_KnownPoint],
+    history: list[_HistoryPoint],
     target_bitrate: int,
     crf_min: int,
     crf_max: int,
@@ -431,40 +243,39 @@ def _extrapolate_crf(
     direction: int,
     crf_nudge_size: int = 5,
 ) -> int:
-    """Extrapolate a CRF when all known points are on the same side of the target.
+    """Extrapolate a CRF when all known points are on one side of the target.
 
-    *direction* must be +1 (all overshooting → need a higher CRF) or -1 (all
-    undershooting → need a lower CRF).  Uses the two extreme known points to
-    fit the log-linear slope; if only one point exists a synthetic anchor is
-    added at the boundary of the CRF range.
+    *direction* is +1 (all overshoot → need higher CRF) or -1 (all undershoot
+    → need lower CRF).  Uses the two extreme known points to fit the log-linear
+    slope; if only one point exists a synthetic anchor is added at the boundary.
     """
-    anchor_lo = min(known, key=lambda x: x.crf)
-    anchor_hi = max(known, key=lambda x: x.crf)
+    anchor_lo = min(history, key=lambda p: p.crf)
+    anchor_hi = max(history, key=lambda p: p.crf)
 
     if anchor_lo is anchor_hi:
-        p0 = known[0]
+        p0 = history[0]
         if direction == 1:
-            # All points overshoot (bitrate too high); virtual anchor at crf_max with near-zero bitrate
-            # pushes the interpolated slope toward a higher CRF (lower bitrate).
-            crf = interpolate_crf(p0.crf, p0.bitrate, crf_max, 1, target_bitrate, crf_min, crf_max)
+            # All overshoot: virtual anchor at crf_max with near-zero bitrate
+            # pushes the slope toward a higher CRF.
+            crf = _interpolate_crf(p0.crf, p0.bitrate, crf_max, 1, target_bitrate, crf_min, crf_max)
         else:
-            # All points undershoot (bitrate too low); virtual anchor at crf_min with 10× bitrate
-            # pushes the interpolated slope toward a lower CRF (higher bitrate).
-            crf = interpolate_crf(crf_min, p0.bitrate * 10, p0.crf, p0.bitrate, target_bitrate, crf_min, crf_max)
+            # All undershoot: virtual anchor at crf_min with 10× bitrate
+            # pushes the slope toward a lower CRF.
+            crf = _interpolate_crf(crf_min, p0.bitrate * 10, p0.crf, p0.bitrate, target_bitrate, crf_min, crf_max)
     else:
-        crf = interpolate_crf(
+        crf = _interpolate_crf(
             anchor_lo.crf, anchor_lo.bitrate,
             anchor_hi.crf, anchor_hi.bitrate,
             target_bitrate, crf_min, crf_max,
         )
 
     if direction == 1:
-        # Overshooting side: nudge toward higher CRF (lower bitrate) if estimate didn't move far enough
+        # Overshooting: nudge toward higher CRF if the estimate didn't move far enough
         max_tried = anchor_hi.crf
         if crf <= max_tried:
             crf = min(crf_max, max_tried + crf_nudge_size)
     else:
-        # Undershooting side: nudge toward lower CRF (higher bitrate) if estimate didn't move far enough
+        # Undershooting: nudge toward lower CRF if the estimate didn't move far enough
         min_tried = anchor_lo.crf
         if crf >= min_tried:
             crf = max(crf_min, min_tried - crf_nudge_size)
@@ -472,121 +283,9 @@ def _extrapolate_crf(
     return crf
 
 
-def _nudge_crf(crf: int, tried_crfs: set[int], crf_min: int, crf_max: int) -> int | None:
-    """Return *crf*, nudged by ±1 if already tried, or None if no untried neighbour exists."""
-    if crf not in tried_crfs:
-        return crf
-    if crf + 1 <= crf_max and crf + 1 not in tried_crfs:
-        return crf + 1
-    if crf - 1 >= crf_min and crf - 1 not in tried_crfs:
-        return crf - 1
-    return None
+# ── Outer search loop ─────────────────────────────────────────────────────────
 
-
-def _resolve_next_crf(
-    known: list[_KnownPoint],
-    best_crf: int,
-    best_bitrate: int,
-    accept_lo: int,
-    accept_hi: int,
-    crf_min: int,
-    crf_max: int,
-) -> int | None:
-    """Choose the next CRF to probe based on the current known-points table.
-
-    accept_hi is also the target bitrate.
-
-    Returns the suggested CRF integer, or None if the search should stop
-    (no further improvement is possible).
-    """
-    bitrate_above    = [p for p in known if p.bitrate > accept_hi]   # CRF too low  → bitrate overshoots
-    bitrate_below    = [p for p in known if p.bitrate < accept_lo]   # CRF too high → bitrate undershoots
-    in_range = [p for p in known if accept_lo <= p.bitrate <= accept_hi]
-    target_bitrate = accept_hi
-
-    if in_range:
-        if not bitrate_above:
-            # No overshoot (bitrate above accept_hi) to bracket against,
-            # but the seed landed below the target bitrate.
-            # There may still be a lower CRF (higher quality,
-            # higher bitrate) that stays within accept_hi, so try to push
-            # toward the top of the acceptable range.
-
-            # Use the lowest-CRF in-range point as the reference
-            lowest_crf_in_range = min(in_range, key=lambda x: x.crf)
-            if lowest_crf_in_range.crf <= crf_min:
-                # Already at the quality ceiling — nothing lower to try.
-                log.info(
-                    "  No above point and lowest in-range CRF=%d is already at "
-                    "crf_min=%d — cannot lower CRF further, stopping",
-                    lowest_crf_in_range.crf, crf_min,
-                )
-                return None
-
-            # Extrapolate toward accept_hi from the lowest-CRF in-range point
-            crf = _extrapolate_crf(known, target_bitrate, crf_min, crf_max, direction=-1, crf_nudge_size=2)
-
-            # Clamp strictly below the current best CRF (lower CRF = higher quality = higher bitrate)
-            # and above crf_min.
-            crf = max(crf_min, min(lowest_crf_in_range.crf - 1, crf))
-
-            log.info(
-                "  No bitrate-above point; probing lower CRF=%d to approach "
-                "accept_hi=%d kbps (best in-range: CRF=%d @ %d kbps)",
-                crf, accept_hi, best_crf, best_bitrate,
-            )
-            return crf
-
-        nearest_above = min(bitrate_above, key=lambda x: x.bitrate)  # lowest bitrate that still overshoots bitrate
-        if best_crf - nearest_above.crf <= 1:
-            log.info(
-                "  Interpolation brackets are consecutive CRFs "
-                "(bitrate-above CRF=%d @ %d kbps, best in-range CRF=%d @ %d kbps) — "
-                "no integer CRF to probe, stopping",
-                nearest_above.crf, nearest_above.bitrate,
-                best_crf, best_bitrate,
-            )
-            return None
-
-        crf = interpolate_crf(
-            best_crf, best_bitrate,
-            nearest_above.crf, nearest_above.bitrate,
-            target_bitrate, crf_min, crf_max,
-        )
-        return max(nearest_above.crf + 1, min(best_crf - 1, crf))
-
-    if bitrate_above and bitrate_below:
-        nearest_above = min(bitrate_above, key=lambda x: x.bitrate)  # lowest bitrate that still overshoots bitrate
-        nearest_below = max(bitrate_below, key=lambda x: x.bitrate)  # highest bitrate that still undershoots bitrate
-
-        if nearest_below.crf - nearest_above.crf <= 1:
-            log.info(
-                "  Interpolation brackets are consecutive CRFs "
-                "(bitrate-above CRF=%d @ %d kbps, bitrate-below CRF=%d @ %d kbps) — "
-                "no integer CRF to probe; returning nearest overshoot CRF=%d",
-                nearest_above.crf, nearest_above.bitrate,
-                nearest_below.crf, nearest_below.bitrate,
-                nearest_above.crf,
-            )
-            return nearest_above  # type: ignore[return-value]  # sentinel: caller checks for _KnownPoint
-
-        crf = interpolate_crf(
-            nearest_below.crf, nearest_below.bitrate,
-            nearest_above.crf, nearest_above.bitrate,
-            target_bitrate, crf_min, crf_max,
-        )
-        return max(nearest_above.crf + 1, min(nearest_below.crf - 1, crf))
-
-    if bitrate_above:
-        return _extrapolate_crf(known, target_bitrate, crf_min, crf_max, direction=1)
-
-    if bitrate_below:
-        return _extrapolate_crf(known, target_bitrate, crf_min, crf_max, direction=-1)
-
-    return None
-
-
-def find_optimal_crf_interpolated(
+def find_optimal_crf(
     input_path: Path,
     windows: BitrateWindows,
     extra_args: list[str],
@@ -600,124 +299,157 @@ def find_optimal_crf_interpolated(
     offsets: list[float] | None = None,
     seg_duration: float = 5.0,
     full_encode: bool = False,
+    interpolate: bool = False,
     seed_crf: int = -1,
-    seed_lo: int = -1,
-    seed_hi: int = -1,
+    # seed_known is reserved for future use where prior encode data (e.g. from a
+    # preceding search pass) could be injected to guide the search without
+    # re-encoding.  It is not currently used by the outer loop, but is kept here
+    # so callers can pass it without API breakage when it becomes useful.
     seed_known: list[tuple[int, int]] | None = None,
-    max_acceptable_crf: int = -1,
+    crf_ceiling_fallback: int = -1,
     has_audio: bool = True,
 ) -> CrfResult:
-    """Find optimal CRF using log-linear interpolation with binary search fallback.
+    """Find the optimal CRF using a unified search loop.
 
-    Probes two initial CRF values, interpolates, and refines.  Falls back
-    to binary search if interpolation doesn't converge within a few steps.
+    The *interpolate* flag selects the CRF-selection strategy:
+      - False (default): binary search
+      - True: log-linear interpolation
 
-    When *seed_crf* is provided, the initial probes are placed around the
-    seed value for faster convergence.
+    The outer loop drives all encode iterations and handles every stopping
+    condition uniformly, regardless of strategy:
 
-    When *seed_known* is provided, those ``(crf, bitrate)`` pairs are
-    injected into the known-points table before the first probe, so that
-    data already collected (e.g. from a preceding full encode) immediately
-    guides the interpolation rather than being discarded.  Points whose
-    bitrate falls in the acceptable range also pre-populate *best_crf* /
-    *best_bitrate*, potentially allowing the search to skip encodes
-    entirely if the seeded result is already good enough.
+      1. Ask the search method for the next CRF to probe.
+      2. If the suggested CRF is a duplicate (already in history), step ±1
+         in the direction that moves the bitrate closer to the target.  If
+         both the duplicate and its neighbour have been tried, stop and
+         return the undershoot side (lower bitrate / higher CRF).
+      3. Check for consecutive brackets: if the nearest overshoot and
+         undershoot history points are adjacent CRF integers, return the
+         undershoot side immediately.
+      4. Encode at the suggested CRF and record the result.
+      5. If the bitrate falls in the confident window → return immediately.
+      6. If the bitrate falls in the accept window → record as best and
+         continue searching for a lower CRF (higher quality) still in range.
+      7. If CRF == crf_max and bitrate is still above accept_hi → the target
+         is unachievable at acceptable quality; return with
+         crf_ceiling_used=True at *crf_ceiling_fallback* (or crf_max).
+      8. If CRF == crf_min and bitrate is still below accept_lo → return
+         crf_min (cannot raise quality further).
+      9. Otherwise continue to the next iteration.
+
+    The target bitrate is always the upper edge of the active acceptance
+    window (accept_hi), which is inferred from *full_encode* and *windows*:
+    no separate target-bitrate parameter is required.
     """
     accept_lo, accept_hi, confident_lo, confident_hi = _select_windows(windows, full_encode)
-    _mac = max_acceptable_crf if max_acceptable_crf >= 0 else crf_max
 
-    known: list[_KnownPoint] = []
-    best_crf = -1
-    best_bitrate = 0
+    # The target bitrate is the upper edge of whichever window is active.
+    # All search methods drive the bitrate toward this value.
+    target_bitrate = accept_hi
+
+    _next_crf_fn = _next_crf_interpolated if interpolate else _next_crf_binary
+
+    method_label = "interpolation" if interpolate else "binary"
+    log.info(
+        "  CRF search (%s, %s): target=%d, accept=[%d, %d], confident=[%d, %d]",
+        method_label, "full" if full_encode else "sample",
+        target_bitrate, accept_lo, accept_hi, confident_lo, confident_hi,
+    )
+
+    history: list[_HistoryPoint] = []
     tried_crfs: set[int] = set()
 
-    def _cleanup_except(winner: Path | None) -> None:
-        """Delete every temp file in *known* except *winner*."""
-        for p in known:
-            if p.temp_file and p.temp_file != winner and p.temp_file.exists():
+    # Best result seen so far that is within [accept_lo, accept_hi].
+    # We prefer the lowest CRF (highest quality) in that range.
+    best: _HistoryPoint | None = None
+
+    def _cleanup_except(keep: Path | None) -> None:
+        """Delete every temp file in history except *keep*."""
+        for p in history:
+            if p.temp_file and p.temp_file != keep and p.temp_file.exists():
                 p.temp_file.unlink(missing_ok=True)
 
-    # Inject any pre-existing measurements so interpolation starts with real data.
-    if seed_known:
-        for sk_crf, sk_bitrate in seed_known:
-            log.info(
-                "  Interpolation seeded with known point: CRF=%d -> %d kbps",
-                sk_crf, sk_bitrate,
-            )
-            known.append(_KnownPoint(crf=sk_crf, bitrate=sk_bitrate))
-            tried_crfs.add(sk_crf)
-            if accept_lo <= sk_bitrate <= accept_hi:
-                # Prefer lower CRF (higher quality, higher bitrate) within the acceptable range
-                if best_crf < 0 or sk_crf < best_crf:
-                    best_crf = sk_crf
-                    best_bitrate = sk_bitrate
+    for iteration in range(1, max_iterations + 1):
 
-    # Build the list of initial CRF probes.
-    if seed_crf >= 0:
-        lo_bound = seed_lo if seed_lo >= 0 else crf_min
-        hi_bound = seed_hi if seed_hi >= 0 else crf_max
+        # ── Ask the search method for the next CRF ────────────────────────────
+        crf = _next_crf_fn(
+            history, target_bitrate, crf_min, crf_max,
+            seed_crf=seed_crf,
+        )
+        crf = max(crf_min, min(crf_max, crf))
 
-        if seed_known:
-            # One probe in the direction implied by the seeded measurement.
-            sk_crf, sk_bitrate = seed_known[0]
-            if sk_bitrate > accept_hi:
-                # Bitrate overshoots (too high) → need higher CRF → probe above seed CRF
-                probe_crfs = [min(hi_bound, sk_crf + 3)]
-            elif sk_bitrate < accept_lo:
-                # Bitrate undershoots (too low) → need lower CRF → probe below seed CRF
-                probe_crfs = [max(lo_bound, sk_crf - 3)]
+        # ── Duplicate detection ───────────────────────────────────────────────
+        if crf in tried_crfs:
+            # Look up this CRF in history to determine step direction.
+            existing = next(p for p in history if p.crf == crf)
+            if existing.bitrate > target_bitrate:
+                # Bitrate too high → step up (higher CRF lowers bitrate)
+                neighbour = crf + 1
             else:
-                probe_crfs = [sk_crf]
-        else:
-            probe_crfs = [
-                max(lo_bound, seed_crf - 3),
-                min(hi_bound, seed_crf + 3),
-            ]
-    else:
-        # Probe at the 25th and 75th percentile of the empirical sweet-spot [24, 50]
-        # to bracket the target quickly without wasting encodes at extreme CRF values.
-        _SWEET_LO, _SWEET_HI = 24, 50
-        sweet_lo = max(crf_min, _SWEET_LO)
-        sweet_hi = min(crf_max, _SWEET_HI)
-        probe_crfs = [
-            sweet_lo + (sweet_hi - sweet_lo) // 4,      # ~30
-            sweet_lo + 3 * (sweet_hi - sweet_lo) // 4,  # ~44
-        ]
+                # Bitrate too low → step down (lower CRF raises bitrate)
+                neighbour = crf - 1
 
-    interpolation_iters = max(max_iterations, 6)
+            neighbour = max(crf_min, min(crf_max, neighbour))
 
-    for iteration in range(1, interpolation_iters + 1):
-        if iteration <= len(probe_crfs):
-            crf = probe_crfs[iteration - 1]
-        elif len(known) >= 2:
-            # accept_hi is the target bitrate
-            next_crf = _resolve_next_crf(
-                known, best_crf, best_bitrate,
-                accept_lo, accept_hi, crf_min, crf_max,
+            if neighbour in tried_crfs:
+                # Both the suggested CRF and its natural neighbour have been
+                # tried.  No valid integer CRF remains to probe — stop and
+                # return the undershoot side (bitrate ≤ target / higher CRF).
+                log.warning(
+                    "  Iteration %d: CRF=%d already tried and neighbour CRF=%d also tried "
+                    "— no valid CRF to probe, stopping search",
+                    iteration, crf, neighbour,
+                )
+                undershoot = next(
+                    (p for p in sorted(history, key=lambda p: p.crf, reverse=True)
+                     if p.bitrate <= target_bitrate),
+                    None,
+                )
+                if undershoot is None:
+                    # All points overshoot; return the highest-CRF point (lowest bitrate)
+                    undershoot = max(history, key=lambda p: p.crf)
+                _cleanup_except(undershoot.temp_file)
+                return CrfResult(
+                    crf=undershoot.crf,
+                    estimated_bitrate=undershoot.bitrate,
+                    temp_file=undershoot.temp_file,
+                )
+
+            log.debug(
+                "  Iteration %d: CRF=%d already tried, stepping to CRF=%d",
+                iteration, crf, neighbour,
             )
-            if next_crf is None:
-                break
-            # _resolve_next_crf returns a _KnownPoint as a sentinel when the
-            # consecutive-bracket early-return case is hit.
-            if isinstance(next_crf, _KnownPoint):
-                winner = next_crf
+            crf = neighbour
+
+        # ── Consecutive-bracket check ─────────────────────────────────────────
+        # If the nearest overshoot and nearest undershoot are adjacent integers
+        # there is no CRF left to probe between them — stop early.
+        overshoots  = [p for p in history if p.bitrate > target_bitrate]
+        undershoots = [p for p in history if p.bitrate <= target_bitrate]
+        if overshoots and undershoots:
+            # Nearest overshoot: lowest CRF that still exceeds the target bitrate.
+            # Nearest undershoot: lowest CRF (highest quality) that fits.
+            nearest_over  = min(overshoots,  key=lambda p: p.crf)
+            nearest_under = min(undershoots, key=lambda p: p.crf)
+            if nearest_under.crf - nearest_over.crf <= 1:
+                log.info(
+                    "  Consecutive brackets: CRF=%d (%d kbps) and CRF=%d (%d kbps) "
+                    "— no integer CRF to probe, stopping",
+                    nearest_over.crf, nearest_over.bitrate,
+                    nearest_under.crf, nearest_under.bitrate,
+                )
+                # Return the undershoot (bitrate ≤ target = lower bitrate = higher CRF)
+                winner = nearest_under
                 _cleanup_except(winner.temp_file)
                 return CrfResult(
                     crf=winner.crf,
                     estimated_bitrate=winner.bitrate,
                     temp_file=winner.temp_file,
                 )
-            crf = next_crf
-        else:
-            break
 
-        crf = max(crf_min, min(crf_max, crf))
-        crf = _nudge_crf(crf, tried_crfs, crf_min, crf_max)
-        if crf is None:
-            break
+        # ── Encode ────────────────────────────────────────────────────────────
         tried_crfs.add(crf)
-
-        bitrate, temp_file = _evaluate_crf_sample(
+        bitrate, temp_file = _evaluate_crf(
             input_path, crf, extra_args, audio_bitrate, preset,
             audio_bitrate_kbps,
             offsets=offsets, seg_duration=seg_duration,
@@ -725,63 +457,101 @@ def find_optimal_crf_interpolated(
         )
 
         if bitrate < 0:
-            log.warning("  Interpolation iter %d: CRF=%d -> encode failed", iteration, crf)
+            log.warning(
+                "  Iteration %d: CRF=%d -> encode failed, skipping",
+                iteration, crf,
+            )
             if temp_file and temp_file.exists():
                 temp_file.unlink(missing_ok=True)
             continue
 
-        log.info("  Interpolation iter %d: CRF=%d -> %d kbps", iteration, crf, bitrate)
-        known.append(_KnownPoint(crf=crf, bitrate=bitrate, temp_file=temp_file))
+        log.info("  Iteration %d: CRF=%d -> %d kbps", iteration, crf, bitrate)
+        point = _HistoryPoint(crf=crf, bitrate=bitrate, temp_file=temp_file)
+        history.append(point)
 
+        # ── Acceptance check ──────────────────────────────────────────────────
         if accept_lo <= bitrate <= accept_hi:
-            # Prefer lower CRF (higher quality, higher bitrate) within the acceptable range
-            if best_crf < 0 or crf < best_crf:
-                best_crf = crf
-                best_bitrate = bitrate
+            # Within the acceptance window — prefer lowest CRF (highest quality).
+            if best is None or crf < best.crf:
+                if best and best.temp_file and best.temp_file != temp_file:
+                    best.temp_file.unlink(missing_ok=True)
+                best = point
+
             if confident_lo <= bitrate <= confident_hi:
-                log.info("  Interpolation converged in confident zone")
-                break
-        elif bitrate > accept_hi and crf >= _mac:
-            # Bitrate still too high at or above max_acceptable_crf — the
-            # crf-ceiling-fallback will be used; no need to keep probing.
+                log.info(
+                    "  CRF=%d (%d kbps) is in confident zone [%d, %d] — stopping",
+                    crf, bitrate, confident_lo, confident_hi,
+                )
+                _cleanup_except(best.temp_file)
+                return CrfResult(
+                    crf=best.crf,
+                    estimated_bitrate=best.bitrate,
+                    temp_file=best.temp_file,
+                )
+
+            # Acceptable but not confident — continue searching for a lower CRF
+            # (higher quality) that is still in range.
+            continue
+
+        # ── CRF ceiling check ─────────────────────────────────────────────────
+        if crf >= crf_max and bitrate > accept_hi:
+            _fallback = crf_ceiling_fallback if crf_ceiling_fallback >= 0 else crf_max
             log.info(
-                "  CRF=%d >= max-acceptable-crf=%d and bitrate (%d kbps) still exceeds "
-                "accept_hi (%d kbps) — stopping interpolation early (crf-ceiling-fallback applies)",
-                crf, _mac, bitrate, accept_hi,
+                "  CRF=%d is at crf_max=%d and bitrate (%d kbps) still exceeds "
+                "accept_hi (%d kbps) — target unachievable, using crf-ceiling-fallback=%d",
+                crf, crf_max, bitrate, accept_hi, _fallback,
             )
-            break
-        elif bitrate < accept_lo and crf <= crf_min:
-            # Bitrate still too low at crf_min — can't lower CRF any further;
-            # keep crf_min as the best result and stop.
+            _cleanup_except(None)
+            return CrfResult(
+                crf=_fallback,
+                estimated_bitrate=bitrate,
+                temp_file=None,
+                crf_ceiling_used=True,
+            )
+
+        # ── CRF floor check ───────────────────────────────────────────────────
+        if crf <= crf_min and bitrate < accept_lo:
             log.info(
-                "  CRF=%d is already at crf_min=%d and bitrate (%d kbps) is still "
-                "below accept_lo (%d kbps) — cannot lower CRF further, using crf_min",
+                "  CRF=%d is at crf_min=%d and bitrate (%d kbps) is still "
+                "below accept_lo (%d kbps) — cannot raise quality further, using crf_min",
                 crf, crf_min, bitrate, accept_lo,
             )
-            if best_crf < 0 or crf < best_crf:
-                best_crf = crf
-                best_bitrate = bitrate
-            break
+            _cleanup_except(point.temp_file)
+            return CrfResult(
+                crf=crf_min,
+                estimated_bitrate=bitrate,
+                temp_file=temp_file,
+            )
 
-    # Resolve the temp file for the winner, then clean up everything else.
-    best_temp_file: Path | None = None
-    if best_crf >= 0:
-        for p in known:
-            if p.crf == best_crf:
-                best_temp_file = p.temp_file
-                break
-    _cleanup_except(best_temp_file)
+        # ── Out of window — continue to next iteration ────────────────────────
 
-    if best_crf < 0:
-        log.warning("  Interpolation did not converge, falling back to binary search")
-        return find_optimal_crf(
-            input_path, windows, extra_args, audio_bitrate, preset,
-            audio_bitrate_kbps, max_iterations, crf_min, crf_max,
-            offsets=offsets, seg_duration=seg_duration,
-            full_encode=full_encode,
-            seed_crf=seed_crf, seed_lo=seed_lo, seed_hi=seed_hi,
-            seed_known=seed_known, max_acceptable_crf=max_acceptable_crf, has_audio=has_audio,
+    # ── Max iterations reached ────────────────────────────────────────────────
+    if best is not None:
+        log.info(
+            "  Max iterations reached. Best in-window result: CRF=%d (%d kbps)",
+            best.crf, best.bitrate,
         )
+        _cleanup_except(best.temp_file)
+        return CrfResult(crf=best.crf, estimated_bitrate=best.bitrate, temp_file=best.temp_file)
 
-    log.info("  Selected CRF=%d (estimated %d kbps)", best_crf, best_bitrate)
-    return CrfResult(crf=best_crf, estimated_bitrate=best_bitrate, temp_file=best_temp_file)
+    # No in-window result — return the best undershoot (bitrate ≤ target) as the
+    # safe side (lower bitrate is preferable to exceeding the target).
+    undershoot_pts = [p for p in history if p.bitrate <= target_bitrate]
+    if undershoot_pts:
+        fallback = max(undershoot_pts, key=lambda p: p.bitrate)  # closest to target
+        log.warning(
+            "  Search did not converge. Best undershoot: CRF=%d (%d kbps)",
+            fallback.crf, fallback.bitrate,
+        )
+        _cleanup_except(fallback.temp_file)
+        return CrfResult(crf=fallback.crf, estimated_bitrate=fallback.bitrate, temp_file=fallback.temp_file)
+
+    # Every encode overshot — return the highest-CRF point (lowest bitrate achieved).
+    fallback = max(history, key=lambda p: p.crf)
+    log.warning(
+        "  Search did not converge and all encodes overshot. "
+        "Using highest CRF tried: CRF=%d (%d kbps)",
+        fallback.crf, fallback.bitrate,
+    )
+    _cleanup_except(fallback.temp_file)
+    return CrfResult(crf=fallback.crf, estimated_bitrate=fallback.bitrate, temp_file=fallback.temp_file)
