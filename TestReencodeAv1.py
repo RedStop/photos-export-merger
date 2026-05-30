@@ -36,6 +36,7 @@ from reencode_av1.search import (
     find_optimal_crf,
     interpolate_crf,
     interpolation_next,
+    smart_search_next,
 )
 from reencode_av1.__main__ import (
     build_parser,
@@ -550,6 +551,70 @@ class TestInterpolationNext:
         assert nxt is None
 
 
+class TestSmartSearchNext:
+    """Stateless bracket-then-interpolate next-CRF picker (the default method).
+
+    Smart search aims at the centre of the confident window, so all cases
+    below pass ``confident_lo``/``confident_hi`` (here [2300, 2400], so the
+    target is 2350). The ``accept_lo``/``accept_hi`` arguments don't affect
+    its decisions but are part of the shared signature.
+    """
+
+    CONF_LO = 2300
+    CONF_HI = 2400  # target = 2350
+
+    def _next(self, history, crf_min=15, crf_max=57):
+        return smart_search_next(
+            history, crf_min, crf_max, 2050, 2450, -1,
+            self.CONF_LO, self.CONF_HI,
+        )
+
+    def test_empty_history_returns_midpoint(self):
+        # True midpoint of [crf_min, crf_max], not the half-width.
+        assert self._next([]) == (15 + 57) // 2  # 36
+
+    def test_single_overshoot_jumps_to_max(self):
+        # bitrate above target → CRF too small → jump to the ceiling to bracket.
+        assert self._next([CrfPoint(36, 5000)]) == 57
+
+    def test_single_undershoot_jumps_to_min(self):
+        # bitrate below target → CRF too large → jump to the floor to bracket.
+        assert self._next([CrfPoint(36, 1000)]) == 15
+
+    def test_bracketed_interpolates_strictly_between(self):
+        nxt = self._next([CrfPoint(15, 9000), CrfPoint(57, 500)])
+        assert nxt is not None and 15 < nxt < 57
+
+    def test_consecutive_bracket_returns_none(self):
+        # CRF 30 overshoots (2500 > 2350), CRF 31 undershoots (2200 <= 2350):
+        # no integer CRF between them.
+        nxt = self._next([CrfPoint(30, 2500), CrfPoint(31, 2200)])
+        assert nxt is None
+
+    def test_all_overshoot_below_ceiling_jumps_to_max(self):
+        # Two probes, both overshoot, neither at crf_max → jump to crf_max.
+        assert self._next([CrfPoint(20, 6000), CrfPoint(36, 5000)]) == 57
+
+    def test_all_overshoot_at_ceiling_returns_none(self):
+        # Even crf_max overshoots → nothing higher to probe.
+        nxt = self._next([CrfPoint(36, 5000), CrfPoint(57, 3000)])
+        assert nxt is None
+
+    def test_all_undershoot_at_floor_returns_none(self):
+        # Even crf_min undershoots → nothing lower to probe.
+        nxt = self._next([CrfPoint(36, 2000), CrfPoint(15, 2100)])
+        assert nxt is None
+
+    def test_target_is_centre_of_confident_window(self):
+        # With confident window [2000, 3000] the target is 2500, so a 2400
+        # probe undershoots (jump to floor) even though 2400 would overshoot
+        # the [2300, 2400] target used elsewhere.
+        nxt = smart_search_next(
+            [CrfPoint(36, 2400)], 15, 57, 2050, 2450, -1, 2000, 3000,
+        )
+        assert nxt == 15
+
+
 class TestFindOptimalCrf:
     """Outer-loop integration: window checks, ceiling, floor, duplicate nudge."""
 
@@ -722,6 +787,23 @@ class TestFindOptimalCrf:
         assert not seed_tmp.exists()
         seed_tmp.unlink(missing_ok=True)
         winner_tmp.unlink(missing_ok=True)
+
+    @mock.patch("reencode_av1.search._evaluate_crf_sample")
+    def test_smart_method_converges(self, mock_eval):
+        # Default method is smart search; verify it lands inside the window
+        # against a log-linear bitrate model.
+        def fake_encode(inp, crf, *a, **kw):
+            return int(10000 * math.exp(-0.05 * crf)), None
+
+        mock_eval.side_effect = fake_encode
+        windows = self._make_windows()
+
+        result = find_optimal_crf(
+            Path("test.mp4"), windows, [], "128k", 3, 128,
+            max_iterations=15, crf_min=1, crf_max=57,
+            crf_ceiling_fallback=48,
+        )
+        assert windows.sample_lo <= result.estimated_bitrate <= windows.sample_hi
 
     @mock.patch("reencode_av1.search._evaluate_crf_sample")
     def test_interpolation_method_converges(self, mock_eval):
@@ -940,7 +1022,7 @@ class TestBuildParser:
         assert args.target_bitrate == 2500
         assert args.preset == 3
         assert args.dry_run is False
-        assert args.interpolate is False
+        assert args.search_method == "smart"
         assert args.precise is False
 
     def test_custom_values(self):
@@ -949,12 +1031,22 @@ class TestBuildParser:
             "--target-bitrate", "2000",
             "--preset", "6",
             "--dry-run",
-            "--interpolate",
+            "--search-method", "interpolation",
         ])
         assert args.target_bitrate == 2000
         assert args.preset == 6
         assert args.dry_run is True
-        assert args.interpolate is True
+        assert args.search_method == "interpolation"
+
+    def test_search_method_binary(self):
+        parser = build_parser()
+        args = parser.parse_args(["--search-method", "binary"])
+        assert args.search_method == "binary"
+
+    def test_search_method_rejects_unknown(self):
+        parser = build_parser()
+        with pytest.raises(SystemExit):
+            parser.parse_args(["--search-method", "bogus"])
 
     def test_default_directory_is_none(self):
         parser = build_parser()
@@ -991,7 +1083,7 @@ class TestProcessFile:
             "segment_duration": 3.0,
             "short_video_threshold": 90.0,
             "audio_bitrate": 0,
-            "interpolate": False,
+            "search_method": "smart",
             "precise": False,
             "dry_run": False,
             "max_iterations": 15,

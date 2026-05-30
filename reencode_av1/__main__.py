@@ -17,6 +17,7 @@ from .search import (
     binary_search_next,
     find_optimal_crf,
     interpolation_next,
+    smart_search_next,
 )
 
 log = logging.getLogger("reencode_av1")
@@ -37,16 +38,17 @@ def build_parser() -> argparse.ArgumentParser:
         formatter_class=argparse.RawDescriptionHelpFormatter,
         epilog="""\
 examples:
-  python -m reencode_av1                              # current directory
-  python -m reencode_av1 /path/to/videos              # specific directory
-  python -m reencode_av1 --target-bitrate 2000        # lower target
-  python -m reencode_av1 --dry-run                    # preview only
-  python -m reencode_av1 --interpolate                # use interpolation
-  python -m reencode_av1 --precise                    # full-video search if out of range
-  python -m reencode_av1 --min-encode-bitrate 1000    # skip files already under 1000 kbps
-  python -m reencode_av1 --min-encode-bitrate 0       # always encode regardless of bitrate
-  python -m reencode_av1 --max-crf 55                 # tighter quality floor
-  python -m reencode_av1 --crf-ceiling-fallback 52    # specific fallback CRF when max-crf exceeded
+  python -m reencode_av1                               # current directory
+  python -m reencode_av1 /path/to/videos               # specific directory
+  python -m reencode_av1 --target-bitrate 2000         # lower target
+  python -m reencode_av1 --dry-run                     # preview only
+  python -m reencode_av1 --search-method binary        # use pure binary search
+  python -m reencode_av1 --search-method interpolation # use log-linear interpolation
+  python -m reencode_av1 --precise                     # full-video search if out of range
+  python -m reencode_av1 --min-encode-bitrate 1000     # skip files already under 1000 kbps
+  python -m reencode_av1 --min-encode-bitrate 0        # always encode regardless of bitrate
+  python -m reencode_av1 --max-crf 55                  # tighter quality floor
+  python -m reencode_av1 --crf-ceiling-fallback 52     # specific fallback CRF when max-crf exceeded
 """,
     )
 
@@ -122,8 +124,12 @@ examples:
         help="SVT-AV1 preset 0-13 (default: 3)",
     )
     p.add_argument(
-        "--interpolate", action="store_true",
-        help="Use log-linear CRF interpolation instead of pure binary search",
+        "--search-method", choices=("smart", "interpolation", "binary"),
+        default="smart",
+        help=(
+            "CRF search strategy: 'smart' (default, bracket-then-interpolate), "
+            "'interpolation' (log-linear), or 'binary' (pure binary search)"
+        ),
     )
     p.add_argument(
         "--precise", action="store_true",
@@ -383,8 +389,13 @@ def process_file(
             info.duration_sec, args.short_video_threshold,
         )
 
-    # Choose search method
-    search_method = interpolation_next if args.interpolate else binary_search_next
+    # Choose search method (smart search is the default)
+    search_method = {
+        "smart": smart_search_next,
+        "interpolation": interpolation_next,
+        "binary": binary_search_next,
+    }[args.search_method]
+    search_label = f" ({args.search_method})"
 
     # Compute segment offsets for multi-segment sampling
     offsets: list[float] | None = None
@@ -394,7 +405,7 @@ def process_file(
         )
         log.debug("  Segment offsets: %s", offsets)
 
-    log.info("  Starting CRF search%s...", " (interpolation)" if args.interpolate else "")
+    log.info("  Starting CRF search%s...", search_label)
 
     # Track temp files for cleanup on exceptions
     temp_files: list[Path] = []

@@ -7,9 +7,10 @@ search method.  Each search method receives the full history of measured
 ``CrfPoint`` results plus the bounds and target windows, and returns
 either an integer CRF to probe next, or ``None`` to stop searching.
 
-Two search methods are provided: :func:`binary_search_next` and
-:func:`interpolation_next`.  Adding a new strategy is a matter of writing
-another function with the same signature.
+Three search methods are provided: :func:`smart_search_next` (the
+default), :func:`binary_search_next` and :func:`interpolation_next`.
+Adding a new strategy is a matter of writing another function with the
+same signature.
 """
 
 from __future__ import annotations
@@ -51,8 +52,13 @@ class CrfResult:
 
 
 # A stateless search method.  Returns the next CRF to probe, or None to stop.
+# Call signature (all positional):
+#   (history, crf_min, crf_max, accept_lo, accept_hi, seed_crf,
+#    confident_lo, confident_hi)
+# The trailing confident-window bounds are used only by smart_search_next;
+# the other methods accept and ignore them.
 SearchMethod = Callable[
-    [list[CrfPoint], int, int, int, int, int],
+    [list[CrfPoint], int, int, int, int, int, int, int],
     "int | None",
 ]
 
@@ -188,8 +194,13 @@ def binary_search_next(
     accept_lo: int,
     accept_hi: int,
     seed_crf: int = -1,
+    confident_lo: int = 0,
+    confident_hi: int = 0,
 ) -> int | None:
     """Choose the next CRF via binary search over proven bounds.
+
+    The ``confident_lo``/``confident_hi`` bounds are part of the shared
+    :data:`SearchMethod` signature but are not used by this method.
 
     Derives the current ``[lo, hi]`` range from the history:
       * The lowest CRF whose bitrate overshoots ``accept_hi`` becomes a
@@ -234,6 +245,8 @@ def interpolation_next(
     accept_lo: int,
     accept_hi: int,
     seed_crf: int = -1,
+    confident_lo: int = 0,
+    confident_hi: int = 0,
 ) -> int | None:
     """Choose the next CRF via log-linear interpolation.
 
@@ -242,6 +255,9 @@ def interpolation_next(
     points or extrapolates when all points are on one side.  Returns
     ``None`` when no useful integer CRF remains to probe (e.g. the
     bracketing points are consecutive integers).
+
+    The ``confident_lo``/``confident_hi`` bounds are part of the shared
+    :data:`SearchMethod` signature but are not used by this method.
     """
     target_bitrate = accept_hi
 
@@ -307,6 +323,69 @@ def interpolation_next(
     return None
 
 
+def smart_search_next(
+    history: list[CrfPoint],
+    crf_min: int,
+    crf_max: int,
+    accept_lo: int,
+    accept_hi: int,
+    seed_crf: int = -1,
+    confident_lo: int = 0,
+    confident_hi: int = 0,
+) -> int | None:
+    """Choose the next CRF via bracket-then-interpolate (the default method).
+
+    Assumes monotonicity (bitrate decreases as CRF increases) and aims at
+    the centre of the confident window — ``(confident_lo + confident_hi)
+    // 2`` — which is the same convergence zone the outer loop checks
+    against (``sample_confident_*`` for segment sampling,
+    ``final_accept_*`` for full-video encodes).
+
+    The strategy:
+
+      * First probe (empty history): the midpoint of ``[crf_min, crf_max]``.
+      * One-sided history (every probe overshoots, or every probe
+        undershoots, the target): jump straight to the opposite bound —
+        ``crf_max`` when overshooting (CRF too small), ``crf_min`` when
+        undershooting (CRF too large) — to establish a bracket the way a
+        binary search would.  Returns ``None`` once the relevant bound has
+        already been probed (no untried CRF can improve on the bracket).
+      * Bracketed history (points on both sides of the target):
+        log-linear interpolation between the closest pair straddling the
+        target, clamped to lie strictly between them.  Returns ``None``
+        when that pair is already consecutive (no integer CRF in between).
+    """
+    target = (confident_lo + confident_hi) // 2
+
+    if not history:
+        return (crf_min + crf_max) // 2
+
+    over = [p for p in history if p.bitrate > target]   # bitrate too high → CRF too small
+    under = [p for p in history if p.bitrate <= target]  # bitrate too low → CRF too large
+
+    if over and under:
+        # The pair tightest around the target: smallest overshoot (highest
+        # CRF on the over side) and smallest undershoot (lowest CRF on the
+        # under side).  By monotonicity lo_pt.crf < hi_pt.crf.
+        lo_pt = min(over, key=lambda p: p.bitrate)
+        hi_pt = max(under, key=lambda p: p.bitrate)
+        if hi_pt.crf - lo_pt.crf <= 1:
+            return None  # consecutive integers — nothing left to probe between them
+        crf = interpolate_crf(lo_pt, hi_pt, target, crf_min, crf_max)
+        return max(lo_pt.crf + 1, min(hi_pt.crf - 1, crf))
+
+    if over:
+        # Everything overshoots → need a higher CRF; jump to the ceiling.
+        if max(p.crf for p in over) >= crf_max:
+            return None
+        return crf_max
+
+    # Everything undershoots → need a lower CRF; jump to the floor.
+    if min(p.crf for p in under) <= crf_min:
+        return None
+    return crf_min
+
+
 # ── Outer loop ──────────────────────────────────────────────────────────────
 
 def find_optimal_crf(
@@ -321,7 +400,7 @@ def find_optimal_crf(
     crf_max: int,
     crf_ceiling_fallback: int,
     *,
-    search_method: SearchMethod = binary_search_next,
+    search_method: SearchMethod = smart_search_next,
     offsets: list[float] | None = None,
     seg_duration: float = 5.0,
     full_encode: bool = False,
@@ -406,6 +485,7 @@ def find_optimal_crf(
     for iteration in range(1, max_iterations + 1):
         candidate = search_method(
             history, crf_min, crf_max, accept_lo, accept_hi, seed_crf,
+            confident_lo, confident_hi,
         )
         if candidate is None:
             log.info("  Search method has no further probes; stopping")
