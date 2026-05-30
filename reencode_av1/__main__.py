@@ -12,7 +12,11 @@ from pathlib import Path
 from .encode import encode_full
 from .filters import build_extra_args, compute_segment_offsets, compute_windows
 from .probe import VideoInfo, get_video_bitrate, get_video_info
-from .search import find_optimal_crf, find_optimal_crf_interpolated
+from .search import (
+    binary_search_next,
+    find_optimal_crf,
+    interpolation_next,
+)
 
 log = logging.getLogger("reencode_av1")
 
@@ -40,8 +44,8 @@ examples:
   python -m reencode_av1 --precise                    # full-video search if out of range
   python -m reencode_av1 --min-encode-bitrate 1000    # skip files already under 1000 kbps
   python -m reencode_av1 --min-encode-bitrate 0       # always encode regardless of bitrate
-  python -m reencode_av1 --max-acceptable-crf 55      # tighter quality floor
-  python -m reencode_av1 --crf-ceiling-fallback 52    # specific fallback CRF when acceptable CRF exceeded
+  python -m reencode_av1 --max-crf 55                 # tighter quality floor
+  python -m reencode_av1 --crf-ceiling-fallback 52    # specific fallback CRF when max-crf exceeded
 """,
     )
 
@@ -74,22 +78,18 @@ examples:
         help="Minimum CRF value (default: 15)",
     )
     p.add_argument(
-        "--crf-max", type=int, default=None,
-        help="Maximum CRF value (default: max-acceptable-crf + 1)",
-    )
-    p.add_argument(
-        "--max-acceptable-crf", type=int, default=59,
+        "--max-crf", type=int, default=57,
         help=(
-            "Maximum acceptable CRF value for the search. If the search selects a CRF "
-            "above this value the target bitrate is considered unachievable at acceptable "
-            "quality. The video is then encoded with --crf-ceiling-fallback instead (default: 59)."
+            "Maximum CRF value for the search. If the bitrate at this CRF is still "
+            "above the target, the video is encoded with --crf-ceiling-fallback instead "
+            "(default: 57)."
         ),
     )
     p.add_argument(
         "--crf-ceiling-fallback", type=int, default=None,
         help=(
-            "CRF to use when the search exceeds --max-acceptable-crf. "
-            "Defaults to --max-acceptable-crf when not set, but 48 is recommended."
+            "CRF to use when the search reaches --max-crf and the bitrate is still "
+            "above the target. Defaults to --max-crf when not set, but 48 is recommended."
         ),
     )
     p.add_argument(
@@ -199,27 +199,17 @@ def validate_args(args: argparse.Namespace) -> None:
             f"Increase --target-bitrate-window or decrease --sample-bitrate-window-buffer."
         )
 
-    # Resolve default for crf-max
-    if args.crf_max is None:
-        args.crf_max = min(args.max_acceptable_crf + 1, 63)
-
-    if not (0 <= args.crf_min < args.crf_max <= 63):
-        errors.append("--crf-min and --crf-max must satisfy 0 <= min < max <= 63")
-
-    if not (args.crf_min <= args.max_acceptable_crf <= args.crf_max):
-        errors.append(
-            f"--max-acceptable-crf ({args.max_acceptable_crf}) must be within [--crf-min, --crf-max] "
-            f"([{args.crf_min}, {args.crf_max}])"
-        )
+    if not (0 <= args.crf_min < args.max_crf <= 63):
+        errors.append("--crf-min and --max-crf must satisfy 0 <= min < max <= 63")
 
     # Resolve default for crf-ceiling-fallback
     if args.crf_ceiling_fallback is None:
-        args.crf_ceiling_fallback = args.max_acceptable_crf
+        args.crf_ceiling_fallback = args.max_crf
 
-    if not (args.crf_min <= args.crf_ceiling_fallback <= args.crf_max):
+    if not (args.crf_min <= args.crf_ceiling_fallback <= args.max_crf):
         errors.append(
             f"--crf-ceiling-fallback ({args.crf_ceiling_fallback}) must be within "
-            f"[--crf-min, --crf-max] ([{args.crf_min}, {args.crf_max}])"
+            f"[--crf-min, --max-crf] ([{args.crf_min}, {args.max_crf}])"
         )
 
     if not (0 <= args.preset <= 13):
@@ -392,8 +382,8 @@ def process_file(
             info.duration_sec, args.short_video_threshold,
         )
 
-    # Choose search function
-    search_fn = find_optimal_crf_interpolated if args.interpolate else find_optimal_crf
+    # Choose search method
+    search_method = interpolation_next if args.interpolate else binary_search_next
 
     # Compute segment offsets for multi-segment sampling
     offsets: list[float] | None = None
@@ -409,36 +399,27 @@ def process_file(
     temp_files: list[Path] = []
 
     try:
-        result = search_fn(
+        result = find_optimal_crf(
             input_path, windows, extra_args, audio_str,
             args.preset, audio_kbps, args.max_iterations,
-            args.crf_min, args.crf_max,
+            args.crf_min, args.max_crf, args.crf_ceiling_fallback,
+            search_method=search_method,
             offsets=offsets, seg_duration=args.segment_duration,
-            full_encode=is_short_video, max_acceptable_crf=args.max_acceptable_crf,
+            full_encode=is_short_video,
             has_audio=has_audio,
         )
         if result.temp_file:
             temp_files.append(result.temp_file)
 
-        # ── max-acceptable-crf ceiling check ─────────────────────────
-        crf_ceiling_triggered = False
-        if result.crf > args.max_acceptable_crf:
+        # ── max-crf ceiling check ────────────────────────────────────
+        crf_ceiling_triggered: bool | str = False
+        if result.crf_ceiling_used:
             log.warning(
-                "  Search selected CRF=%d which exceeds --max-acceptable-crf (%d). "
-                "Ignoring target bitrate and encoding with --crf-ceiling-fallback=%d.",
-                result.crf, args.max_acceptable_crf, args.crf_ceiling_fallback,
+                "  Search reached --max-crf (%d) with bitrate still above target. "
+                "Encoding with --crf-ceiling-fallback=%d.",
+                args.max_crf, args.crf_ceiling_fallback,
             )
             crf_ceiling_triggered = True
-
-            # Discard the temp file from the search (wrong CRF)
-            if result.temp_file and result.temp_file.exists():
-                result.temp_file.unlink(missing_ok=True)
-                result.temp_file = None
-
-            # Override the CRF; force a fresh full encode below
-            from dataclasses import replace as _dc_replace
-            result = _dc_replace(result, crf=args.crf_ceiling_fallback, temp_file=None)
-
             if info.bitrate_kbps > 0 and info.bitrate_kbps < 2 * args.target_bitrate:
                 log.warning(
                     "  Original bitrate (%d kbps) is less than double the target (%d kbps). "
@@ -516,24 +497,48 @@ def process_file(
         # ── Precise mode ─────────────────────────────────────────────
         if args.precise and out_of_range and not is_short_video and not crf_ceiling_triggered:
             log.info("  --precise: final bitrate out of range, starting full-video search...")
-            output_path.unlink(missing_ok=True)
-
-            precise_search_fn = (
-                find_optimal_crf_interpolated if args.interpolate else find_optimal_crf
+            # Preserve the full encode we just made at result.crf as a reusable
+            # seed instead of deleting it: if the precise search settles on that
+            # CRF, this file becomes the output with no re-encode. Moved out of
+            # output_path (same directory, so it's a cheap rename) so output_path
+            # starts empty for the search's chosen winner.
+            seed_temp = output_path.with_name(
+                f"{output_path.stem}.precise-seed{output_path.suffix}"
             )
-            precise_result = precise_search_fn(
+            output_path.replace(seed_temp)
+            temp_files.append(seed_temp)
+
+            precise_result = find_optimal_crf(
                 input_path, windows, extra_args, audio_str,
                 args.preset, audio_kbps, args.max_iterations,
-                args.crf_min, args.crf_max,
+                args.crf_min, args.max_crf, args.crf_ceiling_fallback,
+                search_method=search_method,
                 full_encode=True,
                 seed_crf=result.crf,
                 seed_known=[(result.crf, out_bitrate)],
-                max_acceptable_crf=args.max_acceptable_crf,
+                seed_temp_files={result.crf: seed_temp},
+                has_audio=has_audio,
             )
             if precise_result.temp_file:
                 temp_files.append(precise_result.temp_file)
 
-            if precise_result.temp_file and precise_result.temp_file.exists():
+            if precise_result.crf_ceiling_used:
+                log.warning(
+                    "  Precise search also reached --max-crf; encoding with "
+                    "--crf-ceiling-fallback=%d",
+                    args.crf_ceiling_fallback,
+                )
+                exit_code = encode_full(
+                    input_path, output_path, args.crf_ceiling_fallback, extra_args,
+                    audio_str, args.preset, info.duration_sec, has_audio=has_audio,
+                )
+                if exit_code != 0 or not output_path.exists():
+                    log.error("  FAILED: precise crf-ceiling encode did not produce output")
+                    return "failed"
+                crf_ceiling_triggered = True
+                if info.bitrate_kbps > 0 and info.bitrate_kbps < 2 * args.target_bitrate:
+                    crf_ceiling_triggered = "low_original"
+            elif precise_result.temp_file and precise_result.temp_file.exists():
                 shutil.move(str(precise_result.temp_file), str(output_path))
                 final_bitrate = get_video_bitrate(output_path, audio_kbps)
                 final_size_mb = output_path.stat().st_size / (1024 * 1024)
@@ -639,9 +644,7 @@ def main() -> None:
     log.info("Allowed window: %d kbps", args.allowed_bitrate_window)
     log.info("Target window: %d kbps", args.target_bitrate_window)
     log.info("Sample buffer: %d kbps", args.sample_bitrate_window_buffer)
-    log.info("Max CRF: %d", args.crf_max)
-    log.info("Min CRF: %d", args.crf_min)
-    log.info("Max acceptable CRF: %d | CRF ceiling fallback: %d", args.max_acceptable_crf, args.crf_ceiling_fallback)
+    log.info("Min CRF: %d | Max CRF: %d | CRF ceiling fallback: %d", args.crf_min, args.max_crf, args.crf_ceiling_fallback)
 
     windows = compute_windows(
         args.target_bitrate,

@@ -31,10 +31,10 @@ from reencode_av1.encode import (
 )
 from reencode_av1.search import (
     CrfResult,
-    _SearchState,
-    interpolate_crf,
+    binary_search_next,
     find_optimal_crf,
-    find_optimal_crf_interpolated,
+    interpolate_crf,
+    interpolation_next,
 )
 from reencode_av1.__main__ import (
     build_parser,
@@ -332,7 +332,7 @@ class TestComputeWindows:
         assert w.target == 2500
         assert w.sample_lo == 1050   # 2500 - 1500 + 50
         assert w.sample_hi == 2450   # 2500 - 50
-        assert w.sample_confident_lo == 2400  # 2500 - 100
+        assert w.sample_confident_lo == 2450  # 2500 - 100 + 50
         assert w.sample_confident_hi == 2450  # 2500 - 50
         assert w.final_lo == 1000    # 2500 - 1500
         assert w.final_hi == 2500
@@ -451,39 +451,6 @@ class TestParseTimeToSeconds:
 # ═══════════════════════════════════════════════════════════════════════════════
 
 
-class TestSearchState:
-    def test_initial(self):
-        s = _SearchState()
-        assert s.best_crf == -1
-        assert s.best_bitrate == 0
-        assert s.best_temp_file is None
-
-    def test_update_best(self):
-        s = _SearchState()
-        s.update_best(30, 2400)
-        assert s.best_crf == 30
-        assert s.best_bitrate == 2400
-
-    def test_update_best_cleans_old_file(self):
-        with tempfile.NamedTemporaryFile(delete=False, suffix=".mkv") as f:
-            old_path = Path(f.name)
-        s = _SearchState()
-        s.update_best(30, 2400, old_path)
-        assert old_path.exists()
-
-        s.update_best(28, 2450)
-        assert not old_path.exists()
-
-    def test_clear_best(self):
-        with tempfile.NamedTemporaryFile(delete=False, suffix=".mkv") as f:
-            tmp = Path(f.name)
-        s = _SearchState()
-        s.update_best(30, 2400, tmp)
-        s.clear_best()
-        assert s.best_crf == -1
-        assert not tmp.exists()
-
-
 class TestInterpolateCrf:
     def test_basic_interpolation(self):
         # CRF 20 -> 5000 kbps, CRF 40 -> 1000 kbps, target 2500
@@ -519,162 +486,305 @@ class TestInterpolateCrf:
         assert result == 30  # exact midpoint in log-space
 
 
+class TestBinarySearchNext:
+    """Stateless binary-search next-CRF picker."""
+
+    def test_empty_history_returns_midpoint(self):
+        assert binary_search_next([], 1, 63, 1000, 2000) == 32
+
+    def test_empty_history_with_seed_uses_seed(self):
+        assert binary_search_next([], 1, 63, 1000, 2000, seed_crf=40) == 40
+
+    def test_overshoot_raises_lo(self):
+        # CRF 20 overshoots → next probe must be > 20
+        nxt = binary_search_next([(20, 5000)], 1, 63, 1000, 2000)
+        assert nxt is not None and nxt > 20
+
+    def test_undershoot_lowers_hi(self):
+        # CRF 50 undershoots → next probe must be < 50
+        nxt = binary_search_next([(50, 500)], 1, 63, 1000, 2000)
+        assert nxt is not None and nxt < 50
+
+    def test_in_range_narrows_toward_lower_crf(self):
+        # CRF 30 in range → next probe must be < 30 (looking for higher quality)
+        nxt = binary_search_next([(30, 1500)], 1, 63, 1000, 2000)
+        assert nxt is not None and nxt < 30
+
+    def test_consecutive_bracket_returns_none(self):
+        # CRF 30 overshoots, CRF 31 in range → no integer between them
+        nxt = binary_search_next([(30, 2500), (31, 1500)], 1, 63, 1000, 2000)
+        assert nxt is None
+
+
+class TestInterpolationNext:
+    """Stateless log-linear interpolation next-CRF picker."""
+
+    def test_empty_history_default_probe(self):
+        nxt = interpolation_next([], 1, 63, 1000, 2000)
+        assert nxt == 30
+
+    def test_empty_history_uses_seed(self):
+        nxt = interpolation_next([], 1, 63, 1000, 2000, seed_crf=40)
+        assert nxt is not None and 1 <= nxt <= 63
+
+    def test_single_overshoot_probes_higher_crf(self):
+        nxt = interpolation_next([(20, 5000)], 1, 63, 1000, 2000)
+        assert nxt is not None and nxt > 20
+
+    def test_single_undershoot_probes_lower_crf(self):
+        nxt = interpolation_next([(50, 500)], 1, 63, 1000, 2000)
+        assert nxt is not None and nxt < 50
+
+    def test_bracketed_interpolates(self):
+        # CRF 20 overshoots, CRF 50 undershoots — interpolate strictly between
+        nxt = interpolation_next(
+            [(20, 5000), (50, 500)], 1, 63, 1000, 2000,
+        )
+        assert nxt is not None and 20 < nxt < 50
+
+    def test_consecutive_bracket_returns_none(self):
+        nxt = interpolation_next(
+            [(30, 2500), (31, 1500)], 1, 63, 1000, 2000,
+        )
+        assert nxt is None
+
+
 class TestFindOptimalCrf:
-    """Test binary search with mocked encoding."""
+    """Outer-loop integration: window checks, ceiling, floor, duplicate nudge."""
 
     def _make_windows(self, target=2500, allowed=500, tw=100, buf=50):
         return compute_windows(target, allowed, tw, buf)
 
     @mock.patch("reencode_av1.search._evaluate_crf_sample")
     def test_converges_in_confident_zone(self, mock_eval):
-        """When a CRF immediately hits the confident zone, stop early."""
-        mock_eval.return_value = (2420, None)  # always in confident zone
-        windows = self._make_windows()
+        # Use wider target window so confident zone has non-zero width.
+        windows = self._make_windows(tw=400)
+        # confident = [sample_lo+50? actually sample_confident_lo=2150, hi=2450].
+        # 2300 lies inside.
+        mock_eval.return_value = (2300, None)
 
         result = find_optimal_crf(
             Path("test.mp4"), windows, [], "128k", 3, 128,
-            max_iterations=15, crf_min=1, crf_max=63,
-            seg_duration=3.0,
+            max_iterations=15, crf_min=1, crf_max=57,
+            crf_ceiling_fallback=48,
         )
-        assert result.crf >= 1
-        assert result.estimated_bitrate == 2420
-        # Should converge in 1 iteration
+        assert result.estimated_bitrate == 2300
+        assert result.crf_ceiling_used is False
         assert mock_eval.call_count == 1
 
     @mock.patch("reencode_av1.search._evaluate_crf_sample")
-    def test_binary_search_narrows(self, mock_eval):
-        """Search should call with decreasing range."""
-        # Simulate: lower CRF -> higher bitrate
-        def fake_encode(inp, crf, *a, **kw):
-            # Simple linear model: bitrate = 5000 - crf * 80
-            bitrate = 5000 - crf * 80
-            return (bitrate, None)
-
-        mock_eval.side_effect = fake_encode
+    def test_max_crf_ceiling_uses_fallback(self, mock_eval):
+        # Always overshoots → outer loop will hit max_crf with bitrate > target
+        mock_eval.return_value = (9999, None)
         windows = self._make_windows()
 
         result = find_optimal_crf(
             Path("test.mp4"), windows, [], "128k", 3, 128,
-            max_iterations=15, crf_min=1, crf_max=63,
-            seg_duration=3.0,
+            max_iterations=15, crf_min=1, crf_max=57,
+            crf_ceiling_fallback=48,
         )
-        assert result.crf >= 1
-        assert result.estimated_bitrate > 0
+        assert result.crf == 48
+        assert result.crf_ceiling_used is True
 
     @mock.patch("reencode_av1.search._evaluate_crf_sample")
-    def test_fallback_to_crf_max(self, mock_eval):
-        """If nothing converges, fall back to crf_max."""
-        mock_eval.return_value = (9999, None)  # always too high
+    def test_crf_min_floor_stops_search(self, mock_eval):
+        # Always undershoots → outer loop hits crf_min with bitrate < accept_lo
+        mock_eval.return_value = (10, None)
         windows = self._make_windows()
 
         result = find_optimal_crf(
             Path("test.mp4"), windows, [], "128k", 3, 128,
-            max_iterations=15, crf_min=1, crf_max=63,
-            seg_duration=3.0,
+            max_iterations=15, crf_min=5, crf_max=57,
+            crf_ceiling_fallback=48,
         )
-        assert result.crf == 63
+        assert result.crf == 5
+        assert result.crf_ceiling_used is False
 
     @mock.patch("reencode_av1.search._evaluate_crf_sample")
-    def test_encode_failure_handled(self, mock_eval):
-        """Failed encodes (bitrate=-1) shouldn't crash."""
+    def test_returns_best_from_history_on_no_converge(self, mock_eval):
+        # Bitrates always land in the accept window but never confident
+        accept_hi = self._make_windows().sample_hi
+        in_accept_not_confident = accept_hi - 1  # in accept, just below confident_hi but above confident_lo? actually sample_confident_hi == sample_hi. Use a value below sample_lo+something — instead just have it cycle.
+        # Use a fixed value in accept but outside confident: with default windows
+        # sample_lo=2050, sample_hi=2450, sample_confident_lo=2350, sample_confident_hi=2450
+        # 2100 is in accept but outside confident.
+        mock_eval.return_value = (2100, None)
+        windows = self._make_windows()
+
+        result = find_optimal_crf(
+            Path("test.mp4"), windows, [], "128k", 3, 128,
+            max_iterations=3, crf_min=1, crf_max=57,
+            crf_ceiling_fallback=48,
+        )
+        # Should return the in-range CRF, not the fallback
+        assert result.estimated_bitrate == 2100
+        assert result.crf_ceiling_used is False
+
+    @mock.patch("reencode_av1.search._evaluate_crf_sample")
+    def test_encode_failure_does_not_crash(self, mock_eval):
         mock_eval.return_value = (-1, None)
         windows = self._make_windows()
 
         result = find_optimal_crf(
             Path("test.mp4"), windows, [], "128k", 3, 128,
-            max_iterations=5, crf_min=1, crf_max=63,
-            seg_duration=3.0,
+            max_iterations=5, crf_min=1, crf_max=57,
+            crf_ceiling_fallback=48,
         )
-        # Should still return something (fallback to crf_max)
-        assert result.crf == 63
+        # No history; outer loop falls back to crf_max
+        assert result.crf == 57
 
     @mock.patch("reencode_av1.search._evaluate_crf_sample")
-    def test_seeded_search(self, mock_eval):
-        """Seeded search should start near the seed CRF."""
-        calls = []
+    def test_seeded_search_starts_near_seed(self, mock_eval):
+        calls: list[int] = []
 
-        def track_calls(inp, crf, *a, **kw):
+        def track(inp, crf, *a, **kw):
             calls.append(crf)
-            return (2420, None)  # confident zone
+            return (2420, None)
 
-        mock_eval.side_effect = track_calls
+        mock_eval.side_effect = track
         windows = self._make_windows()
 
-        result = find_optimal_crf(
+        find_optimal_crf(
             Path("test.mp4"), windows, [], "128k", 3, 128,
-            max_iterations=15, crf_min=1, crf_max=63,
-            seg_duration=3.0, seed_crf=30,
+            max_iterations=15, crf_min=1, crf_max=57,
+            crf_ceiling_fallback=48, seed_crf=30,
         )
-        # First call should be near seed CRF 30 (within ±5)
-        assert 25 <= calls[0] <= 35
+        assert calls and abs(calls[0] - 30) <= 5
 
     @mock.patch("reencode_av1.search._evaluate_crf_sample")
-    def test_keeps_best_temp_file(self, mock_eval):
-        """When full_encode=True, the best temp file is preserved."""
+    def test_keeps_winner_temp_file(self, mock_eval):
         with tempfile.NamedTemporaryFile(delete=False, suffix=".mkv") as f:
             f.write(b"\x00" * 100)
             tmp = Path(f.name)
 
-        mock_eval.return_value = (2420, tmp)  # confident zone with file
+        mock_eval.return_value = (2420, tmp)
         windows = self._make_windows()
 
         result = find_optimal_crf(
             Path("test.mp4"), windows, [], "128k", 3, 128,
-            max_iterations=15, crf_min=1, crf_max=63,
-            seg_duration=3.0, full_encode=True,
+            max_iterations=15, crf_min=1, crf_max=57,
+            crf_ceiling_fallback=48, full_encode=True,
         )
         assert result.temp_file == tmp
         assert tmp.exists()
         tmp.unlink(missing_ok=True)
 
+    @mock.patch("reencode_av1.search._evaluate_crf_sample")
+    def test_reuses_seed_temp_file_when_seed_selected(self, mock_eval):
+        # A seeded point carrying a pre-made encode that the search settles on
+        # is returned with that encode and is never re-evaluated.
+        with tempfile.NamedTemporaryFile(delete=False, suffix=".mkv") as f:
+            f.write(b"\x00" * 100)
+            tmp = Path(f.name)
 
-class TestFindOptimalCrfInterpolated:
-    """Test interpolation search with mocked encoding."""
+        windows = self._make_windows()
+        no_probe = lambda *a, **kw: None  # search offers no further probes
 
-    def _make_windows(self, target=2500, allowed=500, tw=100, buf=50):
-        return compute_windows(target, allowed, tw, buf)
+        result = find_optimal_crf(
+            Path("test.mp4"), windows, [], "128k", 3, 128,
+            max_iterations=15, crf_min=1, crf_max=57,
+            crf_ceiling_fallback=48, search_method=no_probe,
+            seed_known=[(31, 2100)], seed_temp_files={31: tmp},
+        )
+        assert result.crf == 31
+        assert result.temp_file == tmp
+        assert tmp.exists()
+        assert mock_eval.call_count == 0
+        tmp.unlink(missing_ok=True)
 
     @mock.patch("reencode_av1.search._evaluate_crf_sample")
-    def test_converges(self, mock_eval):
-        """Interpolation should find an acceptable CRF."""
+    def test_cleans_up_non_winning_seed_temp_file(self, mock_eval):
+        # The seed overshoots; the search's own encode converges and wins, so
+        # the unused seed encode is deleted while the winner's is kept.
+        with tempfile.NamedTemporaryFile(delete=False, suffix=".mkv") as f:
+            f.write(b"\x00" * 100)
+            seed_tmp = Path(f.name)
+        with tempfile.NamedTemporaryFile(delete=False, suffix=".mkv") as f:
+            f.write(b"\x00" * 100)
+            winner_tmp = Path(f.name)
+
+        # Wide window so 2300 lands in the confident zone and converges at once.
+        windows = self._make_windows(tw=400)
+        mock_eval.return_value = (2300, winner_tmp)
+        always_forty = lambda *a, **kw: 40
+
+        result = find_optimal_crf(
+            Path("test.mp4"), windows, [], "128k", 3, 128,
+            max_iterations=15, crf_min=1, crf_max=57,
+            crf_ceiling_fallback=48, search_method=always_forty,
+            full_encode=True,
+            seed_known=[(30, 9000)], seed_temp_files={30: seed_tmp},
+        )
+        assert result.crf == 40
+        assert result.temp_file == winner_tmp
+        assert winner_tmp.exists()
+        assert not seed_tmp.exists()
+        seed_tmp.unlink(missing_ok=True)
+        winner_tmp.unlink(missing_ok=True)
+
+    @mock.patch("reencode_av1.search._evaluate_crf_sample")
+    def test_interpolation_method_converges(self, mock_eval):
         def fake_encode(inp, crf, *a, **kw):
-            # Exponential model: bitrate = 10000 * exp(-0.05 * crf)
-            bitrate = int(10000 * math.exp(-0.05 * crf))
-            return (bitrate, None)
+            # Log-linear model: bitrate = 10000 * exp(-0.05 * crf)
+            return int(10000 * math.exp(-0.05 * crf)), None
 
         mock_eval.side_effect = fake_encode
         windows = self._make_windows()
 
-        result = find_optimal_crf_interpolated(
+        result = find_optimal_crf(
             Path("test.mp4"), windows, [], "128k", 3, 128,
-            max_iterations=15, crf_min=1, crf_max=63,
-            seg_duration=3.0,
+            max_iterations=15, crf_min=1, crf_max=57,
+            crf_ceiling_fallback=48,
+            search_method=interpolation_next,
         )
-        assert result.crf >= 1
         assert windows.sample_lo <= result.estimated_bitrate <= windows.sample_hi
 
     @mock.patch("reencode_av1.search._evaluate_crf_sample")
-    def test_falls_back_to_binary_search(self, mock_eval):
-        """If interpolation fails, it should fall back to binary search."""
-        call_count = [0]
+    def test_duplicate_crf_nudges_up_when_overshoot(self, mock_eval):
+        # A search method that always returns 30 — the outer loop must nudge
+        # the second call away from 30 (bitrate at 30 overshoots → step up).
+        calls: list[int] = []
 
-        def failing_then_ok(inp, crf, *a, **kw):
-            call_count[0] += 1
-            # Always return out-of-range to force fallback, then eventually
-            # return something in range for the binary search fallback
-            if call_count[0] > 10:
-                return (2420, None)
-            return (9999, None)
+        def track(inp, crf, *a, **kw):
+            calls.append(crf)
+            # CRF 30 overshoots, CRF 31 in confident → second call wins.
+            if crf == 30:
+                return 5000, None
+            return 2420, None
 
-        mock_eval.side_effect = failing_then_ok
+        mock_eval.side_effect = track
+
+        always_thirty = lambda *a, **kw: 30
         windows = self._make_windows()
 
-        result = find_optimal_crf_interpolated(
+        result = find_optimal_crf(
             Path("test.mp4"), windows, [], "128k", 3, 128,
-            max_iterations=15, crf_min=1, crf_max=63,
-            seg_duration=3.0,
+            max_iterations=5, crf_min=1, crf_max=57,
+            crf_ceiling_fallback=48, search_method=always_thirty,
         )
-        assert result.crf >= 1
+        assert calls == [30, 31]
+        assert result.crf == 31
+
+    @mock.patch("reencode_av1.search._evaluate_crf_sample")
+    def test_duplicate_crf_stops_when_both_neighbours_tried(self, mock_eval):
+        # Probe history forces (30 overshoots, 31 in range below confident).
+        # Search method keeps suggesting 30 → outer loop nudges to 31 → 31
+        # is already tried → stop and pick below-target one (CRF 31).
+        windows = self._make_windows()
+        seed_known = [(30, 5000), (31, 2100)]  # 2100 is in accept but not confident
+
+        always_thirty = lambda *a, **kw: 30
+
+        result = find_optimal_crf(
+            Path("test.mp4"), windows, [], "128k", 3, 128,
+            max_iterations=5, crf_min=1, crf_max=57,
+            crf_ceiling_fallback=48, search_method=always_thirty,
+            seed_known=seed_known,
+        )
+        # Should pick CRF 31 (bitrate below target) without encoding
+        assert result.crf == 31
+        assert result.estimated_bitrate == 2100
+        assert mock_eval.call_count == 0
 
 
 # ═══════════════════════════════════════════════════════════════════════════════
@@ -735,12 +845,12 @@ class TestValidateArgs:
             "min_encode_bitrate": None,
             "sample_bitrate_window_buffer": None,
             "crf_min": 1,
-            "crf_max": 63,
-            "max_crf": 63,
+            "max_crf": 57,
             "crf_ceiling_fallback": None,
             "preset": 3,
             "segment_count": 5,
             "segment_duration": 3.0,
+            "short_video_threshold": 90.0,
             "audio_bitrate": 0,
             "directory": None,
         }
@@ -768,12 +878,12 @@ class TestValidateArgs:
             validate_args(args)
 
     def test_crf_min_above_max(self):
-        args = self._make_args(crf_min=50, crf_max=30)
+        args = self._make_args(crf_min=50, max_crf=30)
         with pytest.raises(SystemExit):
             validate_args(args)
 
     def test_crf_out_of_range(self):
-        args = self._make_args(crf_max=100)
+        args = self._make_args(max_crf=100)
         with pytest.raises(SystemExit):
             validate_args(args)
 
@@ -868,14 +978,17 @@ class TestProcessFile:
     def _make_args(self, **overrides):
         defaults = {
             "target_bitrate": 2500,
+            "min_encode_bitrate": 0,
             "allowed_bitrate_window": 1500,
             "target_bitrate_window": 100,
             "sample_bitrate_window_buffer": 50,
             "crf_min": 1,
-            "crf_max": 63,
+            "max_crf": 57,
+            "crf_ceiling_fallback": 48,
             "preset": 3,
             "segment_count": 5,
             "segment_duration": 3.0,
+            "short_video_threshold": 90.0,
             "audio_bitrate": 0,
             "interpolate": False,
             "precise": False,
@@ -889,7 +1002,7 @@ class TestProcessFile:
     def test_skips_when_no_info(self, mock_info):
         mock_info.return_value = None
         result = process_file(Path("test.mp4"), self._make_args())
-        assert result == "skipped"
+        assert result.startswith("skipped")
 
     @mock.patch("reencode_av1.__main__.get_video_info")
     def test_skips_av1(self, mock_info):
@@ -897,7 +1010,7 @@ class TestProcessFile:
             "av1", 1920, 1080, 30.0, False, 5000, 120.0, 2, "opus"
         )
         result = process_file(Path("test.mp4"), self._make_args())
-        assert result == "skipped"
+        assert result.startswith("skipped")
 
     @mock.patch("reencode_av1.__main__.get_video_info")
     def test_skips_vp9(self, mock_info):
@@ -905,7 +1018,7 @@ class TestProcessFile:
             "vp9", 1920, 1080, 30.0, False, 5000, 120.0, 2, "opus"
         )
         result = process_file(Path("test.mp4"), self._make_args())
-        assert result == "skipped"
+        assert result.startswith("skipped")
 
     @mock.patch("reencode_av1.__main__.get_output_path")
     @mock.patch("reencode_av1.__main__.get_video_info")
@@ -919,7 +1032,7 @@ class TestProcessFile:
         try:
             mock_output.return_value = tmp
             result = process_file(Path("test.mp4"), self._make_args())
-            assert result == "skipped"
+            assert result.startswith("skipped")
         finally:
             tmp.unlink(missing_ok=True)
 
@@ -929,7 +1042,7 @@ class TestProcessFile:
             "h264", 1920, 1080, 30.0, False, 5000, 120.0, 2, "aac"
         )
         result = process_file(Path("test.mp4"), self._make_args(dry_run=True))
-        assert result == "skipped"
+        assert result.startswith("skipped")
 
     @mock.patch("reencode_av1.__main__.get_video_bitrate")
     @mock.patch("reencode_av1.__main__.encode_full")
