@@ -13,6 +13,7 @@ from .encode import encode_full
 from .filters import build_extra_args, compute_segment_offsets, compute_windows
 from .probe import VideoInfo, get_video_bitrate, get_video_info
 from .search import (
+    CrfPoint,
     binary_search_next,
     find_optimal_crf,
     interpolation_next,
@@ -515,7 +516,7 @@ def process_file(
                 search_method=search_method,
                 full_encode=True,
                 seed_crf=result.crf,
-                seed_known=[(result.crf, out_bitrate)],
+                seed_known=[CrfPoint(result.crf, out_bitrate)],
                 seed_temp_files={result.crf: seed_temp},
                 has_audio=has_audio,
             )

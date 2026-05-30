@@ -4,7 +4,7 @@ The outer ``find_optimal_crf`` function manages all state (history, temp
 files, accept/confident checks, max-crf ceiling fallback, crf-min floor)
 and delegates the choice of *which* CRF to probe next to a stateless
 search method.  Each search method receives the full history of measured
-``(crf, bitrate)`` points plus the bounds and target windows, and returns
+``CrfPoint`` results plus the bounds and target windows, and returns
 either an integer CRF to probe next, or ``None`` to stop searching.
 
 Two search methods are provided: :func:`binary_search_next` and
@@ -26,6 +26,20 @@ from .filters import BitrateWindows
 log = logging.getLogger(__name__)
 
 
+@dataclass(frozen=True)
+class CrfPoint:
+    """A measured point in the CRF search: a CRF and the bitrate it produced.
+
+    CRF and bitrate move in opposite directions (higher CRF → lower
+    bitrate), so pairing them in a named type avoids the ambiguity of a
+    bare ``(int, int)`` tuple where it's easy to lose track of which is
+    which.
+    """
+
+    crf: int
+    bitrate: int
+
+
 @dataclass
 class CrfResult:
     """Result of a CRF search."""
@@ -38,7 +52,7 @@ class CrfResult:
 
 # A stateless search method.  Returns the next CRF to probe, or None to stop.
 SearchMethod = Callable[
-    [list[tuple[int, int]], int, int, int, int, int],
+    [list[CrfPoint], int, int, int, int, int],
     "int | None",
 ]
 
@@ -100,10 +114,8 @@ def _select_windows(
 # ── Log-linear interpolation primitive ──────────────────────────────────────
 
 def interpolate_crf(
-    crf1: int,
-    bitrate1: int,
-    crf2: int,
-    bitrate2: int,
+    p1: CrfPoint,
+    p2: CrfPoint,
     target_bitrate: int,
     crf_min: int,
     crf_max: int,
@@ -114,22 +126,22 @@ def interpolate_crf(
     linear, so interpolating in log-space yields a much better estimate
     than a linear fit.  The result is clamped to ``[crf_min, crf_max]``.
     """
-    if bitrate1 <= 0 or bitrate2 <= 0 or bitrate1 == bitrate2:
-        return (crf1 + crf2) // 2
+    if p1.bitrate <= 0 or p2.bitrate <= 0 or p1.bitrate == p2.bitrate:
+        return (p1.crf + p2.crf) // 2
 
-    log_b1 = math.log(bitrate1)
-    log_b2 = math.log(bitrate2)
+    log_b1 = math.log(p1.bitrate)
+    log_b2 = math.log(p2.bitrate)
     log_target = math.log(target_bitrate)
 
     if log_b1 == log_b2:
-        return (crf1 + crf2) // 2
+        return (p1.crf + p2.crf) // 2
 
-    crf_est = crf1 + (crf2 - crf1) * (log_b1 - log_target) / (log_b1 - log_b2)
+    crf_est = p1.crf + (p2.crf - p1.crf) * (log_b1 - log_target) / (log_b1 - log_b2)
     return max(crf_min, min(crf_max, round(crf_est)))
 
 
 def _extrapolate_crf(
-    history: list[tuple[int, int]],
+    history: list[CrfPoint],
     target_bitrate: int,
     crf_min: int,
     crf_max: int,
@@ -142,31 +154,27 @@ def _extrapolate_crf(
     *direction* must be +1 (all overshooting → need higher CRF) or -1 (all
     undershooting → need lower CRF).
     """
-    anchor_lo = min(history, key=lambda x: x[0])
-    anchor_hi = max(history, key=lambda x: x[0])
+    anchor_lo = min(history, key=lambda p: p.crf)
+    anchor_hi = max(history, key=lambda p: p.crf)
 
-    if anchor_lo[0] == anchor_hi[0]:
-        c, b = history[0]
+    if anchor_lo.crf == anchor_hi.crf:
+        point = history[0]
         if direction == 1:
             # Virtual anchor at crf_max with near-zero bitrate to push higher
-            crf = interpolate_crf(c, b, crf_max, 1, target_bitrate, crf_min, crf_max)
+            crf = interpolate_crf(point, CrfPoint(crf_max, 1), target_bitrate, crf_min, crf_max)
         else:
             # Virtual anchor at crf_min with 10x bitrate to push lower
-            crf = interpolate_crf(crf_min, b * 10, c, b, target_bitrate, crf_min, crf_max)
+            crf = interpolate_crf(CrfPoint(crf_min, point.bitrate * 10), point, target_bitrate, crf_min, crf_max)
     else:
-        crf = interpolate_crf(
-            anchor_lo[0], anchor_lo[1],
-            anchor_hi[0], anchor_hi[1],
-            target_bitrate, crf_min, crf_max,
-        )
+        crf = interpolate_crf(anchor_lo, anchor_hi, target_bitrate, crf_min, crf_max)
 
     # If the estimate didn't move past the extreme tried point, nudge it.
     if direction == 1:
-        if crf <= anchor_hi[0]:
-            crf = min(crf_max, anchor_hi[0] + crf_nudge_size)
+        if crf <= anchor_hi.crf:
+            crf = min(crf_max, anchor_hi.crf + crf_nudge_size)
     else:
-        if crf >= anchor_lo[0]:
-            crf = max(crf_min, anchor_lo[0] - crf_nudge_size)
+        if crf >= anchor_lo.crf:
+            crf = max(crf_min, anchor_lo.crf - crf_nudge_size)
 
     return crf
 
@@ -174,7 +182,7 @@ def _extrapolate_crf(
 # ── Stateless search methods ────────────────────────────────────────────────
 
 def binary_search_next(
-    history: list[tuple[int, int]],
+    history: list[CrfPoint],
     crf_min: int,
     crf_max: int,
     accept_lo: int,
@@ -194,9 +202,9 @@ def binary_search_next(
     is empty.  When the history is empty, *seed_crf* (if in range) is
     used as the first probe; otherwise the midpoint of ``[crf_min, crf_max]``.
     """
-    overshoot_crfs = [c for c, b in history if b > accept_hi]
-    undershoot_crfs = [c for c, b in history if b < accept_lo]
-    in_range_crfs = [c for c, b in history if accept_lo <= b <= accept_hi]
+    overshoot_crfs = [p.crf for p in history if p.bitrate > accept_hi]
+    undershoot_crfs = [p.crf for p in history if p.bitrate < accept_lo]
+    in_range_crfs = [p.crf for p in history if accept_lo <= p.bitrate <= accept_hi]
 
     lo = (max(overshoot_crfs) + 1) if overshoot_crfs else crf_min
     if in_range_crfs:
@@ -220,7 +228,7 @@ def binary_search_next(
 
 
 def interpolation_next(
-    history: list[tuple[int, int]],
+    history: list[CrfPoint],
     crf_min: int,
     crf_max: int,
     accept_lo: int,
@@ -244,23 +252,23 @@ def interpolation_next(
         return max(crf_min, min(crf_max, 30))
 
     if len(history) == 1:
-        h_crf, h_bitrate = history[0]
-        if h_bitrate > accept_hi:
-            return min(crf_max, h_crf + 3)
-        if h_bitrate < accept_lo:
-            return max(crf_min, h_crf - 3)
+        point = history[0]
+        if point.bitrate > accept_hi:
+            return min(crf_max, point.crf + 3)
+        if point.bitrate < accept_lo:
+            return max(crf_min, point.crf - 3)
         # In range: probe a lower CRF to try for higher quality, still in window.
-        return max(crf_min, h_crf - 3)
+        return max(crf_min, point.crf - 3)
 
     # 2+ points: bracket / interpolate.
-    above = [(c, b) for c, b in history if b > accept_hi]
-    below = [(c, b) for c, b in history if b < accept_lo]
-    in_range = [(c, b) for c, b in history if accept_lo <= b <= accept_hi]
+    above = [p for p in history if p.bitrate > accept_hi]
+    below = [p for p in history if p.bitrate < accept_lo]
+    in_range = [p for p in history if accept_lo <= p.bitrate <= accept_hi]
 
     if in_range:
         if not above:
             # No overshoot to bracket against — extrapolate toward lower CRF.
-            lowest_in_range_crf = min(c for c, _ in in_range)
+            lowest_in_range_crf = min(p.crf for p in in_range)
             if lowest_in_range_crf <= crf_min:
                 return None
             crf = _extrapolate_crf(
@@ -269,28 +277,26 @@ def interpolation_next(
             )
             return max(crf_min, min(lowest_in_range_crf - 1, crf))
 
-        nearest_above = min(above, key=lambda x: x[1])  # smallest overshoot
-        lowest_in_range = min(in_range, key=lambda x: x[0])
-        if lowest_in_range[0] - nearest_above[0] <= 1:
+        nearest_above = min(above, key=lambda p: p.bitrate)  # smallest overshoot
+        lowest_in_range = min(in_range, key=lambda p: p.crf)
+        if lowest_in_range.crf - nearest_above.crf <= 1:
             return None  # consecutive integers — no untried CRF in between
         crf = interpolate_crf(
-            lowest_in_range[0], lowest_in_range[1],
-            nearest_above[0], nearest_above[1],
+            lowest_in_range, nearest_above,
             target_bitrate, crf_min, crf_max,
         )
-        return max(nearest_above[0] + 1, min(lowest_in_range[0] - 1, crf))
+        return max(nearest_above.crf + 1, min(lowest_in_range.crf - 1, crf))
 
     if above and below:
-        nearest_above = min(above, key=lambda x: x[1])  # smallest overshoot
-        nearest_below = max(below, key=lambda x: x[1])  # smallest undershoot
-        if nearest_below[0] - nearest_above[0] <= 1:
+        nearest_above = min(above, key=lambda p: p.bitrate)  # smallest overshoot
+        nearest_below = max(below, key=lambda p: p.bitrate)  # smallest undershoot
+        if nearest_below.crf - nearest_above.crf <= 1:
             return None
         crf = interpolate_crf(
-            nearest_below[0], nearest_below[1],
-            nearest_above[0], nearest_above[1],
+            nearest_below, nearest_above,
             target_bitrate, crf_min, crf_max,
         )
-        return max(nearest_above[0] + 1, min(nearest_below[0] - 1, crf))
+        return max(nearest_above.crf + 1, min(nearest_below.crf - 1, crf))
 
     if above:
         return _extrapolate_crf(history, target_bitrate, crf_min, crf_max, direction=1)
@@ -320,7 +326,7 @@ def find_optimal_crf(
     seg_duration: float = 5.0,
     full_encode: bool = False,
     seed_crf: int = -1,
-    seed_known: list[tuple[int, int]] | None = None,
+    seed_known: list[CrfPoint] | None = None,
     seed_temp_files: dict[int, Path] | None = None,
     has_audio: bool = True,
 ) -> CrfResult:
@@ -349,8 +355,8 @@ def find_optimal_crf(
     accept_lo, accept_hi, confident_lo, confident_hi = _select_windows(windows, full_encode)
     target_bitrate = accept_hi
 
-    history: list[tuple[int, int]] = list(seed_known or [])
-    tried_crfs: set[int] = {c for c, _ in history}
+    history: list[CrfPoint] = list(seed_known or [])
+    tried_crfs: set[int] = {p.crf for p in history}
     # Seeded points may carry a reusable encode (e.g. a full-video encode the
     # caller already produced at that CRF), so the search needn't redo it if it
     # ends up selecting that point.  These participate in the same lifecycle as
@@ -363,8 +369,8 @@ def find_optimal_crf(
         crf_min, crf_max,
     )
     if seed_known:
-        for c, b in seed_known:
-            log.info("  Seeded with known point: CRF=%d -> %d kbps", c, b)
+        for point in seed_known:
+            log.info("  Seeded with known point: CRF=%d -> %d kbps", point.crf, point.bitrate)
 
     def _cleanup_except(keep_crf: int | None) -> None:
         for c, p in list(temp_files_by_crf.items()):
@@ -373,16 +379,16 @@ def find_optimal_crf(
             if c != keep_crf:
                 temp_files_by_crf.pop(c, None)
 
-    def _best_from_history() -> tuple[int, int] | None:
+    def _best_from_history() -> CrfPoint | None:
         if not history:
             return None
-        in_range = [(c, b) for c, b in history if accept_lo <= b <= accept_hi]
+        in_range = [p for p in history if accept_lo <= p.bitrate <= accept_hi]
         if in_range:
-            return min(in_range, key=lambda x: x[0])  # lowest CRF (highest quality)
-        below = [(c, b) for c, b in history if b <= accept_hi]
+            return min(in_range, key=lambda p: p.crf)  # lowest CRF (highest quality)
+        below = [p for p in history if p.bitrate <= accept_hi]
         if below:
-            return max(below, key=lambda x: x[1])  # closest to target from below
-        return max(history, key=lambda x: x[0])  # closest to target from above
+            return max(below, key=lambda p: p.bitrate)  # closest to target from below
+        return max(history, key=lambda p: p.crf)  # closest to target from above
 
     def _return_best() -> CrfResult:
         best = _best_from_history()
@@ -393,9 +399,9 @@ def find_optimal_crf(
             )
             _cleanup_except(None)
             return CrfResult(crf_max, 0, None, crf_ceiling_used=False)
-        log.info("  Selected CRF=%d (estimated %d kbps)", best[0], best[1])
-        _cleanup_except(best[0])
-        return CrfResult(best[0], best[1], temp_files_by_crf.get(best[0]), crf_ceiling_used=False)
+        log.info("  Selected CRF=%d (estimated %d kbps)", best.crf, best.bitrate)
+        _cleanup_except(best.crf)
+        return CrfResult(best.crf, best.bitrate, temp_files_by_crf.get(best.crf), crf_ceiling_used=False)
 
     for iteration in range(1, max_iterations + 1):
         candidate = search_method(
@@ -410,7 +416,7 @@ def find_optimal_crf(
         # Duplicate check: nudge ±1 toward the target.
         if candidate in tried_crfs:
             dup_bitrate = next(
-                (b for c, b in history if c == candidate),
+                (p.bitrate for p in history if p.crf == candidate),
                 None,
             )
             if dup_bitrate is None:
@@ -459,7 +465,7 @@ def find_optimal_crf(
         log.info(
             "  Iteration %d: CRF=%d -> %d kbps", iteration, candidate, bitrate,
         )
-        history.append((candidate, bitrate))
+        history.append(CrfPoint(candidate, bitrate))
         if temp_file:
             temp_files_by_crf[candidate] = temp_file
 

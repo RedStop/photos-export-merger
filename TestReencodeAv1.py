@@ -30,6 +30,7 @@ from reencode_av1.encode import (
     _parse_time_to_seconds,
 )
 from reencode_av1.search import (
+    CrfPoint,
     CrfResult,
     binary_search_next,
     find_optimal_crf,
@@ -454,27 +455,27 @@ class TestParseTimeToSeconds:
 class TestInterpolateCrf:
     def test_basic_interpolation(self):
         # CRF 20 -> 5000 kbps, CRF 40 -> 1000 kbps, target 2500
-        result = interpolate_crf(20, 5000, 40, 1000, 2500, 1, 63)
+        result = interpolate_crf(CrfPoint(20, 5000), CrfPoint(40, 1000), 2500, 1, 63)
         assert 1 <= result <= 63
         # Should be between 20 and 40
         assert 20 <= result <= 40
 
     def test_clamped_to_min(self):
         # Target much higher than both points -> clamp to min
-        result = interpolate_crf(20, 100, 40, 50, 50000, 5, 63)
+        result = interpolate_crf(CrfPoint(20, 100), CrfPoint(40, 50), 50000, 5, 63)
         assert result == 5
 
     def test_clamped_to_max(self):
         # Target much lower than both points -> clamp to max
-        result = interpolate_crf(20, 50000, 40, 30000, 10, 1, 63)
+        result = interpolate_crf(CrfPoint(20, 50000), CrfPoint(40, 30000), 10, 1, 63)
         assert result == 63
 
     def test_equal_bitrates_returns_midpoint(self):
-        result = interpolate_crf(20, 2000, 40, 2000, 2500, 1, 63)
+        result = interpolate_crf(CrfPoint(20, 2000), CrfPoint(40, 2000), 2500, 1, 63)
         assert result == 30
 
     def test_zero_bitrate_returns_midpoint(self):
-        result = interpolate_crf(20, 0, 40, 2000, 2500, 1, 63)
+        result = interpolate_crf(CrfPoint(20, 0), CrfPoint(40, 2000), 2500, 1, 63)
         assert result == 30
 
     def test_log_linear_relationship(self):
@@ -482,7 +483,7 @@ class TestInterpolateCrf:
         # Two points: CRF 10 -> 10000, CRF 50 -> 100
         # Target: 1000 (geometric mean of 10000 and 100)
         # In log-space, 1000 is exactly at the midpoint of log(10000) and log(100)
-        result = interpolate_crf(10, 10000, 50, 100, 1000, 1, 63)
+        result = interpolate_crf(CrfPoint(10, 10000), CrfPoint(50, 100), 1000, 1, 63)
         assert result == 30  # exact midpoint in log-space
 
 
@@ -497,22 +498,22 @@ class TestBinarySearchNext:
 
     def test_overshoot_raises_lo(self):
         # CRF 20 overshoots → next probe must be > 20
-        nxt = binary_search_next([(20, 5000)], 1, 63, 1000, 2000)
+        nxt = binary_search_next([CrfPoint(20, 5000)], 1, 63, 1000, 2000)
         assert nxt is not None and nxt > 20
 
     def test_undershoot_lowers_hi(self):
         # CRF 50 undershoots → next probe must be < 50
-        nxt = binary_search_next([(50, 500)], 1, 63, 1000, 2000)
+        nxt = binary_search_next([CrfPoint(50, 500)], 1, 63, 1000, 2000)
         assert nxt is not None and nxt < 50
 
     def test_in_range_narrows_toward_lower_crf(self):
         # CRF 30 in range → next probe must be < 30 (looking for higher quality)
-        nxt = binary_search_next([(30, 1500)], 1, 63, 1000, 2000)
+        nxt = binary_search_next([CrfPoint(30, 1500)], 1, 63, 1000, 2000)
         assert nxt is not None and nxt < 30
 
     def test_consecutive_bracket_returns_none(self):
         # CRF 30 overshoots, CRF 31 in range → no integer between them
-        nxt = binary_search_next([(30, 2500), (31, 1500)], 1, 63, 1000, 2000)
+        nxt = binary_search_next([CrfPoint(30, 2500), CrfPoint(31, 1500)], 1, 63, 1000, 2000)
         assert nxt is None
 
 
@@ -528,23 +529,23 @@ class TestInterpolationNext:
         assert nxt is not None and 1 <= nxt <= 63
 
     def test_single_overshoot_probes_higher_crf(self):
-        nxt = interpolation_next([(20, 5000)], 1, 63, 1000, 2000)
+        nxt = interpolation_next([CrfPoint(20, 5000)], 1, 63, 1000, 2000)
         assert nxt is not None and nxt > 20
 
     def test_single_undershoot_probes_lower_crf(self):
-        nxt = interpolation_next([(50, 500)], 1, 63, 1000, 2000)
+        nxt = interpolation_next([CrfPoint(50, 500)], 1, 63, 1000, 2000)
         assert nxt is not None and nxt < 50
 
     def test_bracketed_interpolates(self):
         # CRF 20 overshoots, CRF 50 undershoots — interpolate strictly between
         nxt = interpolation_next(
-            [(20, 5000), (50, 500)], 1, 63, 1000, 2000,
+            [CrfPoint(20, 5000), CrfPoint(50, 500)], 1, 63, 1000, 2000,
         )
         assert nxt is not None and 20 < nxt < 50
 
     def test_consecutive_bracket_returns_none(self):
         nxt = interpolation_next(
-            [(30, 2500), (31, 1500)], 1, 63, 1000, 2000,
+            [CrfPoint(30, 2500), CrfPoint(31, 1500)], 1, 63, 1000, 2000,
         )
         assert nxt is None
 
@@ -684,7 +685,7 @@ class TestFindOptimalCrf:
             Path("test.mp4"), windows, [], "128k", 3, 128,
             max_iterations=15, crf_min=1, crf_max=57,
             crf_ceiling_fallback=48, search_method=no_probe,
-            seed_known=[(31, 2100)], seed_temp_files={31: tmp},
+            seed_known=[CrfPoint(31, 2100)], seed_temp_files={31: tmp},
         )
         assert result.crf == 31
         assert result.temp_file == tmp
@@ -713,7 +714,7 @@ class TestFindOptimalCrf:
             max_iterations=15, crf_min=1, crf_max=57,
             crf_ceiling_fallback=48, search_method=always_forty,
             full_encode=True,
-            seed_known=[(30, 9000)], seed_temp_files={30: seed_tmp},
+            seed_known=[CrfPoint(30, 9000)], seed_temp_files={30: seed_tmp},
         )
         assert result.crf == 40
         assert result.temp_file == winner_tmp
@@ -771,7 +772,7 @@ class TestFindOptimalCrf:
         # Search method keeps suggesting 30 → outer loop nudges to 31 → 31
         # is already tried → stop and pick below-target one (CRF 31).
         windows = self._make_windows()
-        seed_known = [(30, 5000), (31, 2100)]  # 2100 is in accept but not confident
+        seed_known = [CrfPoint(30, 5000), CrfPoint(31, 2100)]  # 2100 is in accept but not confident
 
         always_thirty = lambda *a, **kw: 30
 
