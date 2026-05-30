@@ -2,6 +2,7 @@ import argparse
 import re
 import subprocess
 import sys
+import tempfile
 from pathlib import Path
 
 Q_PATTERN = re.compile(r"\bq=\s*(-?\d+(?:\.\d+)?)")
@@ -134,13 +135,25 @@ def run_ffmpeg_2pass_av1(
         "-pix_fmt", "yuv420p10le"
     ]
 
+    # SVT-AV1 defaults to CRF (rc=0); -b:v is only honoured in VBR (rc=1).
+    # The pass index and stats file are still driven by ffmpeg's own
+    # -pass/-passlogfile flags (the libsvtav1 wrapper forwards them); only the
+    # rate-control mode has to go through -svtav1-params.
+    passlog_dir = tempfile.mkdtemp(prefix="ffmpeg2pass-")
+    passlog_prefix = str(Path(passlog_dir) / "ffmpeg2pass")
+    pass1_extra: list[str] = ["-pass", "1", "-passlogfile", passlog_prefix]
+    pass2_extra: list[str] = ["-pass", "2", "-passlogfile", passlog_prefix]
     if encoder == "libsvtav1":
-        common_opts.extend(["-preset", str(preset)])
+        common_opts.extend(["-preset", str(preset), "-svtav1-params", "rc=1"])
     elif encoder == "libaom-av1":
         common_opts.extend(["-cpu-used", str(preset)])
     else:
         print("Unsupported encoder.")
         sys.exit(1)
+
+    def _cleanup_passlog() -> None:
+        import shutil
+        shutil.rmtree(passlog_dir, ignore_errors=True)
 
     total_frames = _get_total_frames(input_path)
     abort_over_count: int | None = None
@@ -156,7 +169,7 @@ def run_ffmpeg_2pass_av1(
     pass1_cmd = [
         "ffmpeg", "-y", "-i", str(input_path),
         *common_opts,
-        "-pass", "1",
+        *pass1_extra,
         "-an", "-f", "null",
         "NUL" if sys.platform == "win32" else "/dev/null"
     ]
@@ -168,6 +181,7 @@ def run_ffmpeg_2pass_av1(
     )
     if not aborted and rc != 0:
         print(f"Pass 1 failed with exit code {rc}.")
+        _cleanup_passlog()
         sys.exit(rc)
 
     over_fraction: float | None = None
@@ -208,6 +222,7 @@ def run_ffmpeg_2pass_av1(
             "-compression_level", "10",
             str(output_path),
         ])
+        _cleanup_passlog()
         subprocess.run(crf_cmd, check=True)
         print(f"Encoding completed successfully (CRF fallback): {output_path}")
         return
@@ -216,7 +231,7 @@ def run_ffmpeg_2pass_av1(
     pass2_cmd = [
         "ffmpeg", "-y", "-i", str(input_path),
         *common_opts,
-        "-pass", "2",
+        *pass2_extra,
         "-c:a", "libopus",
         "-b:a", audio_bitrate,
         "-vbr", "on",
@@ -224,7 +239,10 @@ def run_ffmpeg_2pass_av1(
         str(output_path)
     ]
 
-    subprocess.run(pass2_cmd, check=True)
+    try:
+        subprocess.run(pass2_cmd, check=True)
+    finally:
+        _cleanup_passlog()
     print(f"Encoding completed successfully: {output_path}")
 
 
