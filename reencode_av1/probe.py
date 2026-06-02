@@ -22,6 +22,7 @@ class VideoInfo:
     is_vfr: bool
     bitrate_kbps: int
     duration_sec: float
+    frame_count: int
     audio_channels: int
     audio_codec: str | None
 
@@ -107,6 +108,14 @@ def get_video_info(path: Path) -> VideoInfo | None:
 
     duration_sec = float(fmt.get("duration", 0))
 
+    # Actual frame count when ffprobe reports it; otherwise estimate from fps.
+    frame_count = 0
+    nb_frames = video_stream.get("nb_frames")
+    if nb_frames and str(nb_frames).isdigit():
+        frame_count = int(nb_frames)
+    elif fps > 0 and duration_sec > 0:
+        frame_count = round(fps * duration_sec)
+
     return VideoInfo(
         codec=video_stream.get("codec_name", "unknown"),
         width=int(video_stream.get("width", 0)),
@@ -115,6 +124,7 @@ def get_video_info(path: Path) -> VideoInfo | None:
         is_vfr=is_vfr,
         bitrate_kbps=bitrate_kbps,
         duration_sec=duration_sec,
+        frame_count=frame_count,
         audio_channels=audio_channels,
         audio_codec=audio_stream.get("codec_name") if audio_stream else None,
     )

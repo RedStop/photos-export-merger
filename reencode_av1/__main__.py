@@ -316,10 +316,20 @@ def process_file(
         log.warning("  Could not read video info, skipping")
         return "skipped:no_info"
 
+    if info.width > info.height:
+        orientation = "landscape"
+    elif info.height > info.width:
+        orientation = "portrait"
+    else:
+        orientation = "square"
+    total_secs = int(round(info.duration_sec))
+    duration_hms = f"{total_secs // 3600:02d}:{total_secs % 3600 // 60:02d}:{total_secs % 60:02d}"
     log.info(
-        "  Codec=%s Resolution=%dx%d FPS=%.3f Bitrate=%d kbps AudioCh=%d",
-        info.codec, info.width, info.height, info.fps,
-        info.bitrate_kbps, info.audio_channels,
+        "  Codec=%s Resolution=%dx%d (%s) FPS=%.3f Bitrate=%d kbps "
+        "AudioCh=%d Duration=%s (%.1fs) Frames=%d",
+        info.codec, info.width, info.height, orientation, info.fps,
+        info.bitrate_kbps, info.audio_channels, duration_hms,
+        info.duration_sec, info.frame_count,
     )
 
     # Skip if source bitrate is already at or below the minimum encode threshold

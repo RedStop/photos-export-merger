@@ -256,7 +256,7 @@ class TestGetScaleFilter:
 
 class TestBuildExtraArgs:
     def test_standard_1080p(self):
-        info = VideoInfo("h264", 1920, 1080, 30.0, False, 5000, 120.0, 2, "aac")
+        info = VideoInfo("h264", 1920, 1080, 30.0, False, 5000, 120.0, 3600, 2, "aac")
         args = build_extra_args(info)
         assert "-vf" not in args
         assert "-g" in args
@@ -267,20 +267,20 @@ class TestBuildExtraArgs:
         assert args[k_idx + 1] == "120"  # 30 * 4
 
     def test_4k_adds_scale(self):
-        info = VideoInfo("h264", 3840, 2160, 30.0, False, 15000, 120.0, 2, "aac")
+        info = VideoInfo("h264", 3840, 2160, 30.0, False, 15000, 120.0, 3600, 2, "aac")
         args = build_extra_args(info)
         assert "-vf" in args
         vf_idx = args.index("-vf")
         assert args[vf_idx + 1] == "scale=-2:1080"
 
     def test_zero_fps_defaults_to_30(self):
-        info = VideoInfo("h264", 1920, 1080, 0.0, False, 5000, 120.0, 2, "aac")
+        info = VideoInfo("h264", 1920, 1080, 0.0, False, 5000, 120.0, 3600, 2, "aac")
         args = build_extra_args(info)
         g_idx = args.index("-g")
         assert args[g_idx + 1] == "240"  # 30 * 8
 
     def test_60fps_gop(self):
-        info = VideoInfo("h264", 1920, 1080, 60.0, False, 5000, 120.0, 2, "aac")
+        info = VideoInfo("h264", 1920, 1080, 60.0, False, 5000, 120.0, 3600, 2, "aac")
         args = build_extra_args(info)
         g_idx = args.index("-g")
         assert args[g_idx + 1] == "480"  # 60 * 8
@@ -895,25 +895,25 @@ class TestGetOutputPath:
 
 class TestComputeAudioBitrate:
     def test_auto_stereo(self):
-        info = VideoInfo("h264", 1920, 1080, 30.0, False, 5000, 120.0, 2, "aac")
+        info = VideoInfo("h264", 1920, 1080, 30.0, False, 5000, 120.0, 3600, 2, "aac")
         s, k = compute_audio_bitrate(info, 0)
         assert s == "128k"
         assert k == 128
 
     def test_auto_mono(self):
-        info = VideoInfo("h264", 1920, 1080, 30.0, False, 5000, 120.0, 1, "aac")
+        info = VideoInfo("h264", 1920, 1080, 30.0, False, 5000, 120.0, 3600, 1, "aac")
         s, k = compute_audio_bitrate(info, 0)
         assert s == "64k"
         assert k == 64
 
     def test_auto_surround(self):
-        info = VideoInfo("h264", 1920, 1080, 30.0, False, 5000, 120.0, 6, "aac")
+        info = VideoInfo("h264", 1920, 1080, 30.0, False, 5000, 120.0, 3600, 6, "aac")
         s, k = compute_audio_bitrate(info, 0)
         assert s == "384k"
         assert k == 384
 
     def test_override(self):
-        info = VideoInfo("h264", 1920, 1080, 30.0, False, 5000, 120.0, 2, "aac")
+        info = VideoInfo("h264", 1920, 1080, 30.0, False, 5000, 120.0, 3600, 2, "aac")
         s, k = compute_audio_bitrate(info, 96)
         assert s == "96k"
         assert k == 96
@@ -1100,7 +1100,7 @@ class TestProcessFile:
     @mock.patch("reencode_av1.__main__.get_video_info")
     def test_skips_av1(self, mock_info):
         mock_info.return_value = VideoInfo(
-            "av1", 1920, 1080, 30.0, False, 5000, 120.0, 2, "opus"
+            "av1", 1920, 1080, 30.0, False, 5000, 120.0, 3600, 2, "opus"
         )
         result = process_file(Path("test.mp4"), self._make_args())
         assert result.startswith("skipped")
@@ -1108,7 +1108,7 @@ class TestProcessFile:
     @mock.patch("reencode_av1.__main__.get_video_info")
     def test_skips_vp9(self, mock_info):
         mock_info.return_value = VideoInfo(
-            "vp9", 1920, 1080, 30.0, False, 5000, 120.0, 2, "opus"
+            "vp9", 1920, 1080, 30.0, False, 5000, 120.0, 3600, 2, "opus"
         )
         result = process_file(Path("test.mp4"), self._make_args())
         assert result.startswith("skipped")
@@ -1117,7 +1117,7 @@ class TestProcessFile:
     @mock.patch("reencode_av1.__main__.get_video_info")
     def test_skips_existing_output(self, mock_info, mock_output):
         mock_info.return_value = VideoInfo(
-            "h264", 1920, 1080, 30.0, False, 5000, 120.0, 2, "aac"
+            "h264", 1920, 1080, 30.0, False, 5000, 120.0, 3600, 2, "aac"
         )
         # Create a real file so exists() returns True
         with tempfile.NamedTemporaryFile(delete=False, suffix=".mkv") as f:
@@ -1132,7 +1132,7 @@ class TestProcessFile:
     @mock.patch("reencode_av1.__main__.get_video_info")
     def test_dry_run(self, mock_info):
         mock_info.return_value = VideoInfo(
-            "h264", 1920, 1080, 30.0, False, 5000, 120.0, 2, "aac"
+            "h264", 1920, 1080, 30.0, False, 5000, 120.0, 3600, 2, "aac"
         )
         result = process_file(Path("test.mp4"), self._make_args(dry_run=True))
         assert result.startswith("skipped")
@@ -1147,7 +1147,7 @@ class TestProcessFile:
     ):
         """Temp files should be cleaned up even if an exception occurs."""
         mock_info.return_value = VideoInfo(
-            "h264", 1920, 1080, 30.0, False, 5000, 120.0, 2, "aac"
+            "h264", 1920, 1080, 30.0, False, 5000, 120.0, 3600, 2, "aac"
         )
         # Output path that doesn't exist
         out_path = Path(tempfile.gettempdir()) / "nonexistent_output.mkv"
