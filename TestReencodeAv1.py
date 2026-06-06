@@ -935,8 +935,10 @@ class TestValidateArgs:
             "segment_duration": 3.0,
             "short_video_threshold": 90.0,
             "audio_bitrate": 0,
-            "directory": None,
+            "path": None,
             "scratch_dir": None,
+            "precise": True,
+            "precise_only": False,
         }
         defaults.update(overrides)
         return argparse.Namespace(**defaults)
@@ -1001,18 +1003,34 @@ class TestValidateArgs:
         with pytest.raises(SystemExit):
             validate_args(args)
 
-    def test_valid_directory(self):
-        with tempfile.TemporaryDirectory() as d:
-            args = self._make_args(directory=Path(d))
-            validate_args(args)  # should not raise
-
-    def test_nonexistent_directory(self):
-        args = self._make_args(directory=Path("/nonexistent/path/xyz"))
+    def test_precise_only_with_no_precise_is_rejected(self):
+        # --precise-only (precise_only=True) and --no-precise (precise=False)
+        # cannot be combined.
+        args = self._make_args(precise_only=True, precise=False)
         with pytest.raises(SystemExit):
             validate_args(args)
 
-    def test_none_directory(self):
-        args = self._make_args(directory=None)
+    def test_precise_only_alone_is_allowed(self):
+        args = self._make_args(precise_only=True, precise=True)
+        validate_args(args)  # should not raise
+
+    def test_valid_directory(self):
+        with tempfile.TemporaryDirectory() as d:
+            args = self._make_args(path=Path(d))
+            validate_args(args)  # should not raise
+
+    def test_valid_file(self):
+        with tempfile.NamedTemporaryFile(suffix=".mp4") as f:
+            args = self._make_args(path=Path(f.name))
+            validate_args(args)  # should not raise
+
+    def test_nonexistent_path(self):
+        args = self._make_args(path=Path("/nonexistent/path/xyz"))
+        with pytest.raises(SystemExit):
+            validate_args(args)
+
+    def test_none_path(self):
+        args = self._make_args(path=None)
         validate_args(args)  # should not raise
 
     def test_scratch_dir_none(self):
@@ -1044,7 +1062,19 @@ class TestBuildParser:
         assert args.preset == 3
         assert args.dry_run is False
         assert args.search_method == "smart"
+        assert args.precise is True
+        assert args.precise_only is False
+
+    def test_no_precise_disables_precise(self):
+        parser = build_parser()
+        args = parser.parse_args(["--no-precise"])
         assert args.precise is False
+
+    def test_precise_only_flag(self):
+        parser = build_parser()
+        args = parser.parse_args(["--precise-only"])
+        assert args.precise_only is True
+        assert args.precise is True
 
     def test_custom_values(self):
         parser = build_parser()
@@ -1069,10 +1099,10 @@ class TestBuildParser:
         with pytest.raises(SystemExit):
             parser.parse_args(["--search-method", "bogus"])
 
-    def test_default_directory_is_none(self):
+    def test_default_path_is_none(self):
         parser = build_parser()
         args = parser.parse_args([])
-        assert args.directory is None
+        assert args.path is None
 
     def test_scratch_dir_default_is_none(self):
         parser = build_parser()
@@ -1084,15 +1114,15 @@ class TestBuildParser:
         args = parser.parse_args(["--scratch-dir", "/some/scratch"])
         assert args.scratch_dir == Path("/some/scratch")
 
-    def test_directory_argument(self):
+    def test_path_argument(self):
         parser = build_parser()
         args = parser.parse_args(["/some/path"])
-        assert args.directory == Path("/some/path")
+        assert args.path == Path("/some/path")
 
-    def test_directory_with_options(self):
+    def test_path_with_options(self):
         parser = build_parser()
         args = parser.parse_args(["--dry-run", "/some/path"])
-        assert args.directory == Path("/some/path")
+        assert args.path == Path("/some/path")
         assert args.dry_run is True
 
 
@@ -1116,6 +1146,7 @@ class TestProcessFile:
             "audio_bitrate": 0,
             "search_method": "smart",
             "precise": False,
+            "precise_only": False,
             "dry_run": False,
             "max_iterations": 15,
             "scratch_dir": None,
@@ -1245,6 +1276,49 @@ class TestProcessFile:
             assert dest_output.exists()
             # No staged input/output left behind in the scratch dir.
             assert list(scratch_dir.iterdir()) == []
+
+    @mock.patch("reencode_av1.__main__.get_video_bitrate")
+    @mock.patch("reencode_av1.__main__.encode_full")
+    @mock.patch("reencode_av1.__main__.find_optimal_crf")
+    @mock.patch("reencode_av1.__main__.get_output_path")
+    @mock.patch("reencode_av1.__main__.get_video_info")
+    def test_precise_only_forces_full_search_on_long_video(
+        self, mock_info, mock_output, mock_search, mock_encode, mock_bitrate
+    ):
+        """--precise-only runs a full-video search even for a video well above the
+        short-video threshold: find_optimal_crf gets full_encode=True with no
+        segment offsets, the search encode is reused, and encode_full is not called."""
+        # 600s video — far above the 90s short-video threshold.
+        mock_info.return_value = VideoInfo(
+            "h264", 1920, 1080, 30.0, False, 5000, 600.0, 18000, 2, "aac"
+        )
+        mock_bitrate.return_value = 2400
+
+        with tempfile.TemporaryDirectory() as dest_d:
+            source = Path(dest_d) / "video.mp4"
+            source.write_bytes(b"\x00" * 1024)
+            dest_output = Path(dest_d) / "video.mkv"
+            mock_output.return_value = dest_output
+
+            # Search produces a usable full-video encode to be reused as output.
+            search_encode = Path(dest_d) / "search-encode.mkv"
+            search_encode.write_bytes(b"\x00" * 512)
+            mock_search.return_value = CrfResult(
+                crf=30, estimated_bitrate=2400, temp_file=search_encode
+            )
+
+            result = process_file(
+                source, self._make_args(precise_only=True, precise=True)
+            )
+
+            assert result == "processed"
+            # Full-video search: full_encode=True and no segment offsets.
+            _, kwargs = mock_search.call_args
+            assert kwargs["full_encode"] is True
+            assert kwargs["offsets"] is None
+            # The search encode was reused directly; no separate full encode ran.
+            mock_encode.assert_not_called()
+            assert dest_output.exists()
 
     @mock.patch("reencode_av1.__main__.get_video_bitrate")
     @mock.patch("reencode_av1.__main__.encode_full")

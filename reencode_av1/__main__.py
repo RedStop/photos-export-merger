@@ -41,11 +41,13 @@ def build_parser() -> argparse.ArgumentParser:
 examples:
   python -m reencode_av1                               # current directory
   python -m reencode_av1 /path/to/videos               # specific directory
+  python -m reencode_av1 /path/to/clip.mp4             # a single video file
   python -m reencode_av1 --target-bitrate 2000         # lower target
   python -m reencode_av1 --dry-run                     # preview only
   python -m reencode_av1 --search-method binary        # use pure binary search
   python -m reencode_av1 --search-method interpolation # use log-linear interpolation
-  python -m reencode_av1 --precise                     # full-video search if out of range
+  python -m reencode_av1 --no-precise                  # skip full-video search if out of range
+  python -m reencode_av1 --precise-only                # always search on the full video
   python -m reencode_av1 --scratch-dir D:/scratch \\nas/videos  # stage NAS sources on local disk
   python -m reencode_av1 --skip-below-bitrate 1000     # skip files already under 1000 kbps
   python -m reencode_av1 --skip-below-bitrate 0        # always encode regardless of bitrate
@@ -134,8 +136,24 @@ examples:
         ),
     )
     p.add_argument(
-        "--precise", action="store_true",
-        help="Redo search with full video if final bitrate is out of range",
+        "--no-precise", dest="precise", action="store_false", default=True,
+        help=(
+            "Disable precise mode. Precise mode is on by default: when the "
+            "sample-based encode lands out of range, the CRF search is redone with "
+            "full-video encodes. This flag skips that re-search and keeps the "
+            "first encode, which is faster but may leave the bitrate out of range. "
+            "Mutually exclusive with --precise-only."
+        ),
+    )
+    p.add_argument(
+        "--precise-only", action="store_true",
+        help=(
+            "Run the CRF search on the full video from the start, regardless of "
+            "length, instead of estimating from sample segments. The most accurate "
+            "and slowest mode; the chosen encode is reused as the final output, so "
+            "there is no separate sample pass or re-search. Mutually exclusive with "
+            "--no-precise."
+        ),
     )
     p.add_argument(
         "--scratch-dir", type=Path, default=None,
@@ -159,8 +177,11 @@ examples:
         help="Enable debug logging",
     )
     p.add_argument(
-        "directory", nargs="?", type=Path, default=None,
-        help="Directory to scan for video files (default: current directory)",
+        "path", nargs="?", type=Path, default=None, metavar="PATH",
+        help=(
+            "A single video file to re-encode, or a directory to scan recursively "
+            "for video files (default: current directory)"
+        ),
     )
 
     return p
@@ -253,9 +274,11 @@ def validate_args(args: argparse.Namespace) -> None:
     if args.audio_bitrate < 0:
         errors.append("--audio-bitrate must be >= 0 (use 0 for auto)")
 
-    if args.directory is not None:
-        if not args.directory.is_dir():
-            errors.append(f"directory does not exist or is not a directory: {args.directory}")
+    if args.precise_only and not args.precise:
+        errors.append("--precise-only and --no-precise are mutually exclusive")
+
+    if args.path is not None and not args.path.exists():
+        errors.append(f"path does not exist: {args.path}")
 
     if args.scratch_dir is not None and args.scratch_dir.exists() and not args.scratch_dir.is_dir():
         errors.append(f"--scratch-dir exists but is not a directory: {args.scratch_dir}")
@@ -403,11 +426,19 @@ def process_file(
         return "skipped:dry_run"
 
     # Determine if short video — videos at or under the threshold are encoded in
-    # full during the search (no segment sampling); longer videos use the short
-    # multi-segment encoding unless --precise mode is active.
+    # full during the search (no segment sampling); longer videos use
+    # multi-segment sampling, with a full-video re-search when precise mode is on.
     is_short_video = info.duration_sec > 0 and info.duration_sec <= args.short_video_threshold
 
-    if is_short_video:
+    # --precise-only forces a full-video CRF search for every file regardless of
+    # length. Short videos already take the full-video search path. In both cases
+    # the search encodes the whole file, so segment sampling and the precise
+    # re-search pass are skipped and the chosen encode is reused as the output.
+    use_full_search = is_short_video or args.precise_only
+
+    if args.precise_only:
+        log.info("  --precise-only: encoding full video during search")
+    elif is_short_video:
         log.info(
             "  Video (%.1fs) <= %.0fs threshold, encoding full video during search",
             info.duration_sec, args.short_video_threshold,
@@ -423,7 +454,7 @@ def process_file(
 
     # Compute segment offsets for multi-segment sampling
     offsets: list[float] | None = None
-    if not is_short_video:
+    if not use_full_search:
         offsets = compute_segment_offsets(
             info.duration_sec, args.segment_count, args.segment_duration,
         )
@@ -466,7 +497,7 @@ def process_file(
             args.crf_min, args.crf_max, args.crf_ceiling_fallback,
             search_method=search_method,
             offsets=offsets, seg_duration=args.segment_duration,
-            full_encode=is_short_video,
+            full_encode=use_full_search,
             has_audio=has_audio,
         )
         if result.temp_file:
@@ -490,7 +521,7 @@ def process_file(
                 crf_ceiling_triggered = "low_original"
 
         # ── Full encode ──────────────────────────────────────────────
-        if is_short_video and result.temp_file and result.temp_file.exists():
+        if use_full_search and result.temp_file and result.temp_file.exists():
             log.info(
                 "  Reusing search encode (CRF=%d) as final output -> %s",
                 result.crf, output_path,
@@ -557,8 +588,8 @@ def process_file(
             )
 
         # ── Precise mode ─────────────────────────────────────────────
-        if args.precise and out_of_range and not is_short_video and not crf_ceiling_triggered:
-            log.info("  --precise: final bitrate out of range, starting full-video search...")
+        if args.precise and out_of_range and not use_full_search and not crf_ceiling_triggered:
+            log.info("  Precise mode: final bitrate out of range, starting full-video search...")
             # Preserve the full encode we just made at result.crf as a reusable
             # seed instead of deleting it: if the precise search settles on that
             # CRF, this file becomes the output with no re-encode. Moved out of
@@ -695,7 +726,7 @@ def main() -> None:
         log.error("ffmpeg and ffprobe must be on PATH")
         sys.exit(1)
 
-    cwd = args.directory.resolve() if args.directory else Path.cwd()
+    target = args.path.resolve() if args.path else Path.cwd()
     log.info("=" * 60)
     log.info("AV1 Re-encode Session Started")
     log.info("=" * 60)
@@ -727,12 +758,15 @@ def main() -> None:
         windows.final_lo, windows.final_hi,
         windows.final_accept_lo, windows.final_accept_hi,
     )
-    log.info("Scanning: %s", cwd)
-
-    video_files = sorted(
-        f for f in cwd.rglob("*")
-        if f.is_file() and f.suffix.lower() in VIDEO_EXTENSIONS
-    )
+    if target.is_file():
+        log.info("Single file: %s", target)
+        video_files = [target]
+    else:
+        log.info("Scanning: %s", target)
+        video_files = sorted(
+            f for f in target.rglob("*")
+            if f.is_file() and f.suffix.lower() in VIDEO_EXTENSIONS
+        )
 
     total = len(video_files)
     log.info("Found %d video file(s)", total)
