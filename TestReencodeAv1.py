@@ -936,6 +936,7 @@ class TestValidateArgs:
             "short_video_threshold": 90.0,
             "audio_bitrate": 0,
             "directory": None,
+            "cache_dir": None,
         }
         defaults.update(overrides)
         return argparse.Namespace(**defaults)
@@ -1014,6 +1015,26 @@ class TestValidateArgs:
         args = self._make_args(directory=None)
         validate_args(args)  # should not raise
 
+    def test_cache_dir_none(self):
+        args = self._make_args(cache_dir=None)
+        validate_args(args)  # should not raise
+
+    def test_cache_dir_existing_directory(self):
+        with tempfile.TemporaryDirectory() as d:
+            args = self._make_args(cache_dir=Path(d))
+            validate_args(args)  # should not raise
+
+    def test_cache_dir_nonexistent_is_allowed(self):
+        # A not-yet-existing cache dir is fine; it is created at runtime.
+        args = self._make_args(cache_dir=Path("/nonexistent/cache/xyz"))
+        validate_args(args)  # should not raise
+
+    def test_cache_dir_is_a_file(self):
+        with tempfile.NamedTemporaryFile(suffix=".tmp") as f:
+            args = self._make_args(cache_dir=Path(f.name))
+            with pytest.raises(SystemExit):
+                validate_args(args)
+
 
 class TestBuildParser:
     def test_defaults(self):
@@ -1053,6 +1074,16 @@ class TestBuildParser:
         args = parser.parse_args([])
         assert args.directory is None
 
+    def test_cache_dir_default_is_none(self):
+        parser = build_parser()
+        args = parser.parse_args([])
+        assert args.cache_dir is None
+
+    def test_cache_dir_argument(self):
+        parser = build_parser()
+        args = parser.parse_args(["--cache-dir", "/some/scratch"])
+        assert args.cache_dir == Path("/some/scratch")
+
     def test_directory_argument(self):
         parser = build_parser()
         args = parser.parse_args(["/some/path"])
@@ -1087,6 +1118,7 @@ class TestProcessFile:
             "precise": False,
             "dry_run": False,
             "max_iterations": 15,
+            "cache_dir": None,
         }
         defaults.update(overrides)
         return argparse.Namespace(**defaults)
@@ -1166,6 +1198,86 @@ class TestProcessFile:
 
         # Temp file should be cleaned up by the finally block
         assert not tmp.exists()
+
+    @mock.patch("reencode_av1.__main__.get_video_bitrate")
+    @mock.patch("reencode_av1.__main__.encode_full")
+    @mock.patch("reencode_av1.__main__.find_optimal_crf")
+    @mock.patch("reencode_av1.__main__.get_output_path")
+    @mock.patch("reencode_av1.__main__.get_video_info")
+    def test_cache_dir_stages_source_and_moves_output(
+        self, mock_info, mock_output, mock_search, mock_encode, mock_bitrate
+    ):
+        """With --cache-dir, the source is staged locally, the encode reads from
+        the staged copy, and the final output is moved to the destination."""
+        mock_info.return_value = VideoInfo(
+            "h264", 1920, 1080, 30.0, False, 5000, 120.0, 3600, 2, "aac"
+        )
+        mock_search.return_value = CrfResult(crf=30, estimated_bitrate=2400, temp_file=None)
+        mock_bitrate.return_value = 2400
+
+        with tempfile.TemporaryDirectory() as src_d, \
+                tempfile.TemporaryDirectory() as dest_d, \
+                tempfile.TemporaryDirectory() as cache_d:
+            source = Path(src_d) / "video.mp4"
+            source.write_bytes(b"\x00" * 1024)
+            dest_output = Path(dest_d) / "video.mkv"
+            mock_output.return_value = dest_output
+            cache_dir = Path(cache_d)
+
+            encode_src = {}
+
+            def _fake_encode(src, out_path, *a, **kw):
+                encode_src["src"] = src
+                Path(out_path).write_bytes(b"\x00" * 512)
+                return 0
+
+            mock_encode.side_effect = _fake_encode
+
+            result = process_file(
+                source, self._make_args(cache_dir=cache_dir)
+            )
+
+            assert result == "processed"
+            # Encode read from the staged copy inside the cache dir, not the source.
+            assert encode_src["src"].parent == cache_dir
+            assert encode_src["src"] != source
+            # Final output was moved to the destination.
+            assert dest_output.exists()
+            # No staged input/output left behind in the cache dir.
+            assert list(cache_dir.iterdir()) == []
+
+    @mock.patch("reencode_av1.__main__.get_video_bitrate")
+    @mock.patch("reencode_av1.__main__.encode_full")
+    @mock.patch("reencode_av1.__main__.find_optimal_crf")
+    @mock.patch("reencode_av1.__main__.get_output_path")
+    @mock.patch("reencode_av1.__main__.get_video_info")
+    def test_cache_dir_failure_leaves_no_files_and_no_output(
+        self, mock_info, mock_output, mock_search, mock_encode, mock_bitrate
+    ):
+        """A failed encode must not move anything to the destination and must
+        clean up the staged copies."""
+        mock_info.return_value = VideoInfo(
+            "h264", 1920, 1080, 30.0, False, 5000, 120.0, 3600, 2, "aac"
+        )
+        mock_search.return_value = CrfResult(crf=30, estimated_bitrate=2400, temp_file=None)
+        mock_encode.return_value = 1  # non-zero exit -> failed
+
+        with tempfile.TemporaryDirectory() as src_d, \
+                tempfile.TemporaryDirectory() as dest_d, \
+                tempfile.TemporaryDirectory() as cache_d:
+            source = Path(src_d) / "video.mp4"
+            source.write_bytes(b"\x00" * 1024)
+            dest_output = Path(dest_d) / "video.mkv"
+            mock_output.return_value = dest_output
+            cache_dir = Path(cache_d)
+
+            result = process_file(
+                source, self._make_args(cache_dir=cache_dir)
+            )
+
+            assert result == "failed"
+            assert not dest_output.exists()
+            assert list(cache_dir.iterdir()) == []
 
 
 # ═══════════════════════════════════════════════════════════════════════════════

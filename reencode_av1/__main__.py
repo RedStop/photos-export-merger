@@ -7,6 +7,7 @@ import logging
 import shutil
 import sys
 import time
+import uuid
 from pathlib import Path
 
 from .encode import encode_full
@@ -45,6 +46,7 @@ examples:
   python -m reencode_av1 --search-method binary        # use pure binary search
   python -m reencode_av1 --search-method interpolation # use log-linear interpolation
   python -m reencode_av1 --precise                     # full-video search if out of range
+  python -m reencode_av1 --cache-dir D:/scratch \\nas/videos  # stage NAS sources on local disk
   python -m reencode_av1 --min-encode-bitrate 1000     # skip files already under 1000 kbps
   python -m reencode_av1 --min-encode-bitrate 0        # always encode regardless of bitrate
   python -m reencode_av1 --max-crf 55                  # tighter quality floor
@@ -134,6 +136,15 @@ examples:
     p.add_argument(
         "--precise", action="store_true",
         help="Redo search with full video if final bitrate is out of range",
+    )
+    p.add_argument(
+        "--cache-dir", type=Path, default=None,
+        help=(
+            "Local scratch directory. When set, each source is copied here before "
+            "encoding so the many decode passes read from local disk instead of the "
+            "source location (e.g. a NAS share); the final output is written here and "
+            "moved to its destination once complete. The directory is created if needed."
+        ),
     )
     p.add_argument(
         "--dry-run", action="store_true",
@@ -245,6 +256,9 @@ def validate_args(args: argparse.Namespace) -> None:
     if args.directory is not None:
         if not args.directory.is_dir():
             errors.append(f"directory does not exist or is not a directory: {args.directory}")
+
+    if args.cache_dir is not None and args.cache_dir.exists() and not args.cache_dir.is_dir():
+        errors.append(f"--cache-dir exists but is not a directory: {args.cache_dir}")
 
     if errors:
         for e in errors:
@@ -421,8 +435,33 @@ def process_file(
     temp_files: list[Path] = []
 
     try:
+        # Stage onto local scratch when --cache-dir is set, so the many decode
+        # passes read from local disk instead of the source location (e.g. a NAS
+        # share). Only stage now that we've committed to encoding — files skipped
+        # above are never copied. src/output_path are redirected to the local
+        # copies and registered in temp_files so the finally block removes them on
+        # every exit path; dest_output keeps the real destination for the final
+        # move performed by _finalize_output() on success.
+        dest_output = output_path
+        src = input_path
+        if args.cache_dir is not None:
+            args.cache_dir.mkdir(parents=True, exist_ok=True)
+            token = uuid.uuid4().hex
+            src = args.cache_dir / f"{token}-in{input_path.suffix}"
+            output_path = args.cache_dir / f"{token}-out{dest_output.suffix}"
+            temp_files.append(src)
+            temp_files.append(output_path)
+            log.info("  Caching source locally: %s", src)
+            shutil.copy2(input_path, src)
+
+        def _finalize_output() -> None:
+            """Move the locally-encoded output to its destination when caching."""
+            if output_path != dest_output and output_path.exists():
+                log.info("  Writing final output to %s", dest_output)
+                shutil.move(str(output_path), str(dest_output))
+
         result = find_optimal_crf(
-            input_path, windows, extra_args, audio_str,
+            src, windows, extra_args, audio_str,
             args.preset, audio_kbps, args.max_iterations,
             args.crf_min, args.max_crf, args.crf_ceiling_fallback,
             search_method=search_method,
@@ -467,7 +506,7 @@ def process_file(
             log.info("  Full encode with CRF=%d -> %s", result.crf, output_path)
             start = time.monotonic()
             exit_code = encode_full(
-                input_path, output_path, result.crf, extra_args,
+                src, output_path, result.crf, extra_args,
                 audio_str, args.preset, info.duration_sec, has_audio=has_audio,
             )
             elapsed = time.monotonic() - start
@@ -492,6 +531,7 @@ def process_file(
                 "  Done in %s. %.1f MB -> %.1f MB (could not determine output bitrate)",
                 elapsed_str, in_size_mb, out_size_mb,
             )
+            _finalize_output()
             if crf_ceiling_triggered == "low_original":
                 return "processed:crf_ceiling:low_original"
             if crf_ceiling_triggered:
@@ -531,7 +571,7 @@ def process_file(
             temp_files.append(seed_temp)
 
             precise_result = find_optimal_crf(
-                input_path, windows, extra_args, audio_str,
+                src, windows, extra_args, audio_str,
                 args.preset, audio_kbps, args.max_iterations,
                 args.crf_min, args.max_crf, args.crf_ceiling_fallback,
                 search_method=search_method,
@@ -551,7 +591,7 @@ def process_file(
                     args.crf_ceiling_fallback,
                 )
                 exit_code = encode_full(
-                    input_path, output_path, args.crf_ceiling_fallback, extra_args,
+                    src, output_path, args.crf_ceiling_fallback, extra_args,
                     audio_str, args.preset, info.duration_sec, has_audio=has_audio,
                 )
                 if exit_code != 0 or not output_path.exists():
@@ -582,6 +622,7 @@ def process_file(
                 log.error("  Full-video search produced no usable file")
                 return "failed"
 
+        _finalize_output()
         if crf_ceiling_triggered == "low_original":
             return "processed:crf_ceiling:low_original"
         if crf_ceiling_triggered:
@@ -667,6 +708,8 @@ def main() -> None:
     log.info("Target window: %d kbps", args.target_bitrate_window)
     log.info("Sample buffer: %d kbps", args.sample_bitrate_window_buffer)
     log.info("Min CRF: %d | Max CRF: %d | CRF ceiling fallback: %d", args.crf_min, args.max_crf, args.crf_ceiling_fallback)
+    if args.cache_dir is not None:
+        log.info("Cache dir: %s (sources staged locally before encoding)", args.cache_dir)
 
     windows = compute_windows(
         args.target_bitrate,
