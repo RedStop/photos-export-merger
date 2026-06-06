@@ -46,11 +46,11 @@ examples:
   python -m reencode_av1 --search-method binary        # use pure binary search
   python -m reencode_av1 --search-method interpolation # use log-linear interpolation
   python -m reencode_av1 --precise                     # full-video search if out of range
-  python -m reencode_av1 --cache-dir D:/scratch \\nas/videos  # stage NAS sources on local disk
-  python -m reencode_av1 --min-encode-bitrate 1000     # skip files already under 1000 kbps
-  python -m reencode_av1 --min-encode-bitrate 0        # always encode regardless of bitrate
-  python -m reencode_av1 --max-crf 55                  # tighter quality floor
-  python -m reencode_av1 --crf-ceiling-fallback 52     # specific fallback CRF when max-crf exceeded
+  python -m reencode_av1 --scratch-dir D:/scratch \\nas/videos  # stage NAS sources on local disk
+  python -m reencode_av1 --skip-below-bitrate 1000     # skip files already under 1000 kbps
+  python -m reencode_av1 --skip-below-bitrate 0        # always encode regardless of bitrate
+  python -m reencode_av1 --crf-max 55                  # tighter quality floor
+  python -m reencode_av1 --crf-ceiling-fallback 52     # specific fallback CRF when crf-max exceeded
 """,
     )
 
@@ -59,7 +59,7 @@ examples:
         help="Target video bitrate in kbps (default: 2500)",
     )
     p.add_argument(
-        "--min-encode-bitrate", type=int, default=None,
+        "--skip-below-bitrate", type=int, default=None,
         help=(
             "Skip re-encoding if the source video bitrate is already at or below this "
             "value in kbps. Defaults to --target-bitrate when not set. "
@@ -67,23 +67,23 @@ examples:
         ),
     )
     p.add_argument(
-        "--allowed-bitrate-window", type=int, default=1500,
+        "--accept-window", type=int, default=1500,
         help="Acceptable final bitrate range below target (default: 1500)",
     )
     p.add_argument(
-        "--target-bitrate-window", type=int, default=200,
+        "--confident-window", type=int, default=200,
         help="Immediate-accept zone width below target for full encodes (default: 200)",
     )
     p.add_argument(
-        "--sample-bitrate-window-buffer", type=int, default=None,
-        help="Inward buffer narrowing the sample search window (default: quarter of target-bitrate-window)",
+        "--sample-window-buffer", type=int, default=None,
+        help="Inward buffer narrowing the sample search window (default: quarter of confident-window)",
     )
     p.add_argument(
         "--crf-min", type=int, default=15,
         help="Minimum CRF value (default: 15)",
     )
     p.add_argument(
-        "--max-crf", type=int, default=57,
+        "--crf-max", type=int, default=57,
         help=(
             "Maximum CRF value for the search. If the bitrate at this CRF is still "
             "above the target, the video is encoded with --crf-ceiling-fallback instead "
@@ -93,13 +93,13 @@ examples:
     p.add_argument(
         "--crf-ceiling-fallback", type=int, default=None,
         help=(
-            "CRF to use when the search reaches --max-crf and the bitrate is still "
-            "above the target. Defaults to --max-crf when not set, but 48 is recommended."
+            "CRF to use when the search reaches --crf-max and the bitrate is still "
+            "above the target. Defaults to --crf-max when not set, but 48 is recommended."
         ),
     )
     p.add_argument(
         "--max-iterations", type=int, default=15,
-        help="Maximum binary search iterations (default: 15)",
+        help="Maximum CRF search iterations (default: 15)",
     )
     p.add_argument(
         "--segment-count", type=int, default=5,
@@ -138,7 +138,7 @@ examples:
         help="Redo search with full video if final bitrate is out of range",
     )
     p.add_argument(
-        "--cache-dir", type=Path, default=None,
+        "--scratch-dir", type=Path, default=None,
         help=(
             "Local scratch directory. When set, each source is copied here before "
             "encoding so the many decode passes read from local disk instead of the "
@@ -173,61 +173,61 @@ def validate_args(args: argparse.Namespace) -> None:
     if args.target_bitrate <= 0:
         errors.append("--target-bitrate must be positive")
 
-    if args.allowed_bitrate_window <= 0:
-        errors.append("--allowed-bitrate-window must be positive")
-    elif args.allowed_bitrate_window >= args.target_bitrate:
-        errors.append("--allowed-bitrate-window must be less than --target-bitrate")
+    if args.accept_window <= 0:
+        errors.append("--accept-window must be positive")
+    elif args.accept_window >= args.target_bitrate:
+        errors.append("--accept-window must be less than --target-bitrate")
 
-    if args.target_bitrate_window <= 0:
-        errors.append("--target-bitrate-window must be positive")
-    elif args.target_bitrate_window > args.allowed_bitrate_window:
+    if args.confident_window <= 0:
+        errors.append("--confident-window must be positive")
+    elif args.confident_window > args.accept_window:
         errors.append(
-            "--target-bitrate-window must be <= --allowed-bitrate-window"
+            "--confident-window must be <= --accept-window"
         )
 
-    # Resolve default for min-encode-bitrate
-    if args.min_encode_bitrate is None:
-        args.min_encode_bitrate = args.target_bitrate
+    # Resolve default for skip-below-bitrate
+    if args.skip_below_bitrate is None:
+        args.skip_below_bitrate = args.target_bitrate
 
-    if args.min_encode_bitrate < 0:
-        errors.append("--min-encode-bitrate must be >= 0 (use 0 to disable)")
+    if args.skip_below_bitrate < 0:
+        errors.append("--skip-below-bitrate must be >= 0 (use 0 to disable)")
 
     # Resolve default for sample buffer
-    if args.sample_bitrate_window_buffer is None:
-        args.sample_bitrate_window_buffer = args.target_bitrate_window // 4
+    if args.sample_window_buffer is None:
+        args.sample_window_buffer = args.confident_window // 4
 
-    buf = args.sample_bitrate_window_buffer
+    buf = args.sample_window_buffer
     if buf < 0:
-        errors.append("--sample-bitrate-window-buffer must be >= 0")
+        errors.append("--sample-window-buffer must be >= 0")
 
-    # Check sample window has positive length: allowed - 2*buffer > 0
-    sample_width = args.allowed_bitrate_window - 2 * buf
+    # Check sample window has positive length: accept - 2*buffer > 0
+    sample_width = args.accept_window - 2 * buf
     if sample_width <= 0:
         errors.append(
             f"Sample window has zero or negative width: "
-            f"allowed_window ({args.allowed_bitrate_window}) - 2*buffer ({2 * buf}) = {sample_width}. "
-            f"Reduce --sample-bitrate-window-buffer or increase --allowed-bitrate-window."
+            f"accept_window ({args.accept_window}) - 2*buffer ({2 * buf}) = {sample_width}. "
+            f"Reduce --sample-window-buffer or increase --accept-window."
         )
 
-    # Check confident zone: target_window >= 2*buffer
-    if args.target_bitrate_window < 2 * buf:
+    # Check confident zone: confident_window >= 2*buffer
+    if args.confident_window < 2 * buf:
         errors.append(
             f"Confident sample zone is inverted: "
-            f"target_window ({args.target_bitrate_window}) < 2*buffer ({2 * buf}). "
-            f"Increase --target-bitrate-window or decrease --sample-bitrate-window-buffer."
+            f"confident_window ({args.confident_window}) < 2*buffer ({2 * buf}). "
+            f"Increase --confident-window or decrease --sample-window-buffer."
         )
 
-    if not (0 <= args.crf_min < args.max_crf <= 63):
-        errors.append("--crf-min and --max-crf must satisfy 0 <= min < max <= 63")
+    if not (0 <= args.crf_min < args.crf_max <= 63):
+        errors.append("--crf-min and --crf-max must satisfy 0 <= min < max <= 63")
 
     # Resolve default for crf-ceiling-fallback
     if args.crf_ceiling_fallback is None:
-        args.crf_ceiling_fallback = args.max_crf
+        args.crf_ceiling_fallback = args.crf_max
 
-    if not (args.crf_min <= args.crf_ceiling_fallback <= args.max_crf):
+    if not (args.crf_min <= args.crf_ceiling_fallback <= args.crf_max):
         errors.append(
             f"--crf-ceiling-fallback ({args.crf_ceiling_fallback}) must be within "
-            f"[--crf-min, --max-crf] ([{args.crf_min}, {args.max_crf}])"
+            f"[--crf-min, --crf-max] ([{args.crf_min}, {args.crf_max}])"
         )
 
     if not (0 <= args.preset <= 13):
@@ -257,8 +257,8 @@ def validate_args(args: argparse.Namespace) -> None:
         if not args.directory.is_dir():
             errors.append(f"directory does not exist or is not a directory: {args.directory}")
 
-    if args.cache_dir is not None and args.cache_dir.exists() and not args.cache_dir.is_dir():
-        errors.append(f"--cache-dir exists but is not a directory: {args.cache_dir}")
+    if args.scratch_dir is not None and args.scratch_dir.exists() and not args.scratch_dir.is_dir():
+        errors.append(f"--scratch-dir exists but is not a directory: {args.scratch_dir}")
 
     if errors:
         for e in errors:
@@ -346,11 +346,11 @@ def process_file(
         info.duration_sec, info.frame_count,
     )
 
-    # Skip if source bitrate is already at or below the minimum encode threshold
-    if args.min_encode_bitrate > 0 and 0 < info.bitrate_kbps <= args.min_encode_bitrate:
+    # Skip if source bitrate is already at or below the skip threshold
+    if args.skip_below_bitrate > 0 and 0 < info.bitrate_kbps <= args.skip_below_bitrate:
         log.info(
-            "  Source bitrate (%d kbps) is at or below --min-encode-bitrate (%d kbps), skipping",
-            info.bitrate_kbps, args.min_encode_bitrate,
+            "  Source bitrate (%d kbps) is at or below --skip-below-bitrate (%d kbps), skipping",
+            info.bitrate_kbps, args.skip_below_bitrate,
         )
         return "skipped:low_bitrate"
 
@@ -391,9 +391,9 @@ def process_file(
     # Compute windows with effective target
     windows = compute_windows(
         effective_target,
-        args.allowed_bitrate_window,
-        args.target_bitrate_window,
-        args.sample_bitrate_window_buffer,
+        args.accept_window,
+        args.confident_window,
+        args.sample_window_buffer,
     )
 
     extra_args = build_extra_args(info)
@@ -435,7 +435,7 @@ def process_file(
     temp_files: list[Path] = []
 
     try:
-        # Stage onto local scratch when --cache-dir is set, so the many decode
+        # Stage onto local scratch when --scratch-dir is set, so the many decode
         # passes read from local disk instead of the source location (e.g. a NAS
         # share). Only stage now that we've committed to encoding — files skipped
         # above are never copied. src/output_path are redirected to the local
@@ -444,11 +444,11 @@ def process_file(
         # move performed by _finalize_output() on success.
         dest_output = output_path
         src = input_path
-        if args.cache_dir is not None:
-            args.cache_dir.mkdir(parents=True, exist_ok=True)
+        if args.scratch_dir is not None:
+            args.scratch_dir.mkdir(parents=True, exist_ok=True)
             token = uuid.uuid4().hex
-            src = args.cache_dir / f"{token}-in{input_path.suffix}"
-            output_path = args.cache_dir / f"{token}-out{dest_output.suffix}"
+            src = args.scratch_dir / f"{token}-in{input_path.suffix}"
+            output_path = args.scratch_dir / f"{token}-out{dest_output.suffix}"
             temp_files.append(src)
             temp_files.append(output_path)
             log.info("  Caching source locally: %s", src)
@@ -463,7 +463,7 @@ def process_file(
         result = find_optimal_crf(
             src, windows, extra_args, audio_str,
             args.preset, audio_kbps, args.max_iterations,
-            args.crf_min, args.max_crf, args.crf_ceiling_fallback,
+            args.crf_min, args.crf_max, args.crf_ceiling_fallback,
             search_method=search_method,
             offsets=offsets, seg_duration=args.segment_duration,
             full_encode=is_short_video,
@@ -476,9 +476,9 @@ def process_file(
         crf_ceiling_triggered: bool | str = False
         if result.crf_ceiling_used:
             log.warning(
-                "  Search reached --max-crf (%d) with bitrate still above target. "
+                "  Search reached --crf-max (%d) with bitrate still above target. "
                 "Encoding with --crf-ceiling-fallback=%d.",
-                args.max_crf, args.crf_ceiling_fallback,
+                args.crf_max, args.crf_ceiling_fallback,
             )
             crf_ceiling_triggered = True
             if info.bitrate_kbps > 0 and info.bitrate_kbps < 2 * args.target_bitrate:
@@ -573,7 +573,7 @@ def process_file(
             precise_result = find_optimal_crf(
                 src, windows, extra_args, audio_str,
                 args.preset, audio_kbps, args.max_iterations,
-                args.crf_min, args.max_crf, args.crf_ceiling_fallback,
+                args.crf_min, args.crf_max, args.crf_ceiling_fallback,
                 search_method=search_method,
                 full_encode=True,
                 seed_crf=result.crf,
@@ -586,7 +586,7 @@ def process_file(
 
             if precise_result.crf_ceiling_used:
                 log.warning(
-                    "  Precise search also reached --max-crf; encoding with "
+                    "  Precise search also reached --crf-max; encoding with "
                     "--crf-ceiling-fallback=%d",
                     args.crf_ceiling_fallback,
                 )
@@ -701,21 +701,21 @@ def main() -> None:
     log.info("=" * 60)
     log.info("Target: %d kbps", args.target_bitrate)
     log.info(
-        "Min encode bitrate: %s",
-        f"{args.min_encode_bitrate} kbps" if args.min_encode_bitrate > 0 else "disabled (0)",
+        "Skip below bitrate: %s",
+        f"{args.skip_below_bitrate} kbps" if args.skip_below_bitrate > 0 else "disabled (0)",
     )
-    log.info("Allowed window: %d kbps", args.allowed_bitrate_window)
-    log.info("Target window: %d kbps", args.target_bitrate_window)
-    log.info("Sample buffer: %d kbps", args.sample_bitrate_window_buffer)
-    log.info("Min CRF: %d | Max CRF: %d | CRF ceiling fallback: %d", args.crf_min, args.max_crf, args.crf_ceiling_fallback)
-    if args.cache_dir is not None:
-        log.info("Cache dir: %s (sources staged locally before encoding)", args.cache_dir)
+    log.info("Accept window: %d kbps", args.accept_window)
+    log.info("Confident window: %d kbps", args.confident_window)
+    log.info("Sample buffer: %d kbps", args.sample_window_buffer)
+    log.info("Min CRF: %d | Max CRF: %d | CRF ceiling fallback: %d", args.crf_min, args.crf_max, args.crf_ceiling_fallback)
+    if args.scratch_dir is not None:
+        log.info("Scratch dir: %s (sources staged locally before encoding)", args.scratch_dir)
 
     windows = compute_windows(
         args.target_bitrate,
-        args.allowed_bitrate_window,
-        args.target_bitrate_window,
-        args.sample_bitrate_window_buffer,
+        args.accept_window,
+        args.confident_window,
+        args.sample_window_buffer,
     )
     log.info(
         "Sample window: [%d, %d], confident: [%d, %d]",

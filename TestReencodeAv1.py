@@ -923,12 +923,12 @@ class TestValidateArgs:
     def _make_args(self, **overrides):
         defaults = {
             "target_bitrate": 2500,
-            "allowed_bitrate_window": 1500,
-            "target_bitrate_window": 200,
-            "min_encode_bitrate": None,
-            "sample_bitrate_window_buffer": None,
+            "accept_window": 1500,
+            "confident_window": 200,
+            "skip_below_bitrate": None,
+            "sample_window_buffer": None,
             "crf_min": 1,
-            "max_crf": 57,
+            "crf_max": 57,
             "crf_ceiling_fallback": None,
             "preset": 3,
             "segment_count": 5,
@@ -936,7 +936,7 @@ class TestValidateArgs:
             "short_video_threshold": 90.0,
             "audio_bitrate": 0,
             "directory": None,
-            "cache_dir": None,
+            "scratch_dir": None,
         }
         defaults.update(overrides)
         return argparse.Namespace(**defaults)
@@ -944,7 +944,7 @@ class TestValidateArgs:
     def test_valid_defaults(self):
         args = self._make_args()
         validate_args(args)  # should not raise
-        assert args.sample_bitrate_window_buffer == 50  # auto-resolved
+        assert args.sample_window_buffer == 50  # auto-resolved
 
     def test_negative_target_bitrate(self):
         args = self._make_args(target_bitrate=-1)
@@ -952,22 +952,22 @@ class TestValidateArgs:
             validate_args(args)
 
     def test_window_exceeds_target(self):
-        args = self._make_args(allowed_bitrate_window=3000)
+        args = self._make_args(accept_window=3000)
         with pytest.raises(SystemExit):
             validate_args(args)
 
     def test_target_window_exceeds_allowed(self):
-        args = self._make_args(target_bitrate_window=1600)
+        args = self._make_args(confident_window=1600)
         with pytest.raises(SystemExit):
             validate_args(args)
 
     def test_crf_min_above_max(self):
-        args = self._make_args(crf_min=50, max_crf=30)
+        args = self._make_args(crf_min=50, crf_max=30)
         with pytest.raises(SystemExit):
             validate_args(args)
 
     def test_crf_out_of_range(self):
-        args = self._make_args(max_crf=100)
+        args = self._make_args(crf_max=100)
         with pytest.raises(SystemExit):
             validate_args(args)
 
@@ -988,15 +988,15 @@ class TestValidateArgs:
 
     def test_buffer_too_large(self):
         """Buffer so large that sample window has zero width."""
-        args = self._make_args(sample_bitrate_window_buffer=300)
+        args = self._make_args(sample_window_buffer=300)
         with pytest.raises(SystemExit):
             validate_args(args)
 
     def test_confident_zone_inverted(self):
-        """target_window < 2*buffer makes the confident zone inverted."""
+        """confident_window < 2*buffer makes the confident zone inverted."""
         args = self._make_args(
-            target_bitrate_window=10,
-            sample_bitrate_window_buffer=50,
+            confident_window=10,
+            sample_window_buffer=50,
         )
         with pytest.raises(SystemExit):
             validate_args(args)
@@ -1015,23 +1015,23 @@ class TestValidateArgs:
         args = self._make_args(directory=None)
         validate_args(args)  # should not raise
 
-    def test_cache_dir_none(self):
-        args = self._make_args(cache_dir=None)
+    def test_scratch_dir_none(self):
+        args = self._make_args(scratch_dir=None)
         validate_args(args)  # should not raise
 
-    def test_cache_dir_existing_directory(self):
+    def test_scratch_dir_existing_directory(self):
         with tempfile.TemporaryDirectory() as d:
-            args = self._make_args(cache_dir=Path(d))
+            args = self._make_args(scratch_dir=Path(d))
             validate_args(args)  # should not raise
 
-    def test_cache_dir_nonexistent_is_allowed(self):
-        # A not-yet-existing cache dir is fine; it is created at runtime.
-        args = self._make_args(cache_dir=Path("/nonexistent/cache/xyz"))
+    def test_scratch_dir_nonexistent_is_allowed(self):
+        # A not-yet-existing scratch dir is fine; it is created at runtime.
+        args = self._make_args(scratch_dir=Path("/nonexistent/scratch/xyz"))
         validate_args(args)  # should not raise
 
-    def test_cache_dir_is_a_file(self):
+    def test_scratch_dir_is_a_file(self):
         with tempfile.NamedTemporaryFile(suffix=".tmp") as f:
-            args = self._make_args(cache_dir=Path(f.name))
+            args = self._make_args(scratch_dir=Path(f.name))
             with pytest.raises(SystemExit):
                 validate_args(args)
 
@@ -1074,15 +1074,15 @@ class TestBuildParser:
         args = parser.parse_args([])
         assert args.directory is None
 
-    def test_cache_dir_default_is_none(self):
+    def test_scratch_dir_default_is_none(self):
         parser = build_parser()
         args = parser.parse_args([])
-        assert args.cache_dir is None
+        assert args.scratch_dir is None
 
-    def test_cache_dir_argument(self):
+    def test_scratch_dir_argument(self):
         parser = build_parser()
-        args = parser.parse_args(["--cache-dir", "/some/scratch"])
-        assert args.cache_dir == Path("/some/scratch")
+        args = parser.parse_args(["--scratch-dir", "/some/scratch"])
+        assert args.scratch_dir == Path("/some/scratch")
 
     def test_directory_argument(self):
         parser = build_parser()
@@ -1102,12 +1102,12 @@ class TestProcessFile:
     def _make_args(self, **overrides):
         defaults = {
             "target_bitrate": 2500,
-            "min_encode_bitrate": 0,
-            "allowed_bitrate_window": 1500,
-            "target_bitrate_window": 100,
-            "sample_bitrate_window_buffer": 50,
+            "skip_below_bitrate": 0,
+            "accept_window": 1500,
+            "confident_window": 100,
+            "sample_window_buffer": 50,
             "crf_min": 1,
-            "max_crf": 57,
+            "crf_max": 57,
             "crf_ceiling_fallback": 48,
             "preset": 3,
             "segment_count": 5,
@@ -1118,7 +1118,7 @@ class TestProcessFile:
             "precise": False,
             "dry_run": False,
             "max_iterations": 15,
-            "cache_dir": None,
+            "scratch_dir": None,
         }
         defaults.update(overrides)
         return argparse.Namespace(**defaults)
@@ -1204,10 +1204,10 @@ class TestProcessFile:
     @mock.patch("reencode_av1.__main__.find_optimal_crf")
     @mock.patch("reencode_av1.__main__.get_output_path")
     @mock.patch("reencode_av1.__main__.get_video_info")
-    def test_cache_dir_stages_source_and_moves_output(
+    def test_scratch_dir_stages_source_and_moves_output(
         self, mock_info, mock_output, mock_search, mock_encode, mock_bitrate
     ):
-        """With --cache-dir, the source is staged locally, the encode reads from
+        """With --scratch-dir, the source is staged locally, the encode reads from
         the staged copy, and the final output is moved to the destination."""
         mock_info.return_value = VideoInfo(
             "h264", 1920, 1080, 30.0, False, 5000, 120.0, 3600, 2, "aac"
@@ -1217,12 +1217,12 @@ class TestProcessFile:
 
         with tempfile.TemporaryDirectory() as src_d, \
                 tempfile.TemporaryDirectory() as dest_d, \
-                tempfile.TemporaryDirectory() as cache_d:
+                tempfile.TemporaryDirectory() as scratch_d:
             source = Path(src_d) / "video.mp4"
             source.write_bytes(b"\x00" * 1024)
             dest_output = Path(dest_d) / "video.mkv"
             mock_output.return_value = dest_output
-            cache_dir = Path(cache_d)
+            scratch_dir = Path(scratch_d)
 
             encode_src = {}
 
@@ -1234,24 +1234,24 @@ class TestProcessFile:
             mock_encode.side_effect = _fake_encode
 
             result = process_file(
-                source, self._make_args(cache_dir=cache_dir)
+                source, self._make_args(scratch_dir=scratch_dir)
             )
 
             assert result == "processed"
-            # Encode read from the staged copy inside the cache dir, not the source.
-            assert encode_src["src"].parent == cache_dir
+            # Encode read from the staged copy inside the scratch dir, not the source.
+            assert encode_src["src"].parent == scratch_dir
             assert encode_src["src"] != source
             # Final output was moved to the destination.
             assert dest_output.exists()
-            # No staged input/output left behind in the cache dir.
-            assert list(cache_dir.iterdir()) == []
+            # No staged input/output left behind in the scratch dir.
+            assert list(scratch_dir.iterdir()) == []
 
     @mock.patch("reencode_av1.__main__.get_video_bitrate")
     @mock.patch("reencode_av1.__main__.encode_full")
     @mock.patch("reencode_av1.__main__.find_optimal_crf")
     @mock.patch("reencode_av1.__main__.get_output_path")
     @mock.patch("reencode_av1.__main__.get_video_info")
-    def test_cache_dir_failure_leaves_no_files_and_no_output(
+    def test_scratch_dir_failure_leaves_no_files_and_no_output(
         self, mock_info, mock_output, mock_search, mock_encode, mock_bitrate
     ):
         """A failed encode must not move anything to the destination and must
@@ -1264,20 +1264,20 @@ class TestProcessFile:
 
         with tempfile.TemporaryDirectory() as src_d, \
                 tempfile.TemporaryDirectory() as dest_d, \
-                tempfile.TemporaryDirectory() as cache_d:
+                tempfile.TemporaryDirectory() as scratch_d:
             source = Path(src_d) / "video.mp4"
             source.write_bytes(b"\x00" * 1024)
             dest_output = Path(dest_d) / "video.mkv"
             mock_output.return_value = dest_output
-            cache_dir = Path(cache_d)
+            scratch_dir = Path(scratch_d)
 
             result = process_file(
-                source, self._make_args(cache_dir=cache_dir)
+                source, self._make_args(scratch_dir=scratch_dir)
             )
 
             assert result == "failed"
             assert not dest_output.exists()
-            assert list(cache_dir.iterdir()) == []
+            assert list(scratch_dir.iterdir()) == []
 
 
 # ═══════════════════════════════════════════════════════════════════════════════
