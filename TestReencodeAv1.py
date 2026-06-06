@@ -980,6 +980,17 @@ class TestValidateArgs:
         with pytest.raises(SystemExit):
             validate_args(args)
 
+    def test_crf_min_equal_max_allowed(self):
+        # Equal min/max pins a fixed CRF (search skipped); must be accepted.
+        args = self._make_args(crf_min=30, crf_max=30)
+        validate_args(args)  # should not raise
+
+    def test_fixed_crf_allows_out_of_point_ceiling_fallback(self):
+        # In fixed-CRF mode the ceiling can never be reached, so
+        # --crf-ceiling-fallback is not constrained to the single [min, max] point.
+        args = self._make_args(crf_min=30, crf_max=30, crf_ceiling_fallback=48)
+        validate_args(args)  # should not raise
+
     def test_bad_preset(self):
         args = self._make_args(preset=20)
         with pytest.raises(SystemExit):
@@ -1366,6 +1377,147 @@ class TestProcessFile:
 
             assert result.status == "failed"
             assert not dest_output.exists()
+            assert list(scratch_dir.iterdir()) == []
+
+    @mock.patch("reencode_av1.__main__.get_video_bitrate")
+    @mock.patch("reencode_av1.__main__.encode_full")
+    @mock.patch("reencode_av1.__main__.find_optimal_crf")
+    @mock.patch("reencode_av1.__main__.get_output_path")
+    @mock.patch("reencode_av1.__main__.get_video_info")
+    def test_fixed_crf_skips_search_and_encodes_at_pinned_crf(
+        self, mock_info, mock_output, mock_search, mock_encode, mock_bitrate
+    ):
+        """When --crf-min == --crf-max, no CRF search runs: the video is encoded
+        once at that CRF (even on a long video that would otherwise sample)."""
+        # 600s video — well above the short-video threshold, so a normal run
+        # would sample and search. Fixed mode must bypass all of that.
+        mock_info.return_value = VideoInfo(
+            "h264", 1920, 1080, 30.0, False, 5000, 600.0, 18000, 2, "aac"
+        )
+        mock_bitrate.return_value = 9999  # bitrate is irrelevant in fixed mode
+
+        with tempfile.TemporaryDirectory() as d:
+            source = Path(d) / "video.mp4"
+            source.write_bytes(b"\x00" * 1024)
+            dest_output = Path(d) / "video.mkv"
+            mock_output.return_value = dest_output
+
+            def _fake_encode(src, out_path, crf, *a, **kw):
+                Path(out_path).write_bytes(b"\x00" * 512)
+                return 0
+
+            mock_encode.side_effect = _fake_encode
+
+            result = process_file(source, self._make_args(crf_min=30, crf_max=30))
+
+            assert result.status == "processed"
+            assert result.crf == 30
+            # The search was never invoked.
+            mock_search.assert_not_called()
+            # A single full encode ran at the pinned CRF.
+            mock_encode.assert_called_once()
+            assert mock_encode.call_args.args[2] == 30
+            assert dest_output.exists()
+
+    @mock.patch("reencode_av1.__main__.get_video_bitrate")
+    @mock.patch("reencode_av1.__main__.encode_full")
+    @mock.patch("reencode_av1.__main__.find_optimal_crf")
+    @mock.patch("reencode_av1.__main__.get_output_path")
+    @mock.patch("reencode_av1.__main__.get_video_info")
+    def test_fixed_crf_ignores_precise_mode_when_bitrate_out_of_range(
+        self, mock_info, mock_output, mock_search, mock_encode, mock_bitrate
+    ):
+        """In fixed-CRF mode, an out-of-range output bitrate must NOT trigger the
+        precise re-search, even with precise enabled."""
+        mock_info.return_value = VideoInfo(
+            "h264", 1920, 1080, 30.0, False, 5000, 600.0, 18000, 2, "aac"
+        )
+        mock_bitrate.return_value = 99999  # far above any window
+
+        with tempfile.TemporaryDirectory() as d:
+            source = Path(d) / "video.mp4"
+            source.write_bytes(b"\x00" * 1024)
+            dest_output = Path(d) / "video.mkv"
+            mock_output.return_value = dest_output
+
+            def _fake_encode(src, out_path, crf, *a, **kw):
+                Path(out_path).write_bytes(b"\x00" * 512)
+                return 0
+
+            mock_encode.side_effect = _fake_encode
+
+            result = process_file(
+                source, self._make_args(crf_min=28, crf_max=28, precise=True)
+            )
+
+            assert result.status == "processed"
+            assert result.crf == 28
+            # No search at all — neither the initial search nor a precise re-search.
+            mock_search.assert_not_called()
+            mock_encode.assert_called_once()
+
+    @mock.patch("reencode_av1.__main__.find_optimal_crf")
+    @mock.patch("reencode_av1.__main__.get_video_info")
+    def test_fixed_crf_still_skips_low_bitrate_source(self, mock_info, mock_search):
+        """Fixed-CRF mode keeps the --skip-below-bitrate skip: a low-bitrate
+        source is skipped before any encode."""
+        mock_info.return_value = VideoInfo(
+            "h264", 1920, 1080, 30.0, False, 800, 120.0, 3600, 2, "aac"
+        )
+        result = process_file(
+            Path("test.mp4"),
+            self._make_args(crf_min=30, crf_max=30, skip_below_bitrate=2500),
+        )
+        assert result.status == "skipped:low_bitrate"
+        mock_search.assert_not_called()
+
+    @mock.patch("reencode_av1.__main__.get_video_bitrate")
+    @mock.patch("reencode_av1.__main__.encode_full")
+    @mock.patch("reencode_av1.__main__.find_optimal_crf")
+    @mock.patch("reencode_av1.__main__.get_output_path")
+    @mock.patch("reencode_av1.__main__.get_video_info")
+    def test_fixed_crf_with_scratch_dir(
+        self, mock_info, mock_output, mock_search, mock_encode, mock_bitrate
+    ):
+        """Fixed-CRF mode composes with --scratch-dir: the source is staged, the
+        encode reads the staged copy at the pinned CRF, the output is moved to its
+        destination, and nothing is left in the scratch dir."""
+        mock_info.return_value = VideoInfo(
+            "h264", 1920, 1080, 30.0, False, 5000, 600.0, 18000, 2, "aac"
+        )
+        mock_bitrate.return_value = 9999
+
+        with tempfile.TemporaryDirectory() as src_d, \
+                tempfile.TemporaryDirectory() as dest_d, \
+                tempfile.TemporaryDirectory() as scratch_d:
+            source = Path(src_d) / "video.mp4"
+            source.write_bytes(b"\x00" * 1024)
+            dest_output = Path(dest_d) / "video.mkv"
+            mock_output.return_value = dest_output
+            scratch_dir = Path(scratch_d)
+
+            encode_src = {}
+
+            def _fake_encode(src, out_path, crf, *a, **kw):
+                encode_src["src"] = src
+                encode_src["crf"] = crf
+                Path(out_path).write_bytes(b"\x00" * 512)
+                return 0
+
+            mock_encode.side_effect = _fake_encode
+
+            result = process_file(
+                source,
+                self._make_args(crf_min=30, crf_max=30, scratch_dir=scratch_dir),
+            )
+
+            assert result.status == "processed"
+            assert result.crf == 30
+            mock_search.assert_not_called()
+            # Encode read the staged copy at the pinned CRF.
+            assert encode_src["src"].parent == scratch_dir
+            assert encode_src["crf"] == 30
+            assert dest_output.exists()
             assert list(scratch_dir.iterdir()) == []
 
 

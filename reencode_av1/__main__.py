@@ -17,6 +17,7 @@ from .probe import VideoInfo, get_video_bitrate, get_video_info
 from .progress import load_progress, progress_path_for, record_progress
 from .search import (
     CrfPoint,
+    CrfResult,
     binary_search_next,
     find_optimal_crf,
     interpolation_next,
@@ -68,6 +69,7 @@ examples:
   python -m reencode_av1 --skip-below-bitrate 0        # always encode regardless of bitrate
   python -m reencode_av1 --crf-max 55                  # tighter quality floor
   python -m reencode_av1 --crf-ceiling-fallback 52     # specific fallback CRF when crf-max exceeded
+  python -m reencode_av1 --crf-min 30 --crf-max 30     # fixed CRF 30, skip the search entirely
 """,
     )
 
@@ -97,14 +99,21 @@ examples:
     )
     p.add_argument(
         "--crf-min", type=int, default=15,
-        help="Minimum CRF value (default: 15)",
+        help=(
+            "Minimum CRF value for the search (default: 15). Set equal to "
+            "--crf-max to pin a fixed CRF: the CRF search is skipped entirely and "
+            "every video is encoded at that CRF regardless of bitrate (the "
+            "target-bitrate, window, search-method, precise, and "
+            "crf-ceiling-fallback options are then ignored; the source-bitrate, "
+            "already-AV1, and existing-output skips still apply)."
+        ),
     )
     p.add_argument(
         "--crf-max", type=int, default=57,
         help=(
             "Maximum CRF value for the search. If the bitrate at this CRF is still "
             "above the target, the video is encoded with --crf-ceiling-fallback instead "
-            "(default: 57)."
+            "(default: 57). Set equal to --crf-min to pin a fixed CRF (see --crf-min)."
         ),
     )
     p.add_argument(
@@ -261,14 +270,17 @@ def validate_args(args: argparse.Namespace) -> None:
             f"Increase --confident-window or decrease --sample-window-buffer."
         )
 
-    if not (0 <= args.crf_min < args.crf_max <= 63):
-        errors.append("--crf-min and --crf-max must satisfy 0 <= min < max <= 63")
+    # crf-min may equal crf-max: that pins a fixed CRF and skips the search.
+    if not (0 <= args.crf_min <= args.crf_max <= 63):
+        errors.append("--crf-min and --crf-max must satisfy 0 <= min <= max <= 63")
 
     # Resolve default for crf-ceiling-fallback
     if args.crf_ceiling_fallback is None:
         args.crf_ceiling_fallback = args.crf_max
 
-    if not (args.crf_min <= args.crf_ceiling_fallback <= args.crf_max):
+    # In fixed-CRF mode (min == max) the ceiling can never be reached, so
+    # crf-ceiling-fallback is ignored and its value is not constrained.
+    if args.crf_min != args.crf_max and not (args.crf_min <= args.crf_ceiling_fallback <= args.crf_max):
         errors.append(
             f"--crf-ceiling-fallback ({args.crf_ceiling_fallback}) must be within "
             f"[--crf-min, --crf-max] ([{args.crf_min}, {args.crf_max}])"
@@ -449,42 +461,57 @@ def process_file(
         log.info("  [DRY RUN] Would encode to: %s", output_path)
         return FileResult("skipped:dry_run")
 
-    # Determine if short video — videos at or under the threshold are encoded in
-    # full during the search (no segment sampling); longer videos use
-    # multi-segment sampling, with a full-video re-search when precise mode is on.
-    is_short_video = info.duration_sec > 0 and info.duration_sec <= args.short_video_threshold
+    # Fixed-CRF mode: when --crf-min == --crf-max the user pins the CRF. The
+    # entire bitrate-driven search is skipped and the video is encoded at that
+    # CRF regardless of bitrate; the target-bitrate, window, search-method,
+    # precise, and crf-ceiling-fallback options are ignored. The skip checks
+    # above (source bitrate, already-AV1, existing output) still apply.
+    fixed_crf = args.crf_min if args.crf_min == args.crf_max else None
 
-    # --precise-only forces a full-video CRF search for every file regardless of
-    # length. Short videos already take the full-video search path. In both cases
-    # the search encodes the whole file, so segment sampling and the precise
-    # re-search pass are skipped and the chosen encode is reused as the output.
-    use_full_search = is_short_video or args.precise_only
-
-    if args.precise_only:
-        log.info("  --precise-only: encoding full video during search")
-    elif is_short_video:
-        log.info(
-            "  Video (%.1fs) <= %.0fs threshold, encoding full video during search",
-            info.duration_sec, args.short_video_threshold,
-        )
-
-    # Choose search method (smart search is the default)
-    search_method = {
-        "smart": smart_search_next,
-        "interpolation": interpolation_next,
-        "binary": binary_search_next,
-    }[args.search_method]
-    search_label = f" ({args.search_method})"
-
-    # Compute segment offsets for multi-segment sampling
+    # Defaults for the search-only locals; overwritten below when searching.
+    use_full_search = False
     offsets: list[float] | None = None
-    if not use_full_search:
-        offsets = compute_segment_offsets(
-            info.duration_sec, args.segment_count, args.segment_duration,
-        )
-        log.debug("  Segment offsets: %s", offsets)
+    search_method = smart_search_next
 
-    log.info("  Starting CRF search%s...", search_label)
+    if fixed_crf is not None:
+        log.info("  Fixed CRF mode: encoding at CRF=%d (search skipped)", fixed_crf)
+    else:
+        # Determine if short video — videos at or under the threshold are encoded
+        # in full during the search (no segment sampling); longer videos use
+        # multi-segment sampling, with a full-video re-search when precise mode is on.
+        is_short_video = info.duration_sec > 0 and info.duration_sec <= args.short_video_threshold
+
+        # --precise-only forces a full-video CRF search for every file regardless
+        # of length. Short videos already take the full-video search path. In both
+        # cases the search encodes the whole file, so segment sampling and the
+        # precise re-search pass are skipped and the chosen encode is reused as the
+        # output.
+        use_full_search = is_short_video or args.precise_only
+
+        if args.precise_only:
+            log.info("  --precise-only: encoding full video during search")
+        elif is_short_video:
+            log.info(
+                "  Video (%.1fs) <= %.0fs threshold, encoding full video during search",
+                info.duration_sec, args.short_video_threshold,
+            )
+
+        # Choose search method (smart search is the default)
+        search_method = {
+            "smart": smart_search_next,
+            "interpolation": interpolation_next,
+            "binary": binary_search_next,
+        }[args.search_method]
+        search_label = f" ({args.search_method})"
+
+        # Compute segment offsets for multi-segment sampling
+        if not use_full_search:
+            offsets = compute_segment_offsets(
+                info.duration_sec, args.segment_count, args.segment_duration,
+            )
+            log.debug("  Segment offsets: %s", offsets)
+
+        log.info("  Starting CRF search%s...", search_label)
 
     # Track temp files for cleanup on exceptions
     temp_files: list[Path] = []
@@ -515,15 +542,21 @@ def process_file(
                 log.info("  Writing final output to %s", dest_output)
                 shutil.move(str(output_path), str(dest_output))
 
-        result = find_optimal_crf(
-            src, windows, extra_args, audio_str,
-            args.preset, audio_kbps, args.max_iterations,
-            args.crf_min, args.crf_max, args.crf_ceiling_fallback,
-            search_method=search_method,
-            offsets=offsets, seg_duration=args.segment_duration,
-            full_encode=use_full_search,
-            has_audio=has_audio,
-        )
+        if fixed_crf is not None:
+            # No search: synthesise a result pinned to the fixed CRF. temp_file is
+            # None, so the full-encode branch below encodes the video once at this
+            # CRF, and crf_ceiling_used=False keeps the ceiling path inactive.
+            result = CrfResult(fixed_crf, 0, None, crf_ceiling_used=False)
+        else:
+            result = find_optimal_crf(
+                src, windows, extra_args, audio_str,
+                args.preset, audio_kbps, args.max_iterations,
+                args.crf_min, args.crf_max, args.crf_ceiling_fallback,
+                search_method=search_method,
+                offsets=offsets, seg_duration=args.segment_duration,
+                full_encode=use_full_search,
+                has_audio=has_audio,
+            )
         if result.temp_file:
             temp_files.append(result.temp_file)
 
@@ -601,18 +634,24 @@ def process_file(
             elapsed_str, in_size_mb, out_size_mb, out_bitrate,
         )
 
-        out_of_range = out_bitrate > windows.final_hi or out_bitrate < windows.final_lo
+        # In fixed-CRF mode the bitrate is accepted as-is, so the window checks
+        # (and the precise re-search they would trigger) are skipped.
+        out_of_range = (
+            fixed_crf is None
+            and (out_bitrate > windows.final_hi or out_bitrate < windows.final_lo)
+        )
 
-        if out_bitrate > windows.final_hi:
-            log.warning(
-                "  Final bitrate (%d kbps) exceeds target (%d kbps)",
-                out_bitrate, windows.final_hi,
-            )
-        elif out_bitrate < windows.final_lo:
-            log.warning(
-                "  Final bitrate (%d kbps) below allowed range [%d, %d] kbps",
-                out_bitrate, windows.final_lo, windows.final_hi,
-            )
+        if fixed_crf is None:
+            if out_bitrate > windows.final_hi:
+                log.warning(
+                    "  Final bitrate (%d kbps) exceeds target (%d kbps)",
+                    out_bitrate, windows.final_hi,
+                )
+            elif out_bitrate < windows.final_lo:
+                log.warning(
+                    "  Final bitrate (%d kbps) below allowed range [%d, %d] kbps",
+                    out_bitrate, windows.final_lo, windows.final_hi,
+                )
 
         # ── Precise mode ─────────────────────────────────────────────
         if args.precise and out_of_range and not use_full_search and not crf_ceiling_triggered:
@@ -762,34 +801,50 @@ def main() -> None:
     log.info("=" * 60)
     log.info("AV1 Re-encode Session Started")
     log.info("=" * 60)
-    log.info("Target: %d kbps", args.target_bitrate)
+    # In fixed-CRF mode the target/window/search settings don't apply, so the
+    # bitrate-tuning startup lines (which would otherwise contradict the warning)
+    # are suppressed. The --skip-below-bitrate line stays: that skip still fires.
+    fixed_crf_mode = args.crf_min == args.crf_max
+    if fixed_crf_mode:
+        log.warning(
+            "Fixed CRF mode: --crf-min == --crf-max == %d. The CRF search is "
+            "skipped and every video is encoded at this CRF regardless of bitrate; "
+            "target-bitrate, window, search-method, precise, and "
+            "crf-ceiling-fallback options are ignored (source-bitrate, already-AV1, "
+            "and existing-output skips still apply).",
+            args.crf_min,
+        )
+    else:
+        log.info("Target: %d kbps", args.target_bitrate)
     log.info(
         "Skip below bitrate: %s",
         f"{args.skip_below_bitrate} kbps" if args.skip_below_bitrate > 0 else "disabled (0)",
     )
-    log.info("Accept window: %d kbps", args.accept_window)
-    log.info("Confident window: %d kbps", args.confident_window)
-    log.info("Sample buffer: %d kbps", args.sample_window_buffer)
+    if not fixed_crf_mode:
+        log.info("Accept window: %d kbps", args.accept_window)
+        log.info("Confident window: %d kbps", args.confident_window)
+        log.info("Sample buffer: %d kbps", args.sample_window_buffer)
     log.info("Min CRF: %d | Max CRF: %d | CRF ceiling fallback: %d", args.crf_min, args.crf_max, args.crf_ceiling_fallback)
     if args.scratch_dir is not None:
         log.info("Scratch dir: %s (sources staged locally before encoding)", args.scratch_dir)
 
-    windows = compute_windows(
-        args.target_bitrate,
-        args.accept_window,
-        args.confident_window,
-        args.sample_window_buffer,
-    )
-    log.info(
-        "Sample window: [%d, %d], confident: [%d, %d]",
-        windows.sample_lo, windows.sample_hi,
-        windows.sample_confident_lo, windows.sample_confident_hi,
-    )
-    log.info(
-        "Final window: [%d, %d], accept: [%d, %d]",
-        windows.final_lo, windows.final_hi,
-        windows.final_accept_lo, windows.final_accept_hi,
-    )
+    if not fixed_crf_mode:
+        windows = compute_windows(
+            args.target_bitrate,
+            args.accept_window,
+            args.confident_window,
+            args.sample_window_buffer,
+        )
+        log.info(
+            "Sample window: [%d, %d], confident: [%d, %d]",
+            windows.sample_lo, windows.sample_hi,
+            windows.sample_confident_lo, windows.sample_confident_hi,
+        )
+        log.info(
+            "Final window: [%d, %d], accept: [%d, %d]",
+            windows.final_lo, windows.final_hi,
+            windows.final_accept_lo, windows.final_accept_hi,
+        )
     if target.is_file():
         log.info("Single file: %s", target)
         video_files = [target]
