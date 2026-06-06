@@ -447,26 +447,30 @@ def process_file(
             info.bitrate_kbps,
         )
 
-    # Compute windows with effective target
-    windows = compute_windows(
-        effective_target,
-        args.accept_window,
-        args.confident_window,
-        args.sample_window_buffer,
-    )
-
-    extra_args = build_extra_args(info)
-
-    if args.dry_run:
-        log.info("  [DRY RUN] Would encode to: %s", output_path)
-        return FileResult("skipped:dry_run")
-
     # Fixed-CRF mode: when --crf-min == --crf-max the user pins the CRF. The
     # entire bitrate-driven search is skipped and the video is encoded at that
     # CRF regardless of bitrate; the target-bitrate, window, search-method,
     # precise, and crf-ceiling-fallback options are ignored. The skip checks
     # above (source bitrate, already-AV1, existing output) still apply.
     fixed_crf = args.crf_min if args.crf_min == args.crf_max else None
+
+    # Compute windows with effective target. Skipped in fixed-CRF mode, where
+    # the window is ignored and every windows reference below is guarded by
+    # `fixed_crf is None`.
+    windows = None
+    if fixed_crf is None:
+        windows = compute_windows(
+            effective_target,
+            args.accept_window,
+            args.confident_window,
+            args.sample_window_buffer,
+        )
+
+    extra_args = build_extra_args(info)
+
+    if args.dry_run:
+        log.info("  [DRY RUN] Would encode to: %s", output_path)
+        return FileResult("skipped:dry_run")
 
     # Defaults for the search-only locals; overwritten below when searching.
     use_full_search = False
