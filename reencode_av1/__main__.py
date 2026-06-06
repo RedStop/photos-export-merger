@@ -438,15 +438,6 @@ def process_file(
     else:
         log.info("  No audio stream detected")
 
-    # Effective target (never increase bitrate)
-    effective_target = args.target_bitrate
-    if 0 < info.bitrate_kbps < args.target_bitrate:
-        effective_target = info.bitrate_kbps
-        log.info(
-            "  Original bitrate (%d kbps) below target, using it instead",
-            info.bitrate_kbps,
-        )
-
     # Fixed-CRF mode: when --crf-min == --crf-max the user pins the CRF. The
     # entire bitrate-driven search is skipped and the video is encoded at that
     # CRF regardless of bitrate; the target-bitrate, window, search-method,
@@ -454,11 +445,19 @@ def process_file(
     # above (source bitrate, already-AV1, existing output) still apply.
     fixed_crf = args.crf_min if args.crf_min == args.crf_max else None
 
-    # Compute windows with effective target. Skipped in fixed-CRF mode, where
-    # the window is ignored and every windows reference below is guarded by
-    # `fixed_crf is None`.
+    # Effective target (never increase bitrate) and window. Both are skipped in
+    # fixed-CRF mode, where the target is ignored and every windows reference
+    # below is guarded by `fixed_crf is None`.
     windows = None
     if fixed_crf is None:
+        effective_target = args.target_bitrate
+        if 0 < info.bitrate_kbps < args.target_bitrate:
+            effective_target = info.bitrate_kbps
+            log.info(
+                "  Original bitrate (%d kbps) below target, using it instead",
+                info.bitrate_kbps,
+            )
+
         windows = compute_windows(
             effective_target,
             args.accept_window,
