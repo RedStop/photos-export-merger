@@ -39,11 +39,18 @@ from reencode_av1.search import (
     smart_search_next,
 )
 from reencode_av1.__main__ import (
+    FileResult,
     build_parser,
     compute_audio_bitrate,
     get_output_path,
     validate_args,
     process_file,
+)
+from reencode_av1.progress import (
+    PROGRESS_FILENAME,
+    load_progress,
+    progress_path_for,
+    record_progress,
 )
 
 
@@ -1064,11 +1071,17 @@ class TestBuildParser:
         assert args.search_method == "smart"
         assert args.precise is True
         assert args.precise_only is False
+        assert args.progress is True
 
     def test_no_precise_disables_precise(self):
         parser = build_parser()
         args = parser.parse_args(["--no-precise"])
         assert args.precise is False
+
+    def test_no_progress_disables_progress(self):
+        parser = build_parser()
+        args = parser.parse_args(["--no-progress"])
+        assert args.progress is False
 
     def test_precise_only_flag(self):
         parser = build_parser()
@@ -1158,7 +1171,7 @@ class TestProcessFile:
     def test_skips_when_no_info(self, mock_info):
         mock_info.return_value = None
         result = process_file(Path("test.mp4"), self._make_args())
-        assert result.startswith("skipped")
+        assert result.status.startswith("skipped")
 
     @mock.patch("reencode_av1.__main__.get_video_info")
     def test_skips_av1(self, mock_info):
@@ -1166,7 +1179,7 @@ class TestProcessFile:
             "av1", 1920, 1080, 30.0, False, 5000, 120.0, 3600, 2, "opus"
         )
         result = process_file(Path("test.mp4"), self._make_args())
-        assert result.startswith("skipped")
+        assert result.status.startswith("skipped")
 
     @mock.patch("reencode_av1.__main__.get_video_info")
     def test_skips_vp9(self, mock_info):
@@ -1174,7 +1187,7 @@ class TestProcessFile:
             "vp9", 1920, 1080, 30.0, False, 5000, 120.0, 3600, 2, "opus"
         )
         result = process_file(Path("test.mp4"), self._make_args())
-        assert result.startswith("skipped")
+        assert result.status.startswith("skipped")
 
     @mock.patch("reencode_av1.__main__.get_output_path")
     @mock.patch("reencode_av1.__main__.get_video_info")
@@ -1188,7 +1201,7 @@ class TestProcessFile:
         try:
             mock_output.return_value = tmp
             result = process_file(Path("test.mp4"), self._make_args())
-            assert result.startswith("skipped")
+            assert result.status.startswith("skipped")
         finally:
             tmp.unlink(missing_ok=True)
 
@@ -1198,7 +1211,7 @@ class TestProcessFile:
             "h264", 1920, 1080, 30.0, False, 5000, 120.0, 3600, 2, "aac"
         )
         result = process_file(Path("test.mp4"), self._make_args(dry_run=True))
-        assert result.startswith("skipped")
+        assert result.status.startswith("skipped")
 
     @mock.patch("reencode_av1.__main__.get_video_bitrate")
     @mock.patch("reencode_av1.__main__.encode_full")
@@ -1268,7 +1281,9 @@ class TestProcessFile:
                 source, self._make_args(scratch_dir=scratch_dir)
             )
 
-            assert result == "processed"
+            assert result.status == "processed"
+            # The final CRF chosen by the search is carried on the result.
+            assert result.crf == 30
             # Encode read from the staged copy inside the scratch dir, not the source.
             assert encode_src["src"].parent == scratch_dir
             assert encode_src["src"] != source
@@ -1311,7 +1326,7 @@ class TestProcessFile:
                 source, self._make_args(precise_only=True, precise=True)
             )
 
-            assert result == "processed"
+            assert result.status == "processed"
             # Full-video search: full_encode=True and no segment offsets.
             _, kwargs = mock_search.call_args
             assert kwargs["full_encode"] is True
@@ -1349,9 +1364,58 @@ class TestProcessFile:
                 source, self._make_args(scratch_dir=scratch_dir)
             )
 
-            assert result == "failed"
+            assert result.status == "failed"
             assert not dest_output.exists()
             assert list(scratch_dir.iterdir()) == []
+
+
+class TestProgress:
+    """Test per-folder progress tracking."""
+
+    def test_load_missing_returns_empty(self):
+        with tempfile.TemporaryDirectory() as d:
+            assert load_progress(Path(d)) == {}
+
+    def test_record_then_load_roundtrip(self):
+        with tempfile.TemporaryDirectory() as d:
+            folder = Path(d)
+            record_progress(folder, "a.mp4", "processed", 32)
+            record_progress(folder, "b.mp4", "skipped:already_av1")
+            data = load_progress(folder)
+            assert data["a.mp4"] == {"status": "processed", "crf": 32}
+            assert data["b.mp4"] == {"status": "skipped:already_av1"}
+            # Written to the folder under the documented filename.
+            assert (folder / PROGRESS_FILENAME).exists()
+            assert progress_path_for(folder) == folder / PROGRESS_FILENAME
+
+    def test_record_preserves_existing_entries(self):
+        with tempfile.TemporaryDirectory() as d:
+            folder = Path(d)
+            record_progress(folder, "a.mp4", "processed", 30)
+            # A second record re-reads the file and keeps the first entry.
+            record_progress(folder, "c.mp4", "skipped:low_bitrate")
+            data = load_progress(folder)
+            assert set(data) == {"a.mp4", "c.mp4"}
+
+    def test_record_overwrites_same_file(self):
+        with tempfile.TemporaryDirectory() as d:
+            folder = Path(d)
+            record_progress(folder, "a.mp4", "failed")
+            record_progress(folder, "a.mp4", "processed", 40)
+            data = load_progress(folder)
+            assert data["a.mp4"] == {"status": "processed", "crf": 40}
+
+    def test_load_malformed_returns_empty(self):
+        with tempfile.TemporaryDirectory() as d:
+            folder = Path(d)
+            (folder / PROGRESS_FILENAME).write_text("not json", encoding="utf-8")
+            assert load_progress(folder) == {}
+
+    def test_load_non_object_returns_empty(self):
+        with tempfile.TemporaryDirectory() as d:
+            folder = Path(d)
+            (folder / PROGRESS_FILENAME).write_text("[1, 2, 3]", encoding="utf-8")
+            assert load_progress(folder) == {}
 
 
 # ═══════════════════════════════════════════════════════════════════════════════

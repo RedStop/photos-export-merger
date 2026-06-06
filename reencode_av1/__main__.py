@@ -8,11 +8,13 @@ import shutil
 import sys
 import time
 import uuid
+from dataclasses import dataclass
 from pathlib import Path
 
 from .encode import encode_full
 from .filters import build_extra_args, compute_segment_offsets, compute_windows
 from .probe import VideoInfo, get_video_bitrate, get_video_info
+from .progress import load_progress, progress_path_for, record_progress
 from .search import (
     CrfPoint,
     binary_search_next,
@@ -28,6 +30,18 @@ VIDEO_EXTENSIONS = frozenset((
     ".webm", ".m4v", ".ts", ".mpg", ".mpeg", ".3gp",
 ))
 SKIP_CODECS = frozenset(("av1", "vp9"))
+
+
+@dataclass
+class FileResult:
+    """Outcome of processing one video.
+
+    ``status`` is one of the strings documented on ``process_file``. ``crf`` is
+    the final CRF used when the video was encoded, otherwise ``None``.
+    """
+
+    status: str
+    crf: int | None = None
 
 
 # ── CLI ──────────────────────────────────────────────────────────────────────
@@ -48,6 +62,7 @@ examples:
   python -m reencode_av1 --search-method interpolation # use log-linear interpolation
   python -m reencode_av1 --no-precise                  # skip full-video search if out of range
   python -m reencode_av1 --precise-only                # always search on the full video
+  python -m reencode_av1 --no-progress                 # ignore progress files (don't read or write)
   python -m reencode_av1 --scratch-dir D:/scratch \\nas/videos  # stage NAS sources on local disk
   python -m reencode_av1 --skip-below-bitrate 1000     # skip files already under 1000 kbps
   python -m reencode_av1 --skip-below-bitrate 0        # always encode regardless of bitrate
@@ -153,6 +168,14 @@ examples:
             "and slowest mode; the chosen encode is reused as the final output, so "
             "there is no separate sample pass or re-search. Mutually exclusive with "
             "--no-precise."
+        ),
+    )
+    p.add_argument(
+        "--no-progress", dest="progress", action="store_false", default=True,
+        help=(
+            "Ignore per-folder progress files: do not read them (so previously "
+            "processed/skipped videos are re-examined) and do not write them "
+            "(so this run records nothing). Progress tracking is on by default."
         ),
     )
     p.add_argument(
@@ -337,21 +360,22 @@ def compute_audio_bitrate(info: VideoInfo, override_kbps: int) -> tuple[str, int
 def process_file(
     input_path: Path,
     args: argparse.Namespace,
-) -> str:
+) -> FileResult:
     """Process a single video file.
 
-    Returns one of:
+    Returns a :class:`FileResult` whose ``status`` is one of:
       ``"processed"``, ``"failed"``,
       ``"skipped:no_info"``, ``"skipped:low_bitrate"``,
       ``"skipped:already_av1"``, ``"skipped:output_exists"``,
       ``"skipped:dry_run"``,
       ``"processed:crf_ceiling"`` (encoded with fallback CRF because search exceeded max-crf),
       ``"processed:crf_ceiling:low_original"`` (as above + original bitrate was low).
+    For encoded videos ``crf`` holds the final CRF used; otherwise it is ``None``.
     """
     info = get_video_info(input_path)
     if info is None:
         log.warning("  Could not read video info, skipping")
-        return "skipped:no_info"
+        return FileResult("skipped:no_info")
 
     if info.width > info.height:
         orientation = "landscape"
@@ -375,18 +399,18 @@ def process_file(
             "  Source bitrate (%d kbps) is at or below --skip-below-bitrate (%d kbps), skipping",
             info.bitrate_kbps, args.skip_below_bitrate,
         )
-        return "skipped:low_bitrate"
+        return FileResult("skipped:low_bitrate")
 
     # Skip AV1 / VP9
     if info.codec in SKIP_CODECS:
         log.info("  Already encoded as %s, skipping", info.codec)
-        return "skipped:already_av1"
+        return FileResult("skipped:already_av1")
 
     # Check output
     output_path = get_output_path(input_path)
     if output_path.exists():
         log.info("  Output already exists: %s, skipping", output_path)
-        return "skipped:output_exists"
+        return FileResult("skipped:output_exists")
 
     # Log VFR / non-30fps
     if info.is_vfr:
@@ -423,7 +447,7 @@ def process_file(
 
     if args.dry_run:
         log.info("  [DRY RUN] Would encode to: %s", output_path)
-        return "skipped:dry_run"
+        return FileResult("skipped:dry_run")
 
     # Determine if short video — videos at or under the threshold are encoded in
     # full during the search (no segment sampling); longer videos use
@@ -503,6 +527,9 @@ def process_file(
         if result.temp_file:
             temp_files.append(result.temp_file)
 
+        # Final CRF used for the encode; updated below if precise mode re-searches.
+        final_crf = result.crf
+
         # ── max-crf ceiling check ────────────────────────────────────
         crf_ceiling_triggered: bool | str = False
         if result.crf_ceiling_used:
@@ -544,11 +571,11 @@ def process_file(
 
             if exit_code != 0:
                 log.error("  FAILED: ffmpeg exited with code %d", exit_code)
-                return "failed"
+                return FileResult("failed")
 
         if not output_path.exists():
             log.error("  FAILED: output file was not created")
-            return "failed"
+            return FileResult("failed")
 
         # ── Verify output ────────────────────────────────────────────
         out_bitrate = get_video_bitrate(output_path, audio_kbps)
@@ -564,10 +591,10 @@ def process_file(
             )
             _finalize_output()
             if crf_ceiling_triggered == "low_original":
-                return "processed:crf_ceiling:low_original"
+                return FileResult("processed:crf_ceiling:low_original", final_crf)
             if crf_ceiling_triggered:
-                return "processed:crf_ceiling"
-            return "processed"
+                return FileResult("processed:crf_ceiling", final_crf)
+            return FileResult("processed", final_crf)
 
         log.info(
             "  Done in %s. %.1f MB -> %.1f MB, output bitrate=%d kbps",
@@ -627,11 +654,13 @@ def process_file(
                 )
                 if exit_code != 0 or not output_path.exists():
                     log.error("  FAILED: precise crf-ceiling encode did not produce output")
-                    return "failed"
+                    return FileResult("failed")
+                final_crf = args.crf_ceiling_fallback
                 crf_ceiling_triggered = True
                 if info.bitrate_kbps > 0 and info.bitrate_kbps < 2 * args.target_bitrate:
                     crf_ceiling_triggered = "low_original"
             elif precise_result.temp_file and precise_result.temp_file.exists():
+                final_crf = precise_result.crf
                 shutil.move(str(precise_result.temp_file), str(output_path))
                 final_bitrate = get_video_bitrate(output_path, audio_kbps)
                 final_size_mb = output_path.stat().st_size / (1024 * 1024)
@@ -651,14 +680,14 @@ def process_file(
                     )
             else:
                 log.error("  Full-video search produced no usable file")
-                return "failed"
+                return FileResult("failed")
 
         _finalize_output()
         if crf_ceiling_triggered == "low_original":
-            return "processed:crf_ceiling:low_original"
+            return FileResult("processed:crf_ceiling:low_original", final_crf)
         if crf_ceiling_triggered:
-            return "processed:crf_ceiling"
-        return "processed"
+            return FileResult("processed:crf_ceiling", final_crf)
+        return FileResult("processed", final_crf)
 
     finally:
         # Clean up any temp files that weren't moved to the output path
@@ -672,6 +701,7 @@ def process_file(
 
 def _print_statistics(
     total: int,
+    prev_from_progress: int,
     already_reencoded: int,
     processed: int,
     failed: int,
@@ -688,6 +718,8 @@ def _print_statistics(
     log.info("Session %s", "Interrupted — Partial Statistics" if interrupted else "Complete — Statistics")
     log.info("=" * 60)
     log.info("Total video files found : %d", total)
+    if prev_from_progress:
+        log.info("Previously recorded     : %d  (skipped via progress files, not processed this run)", prev_from_progress)
     log.info("")
     log.info("Already re-encoded      : %d  (output file already existed, not counted in skips below)", already_reencoded)
     log.info("")
@@ -771,6 +803,54 @@ def main() -> None:
     total = len(video_files)
     log.info("Found %d video file(s)", total)
 
+    # ── Skip videos already recorded in per-folder progress files ──────────────
+    # Each folder keeps a JSON progress file (read directly from the folder, never
+    # staged via --scratch-dir). Videos already listed there are dropped here so
+    # they are not probed, logged, or re-encoded. One line is logged per progress
+    # file consulted, reporting how many of its videos were previously skipped vs
+    # previously re-encoded. Disabled by --no-progress.
+    prev_from_progress = 0
+    if not args.progress:
+        log.info("Progress tracking disabled (--no-progress): not reading or writing progress files")
+    else:
+        progress_cache: dict[Path, dict] = {}
+        prev_skipped: dict[Path, int] = {}
+        prev_reencoded: dict[Path, int] = {}
+        video_files_remaining: list[Path] = []
+
+        for file_path in video_files:
+            folder = file_path.parent
+            if folder not in progress_cache:
+                progress_cache[folder] = load_progress(folder)
+                prev_skipped[folder] = 0
+                prev_reencoded[folder] = 0
+            entry = progress_cache[folder].get(file_path.name)
+            if entry is None:
+                video_files_remaining.append(file_path)
+            elif str(entry.get("status", "")).startswith("processed"):
+                prev_reencoded[folder] += 1
+            else:
+                prev_skipped[folder] += 1
+
+        for folder in progress_cache:
+            if progress_path_for(folder).exists():
+                log.info(
+                    "Read progress file %s: %d previously skipped, %d previously re-encoded",
+                    progress_path_for(folder), prev_skipped[folder], prev_reencoded[folder],
+                )
+
+        prev_skipped_sum = sum(prev_skipped.values())
+        prev_reencoded_sum = sum(prev_reencoded.values())
+        prev_from_progress = prev_skipped_sum + prev_reencoded_sum
+        if prev_skipped_sum or prev_reencoded_sum:
+            log.info(
+                "Skipping %d video(s) from progress files; %d remaining to process",
+                prev_from_progress, len(video_files_remaining),
+            )
+        video_files = video_files_remaining
+
+    remaining_total = len(video_files)
+
     # Statistics counters
     processed = 0
     failed = 0
@@ -787,30 +867,38 @@ def main() -> None:
     try:
         for i, file_path in enumerate(video_files, 1):
             log.info("-" * 60)
-            log.info("Processing [%d/%d]: %s", i, total, file_path)
+            log.info("Processing [%d/%d]: %s", i, remaining_total, file_path)
 
             result = process_file(file_path, args)
+            status = result.status
 
-            if result == "processed":
+            # Record the outcome to the folder's progress file so it is not
+            # re-tested on a later run (unless --no-progress). Failures are not
+            # recorded (so they are retried) and dry-run previews are not recorded
+            # (so a real run still processes them).
+            if args.progress and status not in ("failed", "skipped:dry_run"):
+                record_progress(file_path.parent, file_path.name, status, result.crf)
+
+            if status == "processed":
                 processed += 1
-            elif result == "processed:crf_ceiling":
+            elif status == "processed:crf_ceiling":
                 processed += 1
                 crf_ceiling_count += 1
-            elif result == "processed:crf_ceiling:low_original":
+            elif status == "processed:crf_ceiling:low_original":
                 processed += 1
                 crf_ceiling_count += 1
                 low_original_videos.append(file_path)
-            elif result == "failed":
+            elif status == "failed":
                 failed += 1
-            elif result == "skipped:output_exists":
+            elif status == "skipped:output_exists":
                 already_reencoded += 1
-            elif result == "skipped:no_info":
+            elif status == "skipped:no_info":
                 skipped_no_info += 1
-            elif result == "skipped:low_bitrate":
+            elif status == "skipped:low_bitrate":
                 skipped_low_bitrate += 1
-            elif result == "skipped:already_av1":
+            elif status == "skipped:already_av1":
                 skipped_already_av1 += 1
-            elif result == "skipped:dry_run":
+            elif status == "skipped:dry_run":
                 skipped_dry_run += 1
 
     except KeyboardInterrupt:
@@ -819,6 +907,7 @@ def main() -> None:
 
     _print_statistics(
         total=total,
+        prev_from_progress=prev_from_progress,
         already_reencoded=already_reencoded,
         processed=processed,
         failed=failed,
