@@ -1,11 +1,19 @@
 """CRF search: outer loop with pluggable stateless search methods.
 
 The outer ``find_optimal_crf`` function manages all state (history, temp
-files, accept/confident checks, max-crf ceiling fallback, crf-min floor)
-and delegates the choice of *which* CRF to probe next to a stateless
-search method.  Each search method receives the full history of measured
-``CrfPoint`` results plus the bounds and target windows, and returns
+files, accept/confident checks, max-crf ceiling fallback, crf-min floor,
+the running overhead estimate) and delegates the choice of *which* CRF to
+probe next to a stateless search method.  Each search method receives the
+full history of measured ``CrfPoint`` results plus a :class:`SearchContext`
+(bounds, target windows, seed, and the overhead estimate), and returns
 either an integer CRF to probe next, or ``None`` to stop searching.
+
+The interface between the outer loop and the search methods is deliberately
+narrow: the outer loop works entirely in *total* (whole-file) bitrate — every
+recorded ``CrfPoint.bitrate`` and every window check is total — while a search
+method works in *video* space internally, subtracting ``SearchContext.overhead``
+before its log-linear interpolation (only the video component is log-linear in
+CRF). Classification of points as over/under target stays in total space.
 
 Three search methods are provided: :func:`smart_search_next` (the
 default), :func:`binary_search_next` and :func:`interpolation_next`.
@@ -51,16 +59,31 @@ class CrfResult:
     crf_ceiling_used: bool = False
 
 
+@dataclass(frozen=True)
+class SearchContext:
+    """The inputs a stateless search method needs to pick the next CRF.
+
+    ``crf_min``/``crf_max`` bound the search; ``accept_lo``/``accept_hi`` and
+    ``confident_lo``/``confident_hi`` are the (total-bitrate) acceptance and
+    convergence windows; ``seed_crf`` is an optional first-probe hint (-1 when
+    unset); ``overhead`` is the estimated audio+container bitrate (0 when not
+    yet measured), subtracted before any log-linear interpolation so it operates
+    on the video component alone. The confident bounds are used only by
+    :func:`smart_search_next`; ``overhead`` only by the interpolating methods.
+    """
+
+    crf_min: int
+    crf_max: int
+    accept_lo: int
+    accept_hi: int
+    confident_lo: int = 0
+    confident_hi: int = 0
+    seed_crf: int = -1
+    overhead: int = 0
+
+
 # A stateless search method.  Returns the next CRF to probe, or None to stop.
-# Call signature (all positional):
-#   (history, crf_min, crf_max, accept_lo, accept_hi, seed_crf,
-#    confident_lo, confident_hi)
-# The trailing confident-window bounds are used only by smart_search_next;
-# the other methods accept and ignore them.
-SearchMethod = Callable[
-    [list[CrfPoint], int, int, int, int, int, int, int],
-    "int | None",
-]
+SearchMethod = Callable[[list[CrfPoint], SearchContext], "int | None"]
 
 
 # ── Sampling helper ─────────────────────────────────────────────────────────
@@ -71,34 +94,36 @@ def _evaluate_crf_sample(
     extra_args: list[str],
     audio_bitrate: str,
     preset: int,
-    audio_bitrate_kbps: int,
     *,
     offsets: list[float] | None,
     seg_duration: float,
     full_encode: bool,
     has_audio: bool = True,
-) -> tuple[int, Path | None]:
+    measure_overhead: bool = False,
+) -> tuple[int, int | None, Path | None]:
     """Evaluate a CRF value using the appropriate sampling method.
 
-    Returns ``(bitrate_kbps, temp_file_or_none)``.
+    Returns ``(total_bitrate_kbps, overhead_kbps_or_none, temp_file_or_none)``.
     """
     if full_encode:
         return encode_sample(
             input_path, crf, extra_args, audio_bitrate, preset,
-            audio_bitrate_kbps, keep_file=True, has_audio=has_audio,
+            keep_file=True, has_audio=has_audio, measure_overhead=measure_overhead,
         )
     if offsets:
-        bitrate = encode_segments(
+        bitrate, overhead = encode_segments(
             input_path, crf, extra_args, audio_bitrate, preset,
-            audio_bitrate_kbps, offsets, seg_duration, has_audio=has_audio,
+            offsets, seg_duration, has_audio=has_audio,
+            measure_overhead=measure_overhead,
         )
-        return bitrate, None
+        return bitrate, overhead, None
     # Single-segment fallback (shouldn't normally happen)
-    bitrate, _ = encode_sample(
+    bitrate, overhead, _ = encode_sample(
         input_path, crf, extra_args, audio_bitrate, preset,
-        audio_bitrate_kbps, duration=seg_duration, has_audio=has_audio,
+        duration=seg_duration, has_audio=has_audio,
+        measure_overhead=measure_overhead,
     )
-    return bitrate, None
+    return bitrate, overhead, None
 
 
 def _select_windows(
@@ -125,19 +150,28 @@ def interpolate_crf(
     target_bitrate: int,
     crf_min: int,
     crf_max: int,
+    overhead: int = 0,
 ) -> int:
     """Estimate the CRF for a target bitrate using log-linear interpolation.
 
     The relationship between CRF and ``log(bitrate)`` is approximately
-    linear, so interpolating in log-space yields a much better estimate
-    than a linear fit.  The result is clamped to ``[crf_min, crf_max]``.
+    linear for the *video* component only, so ``overhead`` (the constant
+    audio+container bitrate) is subtracted from both measured points and the
+    target before interpolating in log-space; this removes the curvature an
+    additive constant would otherwise introduce.  With ``overhead == 0`` this
+    is plain log-linear interpolation.  The result is clamped to
+    ``[crf_min, crf_max]``; if subtracting the overhead leaves a non-positive
+    video bitrate anywhere, it falls back to the CRF midpoint.
     """
-    if p1.bitrate <= 0 or p2.bitrate <= 0 or p1.bitrate == p2.bitrate:
+    v1 = p1.bitrate - overhead
+    v2 = p2.bitrate - overhead
+    vt = target_bitrate - overhead
+    if v1 <= 0 or v2 <= 0 or vt <= 0 or v1 == v2:
         return (p1.crf + p2.crf) // 2
 
-    log_b1 = math.log(p1.bitrate)
-    log_b2 = math.log(p2.bitrate)
-    log_target = math.log(target_bitrate)
+    log_b1 = math.log(v1)
+    log_b2 = math.log(v2)
+    log_target = math.log(vt)
 
     if log_b1 == log_b2:
         return (p1.crf + p2.crf) // 2
@@ -154,11 +188,13 @@ def _extrapolate_crf(
     *,
     direction: int,
     crf_nudge_size: int = 5,
+    overhead: int = 0,
 ) -> int:
     """Extrapolate a CRF when all known points are on one side of the target.
 
     *direction* must be +1 (all overshooting → need higher CRF) or -1 (all
-    undershooting → need lower CRF).
+    undershooting → need lower CRF). Virtual anchors are expressed in total
+    bitrate (overhead added back) so that the video component drives them.
     """
     anchor_lo = min(history, key=lambda p: p.crf)
     anchor_hi = max(history, key=lambda p: p.crf)
@@ -166,13 +202,14 @@ def _extrapolate_crf(
     if anchor_lo.crf == anchor_hi.crf:
         point = history[0]
         if direction == 1:
-            # Virtual anchor at crf_max with near-zero bitrate to push higher
-            crf = interpolate_crf(point, CrfPoint(crf_max, 1), target_bitrate, crf_min, crf_max)
+            # Virtual anchor at crf_max with near-zero video bitrate to push higher
+            crf = interpolate_crf(point, CrfPoint(crf_max, overhead + 1), target_bitrate, crf_min, crf_max, overhead)
         else:
-            # Virtual anchor at crf_min with 10x bitrate to push lower
-            crf = interpolate_crf(CrfPoint(crf_min, point.bitrate * 10), point, target_bitrate, crf_min, crf_max)
+            # Virtual anchor at crf_min with 10x the video bitrate to push lower
+            virtual_lo = CrfPoint(crf_min, overhead + (point.bitrate - overhead) * 10)
+            crf = interpolate_crf(virtual_lo, point, target_bitrate, crf_min, crf_max, overhead)
     else:
-        crf = interpolate_crf(anchor_lo, anchor_hi, target_bitrate, crf_min, crf_max)
+        crf = interpolate_crf(anchor_lo, anchor_hi, target_bitrate, crf_min, crf_max, overhead)
 
     # If the estimate didn't move past the extreme tried point, nudge it.
     if direction == 1:
@@ -189,18 +226,12 @@ def _extrapolate_crf(
 
 def binary_search_next(
     history: list[CrfPoint],
-    crf_min: int,
-    crf_max: int,
-    accept_lo: int,
-    accept_hi: int,
-    seed_crf: int = -1,
-    confident_lo: int = 0,
-    confident_hi: int = 0,
+    ctx: SearchContext,
 ) -> int | None:
     """Choose the next CRF via binary search over proven bounds.
 
-    The ``confident_lo``/``confident_hi`` bounds are part of the shared
-    :data:`SearchMethod` signature but are not used by this method.
+    The confident-window bounds and ``overhead`` on *ctx* are part of the
+    shared :data:`SearchMethod` interface but are not used by this method.
 
     Derives the current ``[lo, hi]`` range from the history:
       * The lowest CRF whose bitrate overshoots ``accept_hi`` becomes a
@@ -210,9 +241,13 @@ def binary_search_next(
         bound (hi = that CRF − 1).
 
     Returns the midpoint of the resulting range, or ``None`` if the range
-    is empty.  When the history is empty, *seed_crf* (if in range) is
+    is empty.  When the history is empty, ``ctx.seed_crf`` (if in range) is
     used as the first probe; otherwise the midpoint of ``[crf_min, crf_max]``.
     """
+    crf_min, crf_max = ctx.crf_min, ctx.crf_max
+    accept_lo, accept_hi = ctx.accept_lo, ctx.accept_hi
+    seed_crf = ctx.seed_crf
+
     overshoot_crfs = [p.crf for p in history if p.bitrate > accept_hi]
     undershoot_crfs = [p.crf for p in history if p.bitrate < accept_lo]
     in_range_crfs = [p.crf for p in history if accept_lo <= p.bitrate <= accept_hi]
@@ -240,13 +275,7 @@ def binary_search_next(
 
 def interpolation_next(
     history: list[CrfPoint],
-    crf_min: int,
-    crf_max: int,
-    accept_lo: int,
-    accept_hi: int,
-    seed_crf: int = -1,
-    confident_lo: int = 0,
-    confident_hi: int = 0,
+    ctx: SearchContext,
 ) -> int | None:
     """Choose the next CRF via log-linear interpolation.
 
@@ -256,9 +285,14 @@ def interpolation_next(
     ``None`` when no useful integer CRF remains to probe (e.g. the
     bracketing points are consecutive integers).
 
-    The ``confident_lo``/``confident_hi`` bounds are part of the shared
-    :data:`SearchMethod` signature but are not used by this method.
+    The confident-window bounds on *ctx* are part of the shared
+    :data:`SearchMethod` interface but are not used by this method;
+    ``ctx.overhead`` is passed to the interpolation so it works on the video
+    component.
     """
+    crf_min, crf_max = ctx.crf_min, ctx.crf_max
+    accept_lo, accept_hi = ctx.accept_lo, ctx.accept_hi
+    seed_crf, overhead = ctx.seed_crf, ctx.overhead
     target_bitrate = accept_hi
 
     if len(history) == 0:
@@ -289,7 +323,7 @@ def interpolation_next(
                 return None
             crf = _extrapolate_crf(
                 history, target_bitrate, crf_min, crf_max,
-                direction=-1, crf_nudge_size=2,
+                direction=-1, crf_nudge_size=2, overhead=overhead,
             )
             return max(crf_min, min(lowest_in_range_crf - 1, crf))
 
@@ -299,7 +333,7 @@ def interpolation_next(
             return None  # consecutive integers — no untried CRF in between
         crf = interpolate_crf(
             lowest_in_range, nearest_above,
-            target_bitrate, crf_min, crf_max,
+            target_bitrate, crf_min, crf_max, overhead,
         )
         return max(nearest_above.crf + 1, min(lowest_in_range.crf - 1, crf))
 
@@ -310,28 +344,22 @@ def interpolation_next(
             return None
         crf = interpolate_crf(
             nearest_below, nearest_above,
-            target_bitrate, crf_min, crf_max,
+            target_bitrate, crf_min, crf_max, overhead,
         )
         return max(nearest_above.crf + 1, min(nearest_below.crf - 1, crf))
 
     if above:
-        return _extrapolate_crf(history, target_bitrate, crf_min, crf_max, direction=1)
+        return _extrapolate_crf(history, target_bitrate, crf_min, crf_max, direction=1, overhead=overhead)
 
     if below:
-        return _extrapolate_crf(history, target_bitrate, crf_min, crf_max, direction=-1)
+        return _extrapolate_crf(history, target_bitrate, crf_min, crf_max, direction=-1, overhead=overhead)
 
     return None
 
 
 def smart_search_next(
     history: list[CrfPoint],
-    crf_min: int,
-    crf_max: int,
-    accept_lo: int,
-    accept_hi: int,
-    seed_crf: int = -1,
-    confident_lo: int = 0,
-    confident_hi: int = 0,
+    ctx: SearchContext,
 ) -> int | None:
     """Choose the next CRF via bracket-then-interpolate (the default method).
 
@@ -351,11 +379,13 @@ def smart_search_next(
         binary search would.  Returns ``None`` once the relevant bound has
         already been probed (no untried CRF can improve on the bracket).
       * Bracketed history (points on both sides of the target):
-        log-linear interpolation between the closest pair straddling the
-        target, clamped to lie strictly between them.  Returns ``None``
-        when that pair is already consecutive (no integer CRF in between).
+        log-linear interpolation (in video space, via ``ctx.overhead``)
+        between the closest pair straddling the target, clamped to lie
+        strictly between them.  Returns ``None`` when that pair is already
+        consecutive (no integer CRF in between).
     """
-    target = (confident_lo + confident_hi) // 2
+    crf_min, crf_max = ctx.crf_min, ctx.crf_max
+    target = (ctx.confident_lo + ctx.confident_hi) // 2
 
     if not history:
         return (crf_min + crf_max) // 2
@@ -371,7 +401,7 @@ def smart_search_next(
         hi_pt = max(under, key=lambda p: p.bitrate)
         if hi_pt.crf - lo_pt.crf <= 1:
             return None  # consecutive integers — nothing left to probe between them
-        crf = interpolate_crf(lo_pt, hi_pt, target, crf_min, crf_max)
+        crf = interpolate_crf(lo_pt, hi_pt, target, crf_min, crf_max, ctx.overhead)
         return max(lo_pt.crf + 1, min(hi_pt.crf - 1, crf))
 
     if over:
@@ -394,7 +424,6 @@ def find_optimal_crf(
     extra_args: list[str],
     audio_bitrate: str,
     preset: int,
-    audio_bitrate_kbps: int,
     max_iterations: int,
     crf_min: int,
     crf_max: int,
@@ -407,6 +436,7 @@ def find_optimal_crf(
     seed_crf: int = -1,
     seed_known: list[CrfPoint] | None = None,
     seed_temp_files: dict[int, Path] | None = None,
+    seed_overhead: int | None = None,
     has_audio: bool = True,
 ) -> CrfResult:
     """Find the optimal CRF using the configured stateless search method.
@@ -433,6 +463,12 @@ def find_optimal_crf(
     """
     accept_lo, accept_hi, confident_lo, confident_hi = _select_windows(windows, full_encode)
     target_bitrate = accept_hi
+
+    # Audio+container overhead, measured once per phase from the first completed
+    # encode and reused for the rest. A caller-supplied ``seed_overhead`` (the
+    # precise pass passes the value measured from the pre-search full encode)
+    # means it's already established and no measurement is requested.
+    overhead: int | None = seed_overhead
 
     history: list[CrfPoint] = list(seed_known or [])
     tried_crfs: set[int] = {p.crf for p in history}
@@ -483,10 +519,13 @@ def find_optimal_crf(
         return CrfResult(best.crf, best.bitrate, temp_files_by_crf.get(best.crf), crf_ceiling_used=False)
 
     for iteration in range(1, max_iterations + 1):
-        candidate = search_method(
-            history, crf_min, crf_max, accept_lo, accept_hi, seed_crf,
-            confident_lo, confident_hi,
+        ctx = SearchContext(
+            crf_min=crf_min, crf_max=crf_max,
+            accept_lo=accept_lo, accept_hi=accept_hi,
+            confident_lo=confident_lo, confident_hi=confident_hi,
+            seed_crf=seed_crf, overhead=overhead or 0,
         )
+        candidate = search_method(history, ctx)
         if candidate is None:
             log.info("  Search method has no further probes; stopping")
             break
@@ -527,11 +566,13 @@ def find_optimal_crf(
             candidate = stepped
 
         tried_crfs.add(candidate)
-        bitrate, temp_file = _evaluate_crf_sample(
+        # Measure the audio+container overhead only until it's established for
+        # this phase; subsequent encodes reuse the cached value.
+        bitrate, measured_overhead, temp_file = _evaluate_crf_sample(
             input_path, candidate, extra_args, audio_bitrate, preset,
-            audio_bitrate_kbps,
             offsets=offsets, seg_duration=seg_duration,
             full_encode=full_encode, has_audio=has_audio,
+            measure_overhead=(overhead is None),
         )
 
         if bitrate < 0:
@@ -541,6 +582,10 @@ def find_optimal_crf(
             if temp_file and temp_file.exists():
                 temp_file.unlink(missing_ok=True)
             continue
+
+        if measured_overhead is not None:
+            overhead = measured_overhead
+            log.info("  Measured overhead (audio+container): %d kbps", overhead)
 
         log.info(
             "  Iteration %d: CRF=%d -> %d kbps", iteration, candidate, bitrate,

@@ -25,6 +25,7 @@ class VideoInfo:
     frame_count: int
     audio_channels: int
     audio_codec: str | None
+    total_bitrate_kbps: int = 0
 
 
 def run_ffprobe(path: Path) -> dict:
@@ -108,6 +109,18 @@ def get_video_info(path: Path) -> VideoInfo | None:
 
     duration_sec = float(fmt.get("duration", 0))
 
+    # Total (container) bitrate: prefer the format-level figure, else derive it
+    # from the file size. Used for target/skip comparisons, which are all in
+    # whole-file terms (video + audio + container overhead).
+    total_bitrate_kbps = 0
+    if fmt.get("bit_rate"):
+        total_bitrate_kbps = round(int(fmt["bit_rate"]) / 1000)
+    elif duration_sec > 0:
+        try:
+            total_bitrate_kbps = round(path.stat().st_size * 8 / duration_sec / 1000)
+        except OSError:
+            total_bitrate_kbps = 0
+
     # Actual frame count when ffprobe reports it; otherwise estimate from fps.
     frame_count = 0
     nb_frames = video_stream.get("nb_frames")
@@ -127,35 +140,98 @@ def get_video_info(path: Path) -> VideoInfo | None:
         frame_count=frame_count,
         audio_channels=audio_channels,
         audio_codec=audio_stream.get("codec_name") if audio_stream else None,
+        total_bitrate_kbps=total_bitrate_kbps,
     )
 
 
-def get_video_bitrate(path: Path, audio_bitrate_kbps: int) -> int:
-    """Get the video-only bitrate of an encoded file in kbps.
+def get_total_bitrate(path: Path, duration_hint: float | None = None) -> int:
+    """Get the whole-file (container) bitrate of an encoded file in kbps.
 
-    Falls back to computing from file size if the stream bitrate is missing.
+    This is the figure target/window comparisons run against: it includes
+    video, audio, and container overhead. Prefers the format-level bitrate and
+    falls back to a file-size calculation. Returns -1 if it can't be determined.
     """
     try:
         probe = run_ffprobe(path)
     except (json.JSONDecodeError, subprocess.SubprocessError):
         return -1
 
-    streams = probe.get("streams", [])
     fmt = probe.get("format", {})
+    if fmt.get("bit_rate"):
+        return round(int(fmt["bit_rate"]) / 1000)
 
-    video_stream = next(
-        (s for s in streams if s.get("codec_type") == "video"), None
-    )
-
-    if video_stream and video_stream.get("bit_rate"):
-        return round(int(video_stream["bit_rate"]) / 1000)
-
-    # Fallback: file size based calculation
-    duration = float(fmt.get("duration", 0))
+    duration = float(fmt.get("duration", 0)) or (duration_hint or 0)
     if duration <= 0:
         return -1
+    try:
+        file_size = path.stat().st_size
+    except OSError:
+        return -1
+    return round(file_size * 8 / duration / 1000)
 
-    file_size = path.stat().st_size  # bytes
-    audio_bits = audio_bitrate_kbps * 1000 * duration
-    video_bits = (file_size * 8) - audio_bits
-    return round(video_bits / duration / 1000)
+
+def _sum_video_packet_bytes(path: Path) -> int | None:
+    """Sum the sizes of all video packets in a file, or None on failure.
+
+    Reads packet sizes directly (``-show_entries packet=size``), which works
+    even when the container omits a per-stream bitrate — as Matroska usually
+    does for the streams ffmpeg writes.
+    """
+    try:
+        result = subprocess.run(
+            [
+                "ffprobe",
+                "-v", "quiet",
+                "-select_streams", "v:0",
+                "-show_entries", "packet=size",
+                "-of", "csv=p=0",
+                str(path),
+            ],
+            capture_output=True,
+            text=True,
+        )
+    except (OSError, subprocess.SubprocessError):
+        return None
+    if result.returncode != 0:
+        return None
+
+    total = 0
+    for line in result.stdout.splitlines():
+        line = line.strip().rstrip(",")
+        if line.isdigit():
+            total += int(line)
+    return total
+
+
+def measure_overhead(path: Path, duration_hint: float | None = None) -> int | None:
+    """Measure the audio + container overhead of an encoded file in kbps.
+
+    Defined as ``total_bitrate - video_bitrate``, both measured from the file:
+    the total from the container bitrate (or file size) and the video-only
+    figure from summing the video packet sizes. For a file with no audio this
+    is just the container muxing overhead (typically small). Returns None when
+    either figure can't be determined.
+    """
+    try:
+        probe = run_ffprobe(path)
+    except (json.JSONDecodeError, subprocess.SubprocessError):
+        return None
+
+    fmt = probe.get("format", {})
+    duration = float(fmt.get("duration", 0)) or (duration_hint or 0)
+    if duration <= 0:
+        return None
+
+    if fmt.get("bit_rate"):
+        total = int(fmt["bit_rate"]) / 1000
+    else:
+        try:
+            total = path.stat().st_size * 8 / duration / 1000
+        except OSError:
+            return None
+
+    video_bytes = _sum_video_packet_bytes(path)
+    if video_bytes is None:
+        return None
+    video = video_bytes * 8 / duration / 1000
+    return max(0, round(total - video))

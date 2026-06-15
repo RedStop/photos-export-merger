@@ -13,7 +13,7 @@ from pathlib import Path
 
 from .encode import encode_full
 from .filters import build_extra_args, compute_segment_offsets, compute_windows
-from .probe import VideoInfo, get_video_bitrate, get_video_info
+from .probe import VideoInfo, get_total_bitrate, get_video_info, measure_overhead
 from .progress import load_progress, progress_path_for, record_progress
 from .search import (
     CrfPoint,
@@ -398,18 +398,19 @@ def process_file(
     total_secs = int(round(info.duration_sec))
     duration_hms = f"{total_secs // 3600:02d}:{total_secs % 3600 // 60:02d}:{total_secs % 60:02d}"
     log.info(
-        "  Codec=%s Resolution=%dx%d (%s) FPS=%.3f Bitrate=%d kbps "
+        "  Codec=%s Resolution=%dx%d (%s) FPS=%.3f Bitrate=%d kbps (total %d) "
         "AudioCh=%d Duration=%s (%.1fs) Frames=%d",
         info.codec, info.width, info.height, orientation, info.fps,
-        info.bitrate_kbps, info.audio_channels, duration_hms,
-        info.duration_sec, info.frame_count,
+        info.bitrate_kbps, info.total_bitrate_kbps, info.audio_channels,
+        duration_hms, info.duration_sec, info.frame_count,
     )
 
-    # Skip if source bitrate is already at or below the skip threshold
-    if args.skip_below_bitrate > 0 and 0 < info.bitrate_kbps <= args.skip_below_bitrate:
+    # Skip if the source total bitrate is already at or below the skip threshold
+    # (target/skip comparisons are whole-file: video + audio + overhead).
+    if args.skip_below_bitrate > 0 and 0 < info.total_bitrate_kbps <= args.skip_below_bitrate:
         log.info(
-            "  Source bitrate (%d kbps) is at or below --skip-below-bitrate (%d kbps), skipping",
-            info.bitrate_kbps, args.skip_below_bitrate,
+            "  Source total bitrate (%d kbps) is at or below --skip-below-bitrate (%d kbps), skipping",
+            info.total_bitrate_kbps, args.skip_below_bitrate,
         )
         return FileResult("skipped:low_bitrate")
 
@@ -432,7 +433,7 @@ def process_file(
 
     # Audio bitrate
     has_audio = info.audio_channels > 0 and info.audio_codec is not None
-    audio_str, audio_kbps = compute_audio_bitrate(info, args.audio_bitrate)
+    audio_str, _ = compute_audio_bitrate(info, args.audio_bitrate)
     if has_audio:
         log.info("  Audio: %d channel(s) -> Opus %s", info.audio_channels, audio_str)
     else:
@@ -451,11 +452,11 @@ def process_file(
     windows = None
     if fixed_crf is None:
         effective_target = args.target_bitrate
-        if 0 < info.bitrate_kbps < args.target_bitrate:
-            effective_target = info.bitrate_kbps
+        if 0 < info.total_bitrate_kbps < args.target_bitrate:
+            effective_target = info.total_bitrate_kbps
             log.info(
-                "  Original bitrate (%d kbps) below target, using it instead",
-                info.bitrate_kbps,
+                "  Original total bitrate (%d kbps) below target, using it instead",
+                info.total_bitrate_kbps,
             )
 
         windows = compute_windows(
@@ -553,7 +554,7 @@ def process_file(
         else:
             result = find_optimal_crf(
                 src, windows, extra_args, audio_str,
-                args.preset, audio_kbps, args.max_iterations,
+                args.preset, args.max_iterations,
                 args.crf_min, args.crf_max, args.crf_ceiling_fallback,
                 search_method=search_method,
                 offsets=offsets, seg_duration=args.segment_duration,
@@ -575,11 +576,11 @@ def process_file(
                 args.crf_max, args.crf_ceiling_fallback,
             )
             crf_ceiling_triggered = True
-            if info.bitrate_kbps > 0 and info.bitrate_kbps < 2 * args.target_bitrate:
+            if info.total_bitrate_kbps > 0 and info.total_bitrate_kbps < 2 * args.target_bitrate:
                 log.warning(
-                    "  Original bitrate (%d kbps) is less than double the target (%d kbps). "
+                    "  Original total bitrate (%d kbps) is less than double the target (%d kbps). "
                     "The source may already be low-quality.",
-                    info.bitrate_kbps, args.target_bitrate,
+                    info.total_bitrate_kbps, args.target_bitrate,
                 )
                 crf_ceiling_triggered = "low_original"
 
@@ -614,7 +615,7 @@ def process_file(
             return FileResult("failed")
 
         # ── Verify output ────────────────────────────────────────────
-        out_bitrate = get_video_bitrate(output_path, audio_kbps)
+        out_bitrate = get_total_bitrate(output_path, info.duration_sec)
         in_size_mb = input_path.stat().st_size / (1024 * 1024)
         out_size_mb = output_path.stat().st_size / (1024 * 1024)
 
@@ -670,15 +671,21 @@ def process_file(
             output_path.replace(seed_temp)
             temp_files.append(seed_temp)
 
+            # This pre-search full encode is the full-video phase's first full
+            # encode: measure its true overhead and hand it to the precise search
+            # so the search reuses it rather than re-deriving from a large file.
+            seed_overhead = measure_overhead(seed_temp, info.duration_sec)
+
             precise_result = find_optimal_crf(
                 src, windows, extra_args, audio_str,
-                args.preset, audio_kbps, args.max_iterations,
+                args.preset, args.max_iterations,
                 args.crf_min, args.crf_max, args.crf_ceiling_fallback,
                 search_method=search_method,
                 full_encode=True,
                 seed_crf=result.crf,
                 seed_known=[CrfPoint(result.crf, out_bitrate)],
                 seed_temp_files={result.crf: seed_temp},
+                seed_overhead=seed_overhead,
                 has_audio=has_audio,
             )
             if precise_result.temp_file:
@@ -699,12 +706,12 @@ def process_file(
                     return FileResult("failed")
                 final_crf = args.crf_ceiling_fallback
                 crf_ceiling_triggered = True
-                if info.bitrate_kbps > 0 and info.bitrate_kbps < 2 * args.target_bitrate:
+                if info.total_bitrate_kbps > 0 and info.total_bitrate_kbps < 2 * args.target_bitrate:
                     crf_ceiling_triggered = "low_original"
             elif precise_result.temp_file and precise_result.temp_file.exists():
                 final_crf = precise_result.crf
                 shutil.move(str(precise_result.temp_file), str(output_path))
-                final_bitrate = get_video_bitrate(output_path, audio_kbps)
+                final_bitrate = get_total_bitrate(output_path, info.duration_sec)
                 final_size_mb = output_path.stat().st_size / (1024 * 1024)
                 log.info(
                     "  Precise encode (CRF=%d): %.1f MB -> %.1f MB, bitrate=%d kbps",

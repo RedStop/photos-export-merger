@@ -10,7 +10,7 @@ import tempfile
 import uuid
 from pathlib import Path
 
-from .probe import get_video_bitrate
+from .probe import get_total_bitrate, measure_overhead as _measure_overhead
 
 log = logging.getLogger(__name__)
 
@@ -62,12 +62,12 @@ def encode_sample(
     extra_args: list[str],
     audio_bitrate: str,
     preset: int,
-    audio_bitrate_kbps: int,
     *,
     duration: float | None = None,
     keep_file: bool = False,
     has_audio: bool = True,
-) -> tuple[int, Path | None]:
+    measure_overhead: bool = False,
+) -> tuple[int, int | None, Path | None]:
     """Encode a sample (or full video) at a given CRF.
 
     Args:
@@ -76,14 +76,15 @@ def encode_sample(
         extra_args: additional ffmpeg args (scaling, GOP, etc.).
         audio_bitrate: audio bitrate string like ``"128k"``.
         preset: SVT-AV1 preset.
-        audio_bitrate_kbps: numeric audio bitrate for fallback calculation.
         duration: if set, only encode the first *duration* seconds.
         keep_file: if True, return the temp file path instead of deleting it.
         has_audio: if False, omit all audio codec arguments.
+        measure_overhead: if True, also measure the audio+container overhead.
 
     Returns:
-        ``(bitrate_kbps, temp_path | None)``.  *temp_path* is only set when
-        *keep_file* is True and the encode succeeded.
+        ``(total_bitrate_kbps, overhead_kbps | None, temp_path | None)``.
+        *overhead_kbps* is only set when *measure_overhead* is True and the
+        encode succeeded; *temp_path* only when *keep_file* is True.
     """
     temp_path = _make_temp_path()
 
@@ -101,7 +102,7 @@ def encode_sample(
         result = subprocess.run(ff_args, capture_output=True, text=True)
     except FileNotFoundError:
         log.error("    ffmpeg executable not found — is ffmpeg on PATH?")
-        return -1, None
+        return -1, None, None
 
     if not temp_path.exists():
         log.error(
@@ -121,7 +122,7 @@ def encode_sample(
                 "and that ffmpeg supports the required codecs",
                 result.returncode,
             )
-        return -1, None
+        return -1, None, None
 
     if result.returncode != 0:
         log.error(
@@ -134,20 +135,25 @@ def encode_sample(
         if result.stdout.strip():
             log.error("    ffmpeg stdout:\n%s", result.stdout.strip())
 
-    bitrate = get_video_bitrate(temp_path, audio_bitrate_kbps)
+    bitrate = get_total_bitrate(temp_path, duration)
+    overhead = (
+        _measure_overhead(temp_path, duration)
+        if measure_overhead and bitrate >= 0
+        else None
+    )
 
     if keep_file and bitrate >= 0:
-        return bitrate, temp_path
+        return bitrate, overhead, temp_path
     if keep_file:
         log.warning(
             "    Could not determine bitrate for CRF=%d, returning file anyway",
             crf,
         )
-        return -1, temp_path
+        return -1, None, temp_path
 
     # Clean up
     temp_path.unlink(missing_ok=True)
-    return bitrate, None
+    return bitrate, overhead, None
 
 
 def _extract_vf_filter(extra_args: list[str]) -> tuple[str | None, list[str]]:
@@ -178,17 +184,20 @@ def encode_segments(
     extra_args: list[str],
     audio_bitrate: str,
     preset: int,
-    audio_bitrate_kbps: int,
     offsets: list[float],
     seg_duration: float,
     has_audio: bool = True,
-) -> int:
-    """Encode multiple segments via concat and return the average video bitrate.
+    measure_overhead: bool = False,
+) -> tuple[int, int | None]:
+    """Encode multiple segments via concat and return the total bitrate.
 
     Uses ffmpeg's concat filter by opening the input once per segment
     with ``-ss``/``-t``, then concatenating the streams. If *extra_args*
     contains a ``-vf`` scale filter it is folded into the filter_complex
     chain (since ``-vf`` and ``-filter_complex`` cannot coexist).
+
+    Returns ``(total_bitrate_kbps, overhead_kbps | None)``; *overhead_kbps*
+    is set only when *measure_overhead* is True and the encode succeeded.
     """
     temp_path = _make_temp_path()
 
@@ -253,8 +262,9 @@ def encode_segments(
     except FileNotFoundError:
         log.error("    ffmpeg executable not found — is ffmpeg on PATH?")
         temp_path.unlink(missing_ok=True)
-        return -1
+        return -1, None
 
+    sample_duration = len(offsets) * seg_duration
     try:
         if not temp_path.exists():
             log.error(
@@ -274,7 +284,7 @@ def encode_segments(
                     "and that ffmpeg supports the required codecs",
                     result.returncode,
                 )
-            return -1
+            return -1, None
 
         if result.returncode != 0:
             log.error(
@@ -287,7 +297,13 @@ def encode_segments(
             if result.stdout.strip():
                 log.error("    ffmpeg stdout:\n%s", result.stdout.strip())
 
-        return get_video_bitrate(temp_path, audio_bitrate_kbps)
+        bitrate = get_total_bitrate(temp_path, sample_duration)
+        overhead = (
+            _measure_overhead(temp_path, sample_duration)
+            if measure_overhead and bitrate >= 0
+            else None
+        )
+        return bitrate, overhead
     finally:
         temp_path.unlink(missing_ok=True)
 
